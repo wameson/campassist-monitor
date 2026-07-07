@@ -1,0 +1,26 @@
+{
+  "campsites": {
+    "100": {
+      "campsite_id": "100",
+      "site": "042",
+      "loop": "UPPER PINES",
+      "campsite_type": "STANDARD NONELECTRIC",
+      "availabilities": {
+        "2026-08-10T00:00:00Z": "Available",
+        "2026-08-11T00:00:00Z": "Reserved",
+        "2026-08-12T00:00:00Z": "Not Reservable"
+      }
+    },
+    "101": {
+      "campsite_id": "101",
+      "site": "043",
+      "loop": "UPPER PINES",
+      "campsite_type": "STANDARD NONELECTRIC",
+      "availabilities": {
+        "2026-08-10T00:00:00Z": "Reserved",
+        "2026-08-11T00:00:00Z": "Available"
+      }
+    }
+  },
+  "count": 2
+}
