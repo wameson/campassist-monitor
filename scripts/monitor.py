@@ -1,0 +1,372 @@
+"""CampAssist availability monitor — one cycle per GitHub Actions run.
+
+Cycle: jittered start → read active watches → expire past-date watches →
+dedupe poll plan by (campground_id, month) → poll recreation.gov politely
+(one browser UA per run, shuffled order, 1.2–2.8 s gaps, exponential
+backoff) → delta-detect per watch via state_hash → APNs alert with
+(site, date) dedup + 6 h cooldown → batched last_checked_at write →
+one run_summaries row → 30-day retention pruning.
+
+Write budget (see PLAN.md): a cycle with no availability changes performs
+at most 5 DB writes regardless of watch count.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+
+import httpx
+
+from apns import APNsClient
+from db import SupabaseClient
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+]
+
+AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground/{campground_id}/month"
+
+START_JITTER_MAX_SECONDS = 240.0
+INTER_REQUEST_DELAY_RANGE = (1.2, 2.8)
+BACKOFF_DELAYS_SECONDS = [2, 4, 8]
+RETRYABLE_STATUS = {403, 429}
+ALERT_COOLDOWN_HOURS = 6
+RETENTION_DAYS = 30
+
+
+# --- jitter ---------------------------------------------------------------
+
+def start_delay(rng: random.Random) -> float:
+    """Random run-start delay to desynchronize from the exact cron tick."""
+    return rng.uniform(0, START_JITTER_MAX_SECONDS)
+
+
+def inter_request_delay(rng: random.Random) -> float:
+    """Humanized gap between recreation.gov requests."""
+    return rng.uniform(*INTER_REQUEST_DELAY_RANGE)
+
+
+# --- dates ----------------------------------------------------------------
+
+def as_date(value) -> date:
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def parse_timestamp(value: str) -> datetime:
+    ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def iso_now(now: datetime) -> str:
+    return now.astimezone(timezone.utc).isoformat()
+
+
+def months_for_watch(start: date, end: date) -> list[date]:
+    """First-of-month dates covering [start, end] — one API call each."""
+    months = []
+    cur = start.replace(day=1)
+    while cur <= end:
+        months.append(cur)
+        cur = (cur + timedelta(days=32)).replace(day=1)
+    return months
+
+
+def date_in_watch(d: date, start: date, end: date) -> bool:
+    """Nights of the stay: check-out day availability is irrelevant."""
+    if end > start:
+        return start <= d < end
+    return d == start
+
+
+# --- poll plan ------------------------------------------------------------
+
+def dedupe_poll_plan(watches: list[dict]) -> list[tuple[str, date]]:
+    """One (campground_id, month) entry per unique pair across ALL users."""
+    plan = set()
+    for watch in watches:
+        start = as_date(watch["start_date"])
+        end = as_date(watch["end_date"])
+        for month in months_for_watch(start, end):
+            plan.add((str(watch["campground_id"]), month))
+    return sorted(plan)
+
+
+# --- recreation.gov -------------------------------------------------------
+
+def parse_availability(raw) -> dict[str, dict]:
+    """Defensively parse a recreation.gov month-availability response.
+
+    Missing or renamed fields degrade to a partial parse — never a crash.
+    Returns {campsite_id: {"campsite_id", "site", "availabilities": {date: status}}}.
+    """
+    sites: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return sites
+    campsites = raw.get("campsites")
+    if not isinstance(campsites, dict):
+        return sites
+    for cs_key, cs in campsites.items():
+        if not isinstance(cs, dict):
+            continue
+        availabilities = cs.get("availabilities")
+        dates: dict[str, str] = {}
+        if isinstance(availabilities, dict):
+            for date_str, status in availabilities.items():
+                if not isinstance(status, str):
+                    continue
+                try:
+                    d = as_date(date_str)
+                except (ValueError, TypeError):
+                    continue
+                dates[d.isoformat()] = status
+        campsite_id = cs.get("campsite_id", cs_key)
+        site = cs.get("site")
+        sites[str(cs_key)] = {
+            "campsite_id": str(campsite_id),
+            "site": site if isinstance(site, str) else str(cs_key),
+            "availabilities": dates,
+        }
+    return sites
+
+
+def poll_with_backoff(
+    http: httpx.Client,
+    campground_id: str,
+    month: date,
+    user_agent: str,
+    *,
+    sleep=time.sleep,
+    errors: list[str] | None = None,
+) -> dict[str, dict] | None:
+    """GET one campground-month with exponential backoff on 403/429/5xx.
+
+    Retries after 2 s, 4 s, 8 s, then gives up for this cycle (returns
+    None) so the rest of the run continues.
+    """
+    url = AVAILABILITY_URL.format(campground_id=campground_id)
+    params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
+    headers = {"User-Agent": user_agent, "Accept": "application/json"}
+
+    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
+        try:
+            resp = http.get(url, params=params, headers=headers)
+            status = resp.status_code
+        except httpx.HTTPError as exc:
+            status = None
+            failure = f"{campground_id}/{month.isoformat()}: {exc!r}"
+        if status == 200:
+            try:
+                return parse_availability(resp.json())
+            except ValueError:
+                failure = f"{campground_id}/{month.isoformat()}: invalid JSON"
+                break
+        if status is not None:
+            failure = f"{campground_id}/{month.isoformat()}: HTTP {status}"
+            if not (status in RETRYABLE_STATUS or status >= 500):
+                break
+        if attempt < len(BACKOFF_DELAYS_SECONDS):
+            sleep(BACKOFF_DELAYS_SECONDS[attempt])
+    if errors is not None:
+        errors.append(failure)
+    return None
+
+
+# --- delta detection ------------------------------------------------------
+
+def canonical_json(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def state_hash(obj) -> str:
+    return hashlib.sha256(canonical_json(obj).encode()).hexdigest()
+
+
+def extract_relevant(availability: dict, watch: dict) -> dict[str, dict] | None:
+    """Current open-site state relevant to one watch, or None if any of
+    the watch's months failed to poll this cycle (keep old hash, retry
+    next run rather than hashing partial data)."""
+    start = as_date(watch["start_date"])
+    end = as_date(watch["end_date"])
+    wanted = {str(s) for s in (watch.get("site_ids") or [])}
+
+    merged: dict[str, dict] = {}
+    for month in months_for_watch(start, end):
+        parsed = availability.get((str(watch["campground_id"]), month))
+        if parsed is None:
+            return None
+        for cs_id, cs in parsed.items():
+            entry = merged.setdefault(
+                cs_id, {"campsite_id": cs["campsite_id"], "site": cs["site"], "dates": {}}
+            )
+            entry["dates"].update(cs["availabilities"])
+
+    current: dict[str, dict] = {}
+    for cs_id, cs in merged.items():
+        if wanted and not ({cs_id, cs["campsite_id"], cs["site"]} & wanted):
+            continue
+        open_dates = sorted(
+            d
+            for d, status in cs["dates"].items()
+            if status == "Available" and date_in_watch(as_date(d), start, end)
+        )
+        if open_dates:
+            current[cs_id] = {
+                "campsite_id": cs["campsite_id"],
+                "site": cs["site"],
+                "dates": open_dates,
+            }
+    return current
+
+
+def available_sites(current: dict[str, dict]) -> list[dict]:
+    openings = [
+        {"campsite_id": cs["campsite_id"], "site": cs["site"], "date": d}
+        for cs in current.values()
+        for d in cs["dates"]
+    ]
+    openings.sort(key=lambda o: (o["date"], o["site"]))
+    return openings
+
+
+# --- alert dedup ----------------------------------------------------------
+
+def filter_unalerted(
+    db, watch: dict, openings: list[dict], now: datetime, cooldown_hours: int = ALERT_COOLDOWN_HOURS
+) -> list[dict]:
+    """Drop openings whose (site, date) was alerted within the cooldown."""
+    if not openings:
+        return []
+    rows = db.select("sent_alerts", {"watch_id": f"eq.{watch['id']}"})
+    cutoff = now - timedelta(hours=cooldown_hours)
+    recent = {
+        (str(r["site_id"]), as_date(r["date"]).isoformat())
+        for r in rows
+        if parse_timestamp(r["sent_at"]) > cutoff
+    }
+    return [o for o in openings if (o["campsite_id"], o["date"]) not in recent]
+
+
+def alert_rows(watch: dict, openings: list[dict], now: datetime) -> list[dict]:
+    return [
+        {
+            "watch_id": watch["id"],
+            "site_id": o["campsite_id"],
+            "date": o["date"],
+            "sent_at": iso_now(now),
+        }
+        for o in openings
+    ]
+
+
+# --- main cycle -----------------------------------------------------------
+
+def run(
+    db,
+    apns,
+    http,
+    *,
+    rng: random.Random | None = None,
+    sleep=time.sleep,
+    now_fn=lambda: datetime.now(timezone.utc),
+) -> dict:
+    rng = rng or random.Random()
+    started = time.monotonic()
+    errors: list[str] = []
+    now = now_fn()
+    today = now.date()
+
+    watches = db.select("watches", {"status": "eq.monitoring"})
+
+    # Backend-owned lifecycle: expire past-date watches (one batched write)
+    expired_ids = {w["id"] for w in watches if as_date(w["end_date"]) < today}
+    if expired_ids:
+        db.patch(
+            "watches",
+            {"id": f"in.({','.join(sorted(str(i) for i in expired_ids))})"},
+            {"status": "expired"},
+        )
+    active = [w for w in watches if w["id"] not in expired_ids]
+
+    plan = dedupe_poll_plan(active)
+    rng.shuffle(plan)
+    session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
+
+    availability: dict[tuple[str, date], dict | None] = {}
+    for i, (campground_id, month) in enumerate(plan):
+        availability[(campground_id, month)] = poll_with_backoff(
+            http, campground_id, month, session_ua, sleep=sleep, errors=errors
+        )
+        if i < len(plan) - 1:
+            sleep(inter_request_delay(rng))
+
+    alerts_sent = 0
+    for watch in active:
+        current = extract_relevant(availability, watch)
+        if current is None:
+            continue  # poll failed for this watch's months; keep old hash
+        new_hash = state_hash(current)
+        if new_hash == watch.get("state_hash"):
+            continue
+        openings = available_sites(current)
+        fresh = filter_unalerted(db, watch, openings, now)
+        if fresh and apns.send_alert(watch, fresh, db):
+            db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
+            alerts_sent += len(fresh)
+        else:
+            fresh = []
+        db.patch(
+            "watches",
+            {"id": f"eq.{watch['id']}"},
+            {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if fresh else {})},
+        )
+
+    if active:
+        db.patch(
+            "watches",
+            {"id": f"in.({','.join(sorted(str(w['id']) for w in active))})"},
+            {"last_checked_at": iso_now(now)},
+        )
+
+    summary = {
+        "watches_checked": len(active),
+        "campgrounds_polled": len({cg for cg, _ in plan}),
+        "alerts_sent": alerts_sent,
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "errors": "; ".join(errors) or None,
+    }
+    db.insert("run_summaries", summary)
+
+    retention_cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
+    db.delete("sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
+    db.delete("run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
+    return summary
+
+
+def main() -> None:
+    rng = random.Random()
+    delay = start_delay(rng)
+    print(f"start jitter: sleeping {delay:.0f}s", flush=True)
+    time.sleep(delay)
+
+    db = SupabaseClient.from_env()
+    apns = APNsClient.from_env()
+    with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
+        summary = run(db, apns, http, rng=rng)
+    print(json.dumps(summary), flush=True)
+    if summary["errors"]:
+        print(f"completed with errors: {summary['errors']}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()
