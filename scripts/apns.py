@@ -23,6 +23,13 @@ APNS_HOSTS = {
 JWT_TTL_SECONDS = 50 * 60
 BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
 
+# send_alert outcomes: RETRYABLE_FAILURE means the caller should keep the
+# watch's old state_hash so the alert is retried next cycle; DELIVERED and
+# PERMANENT_FAILURE both advance it.
+DELIVERED = "delivered"
+PERMANENT_FAILURE = "permanent-failure"
+RETRYABLE_FAILURE = "retryable-failure"
+
 
 class APNsClient:
     def __init__(
@@ -78,11 +85,16 @@ class APNsClient:
             json=payload,
         )
 
-    def send_alert(self, watch: dict, openings: list[dict], db) -> bool:
-        """Push an availability alert for a watch. Returns True if delivered."""
+    def send_alert(
+        self, watch: dict, openings: list[dict], db, errors: list[str] | None = None
+    ) -> str:
+        """Push an availability alert for a watch. Returns a delivery outcome:
+        DELIVERED, PERMANENT_FAILURE (410 Unregistered — token row deleted —
+        other 4xx, or no device token), or RETRYABLE_FAILURE (5xx, 429, or a
+        transport-level error, recorded into `errors`)."""
         rows = db.select("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
         if not rows:
-            return False
+            return PERMANENT_FAILURE
         token_row = rows[0]
         first = openings[0]
         payload = {
@@ -101,8 +113,19 @@ class APNsClient:
             "booking_url": BOOKING_URL_TEMPLATE.format(campsite_id=first["campsite_id"]),
             "watch_id": watch["id"],
         }
-        resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
+        try:
+            resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
+        except httpx.HTTPError as exc:
+            if errors is not None:
+                errors.append(f"apns {watch['id']}: {exc!r}")
+            return RETRYABLE_FAILURE
+        if resp.status_code == 200:
+            return DELIVERED
         if resp.status_code == 410:
             db.delete("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
-            return False
-        return resp.status_code == 200
+            return PERMANENT_FAILURE
+        if errors is not None:
+            errors.append(f"apns {watch['id']}: HTTP {resp.status_code}")
+        if resp.status_code == 429 or resp.status_code >= 500:
+            return RETRYABLE_FAILURE
+        return PERMANENT_FAILURE

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from apns import DELIVERED
+
 NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 TABLES = ("watches", "device_tokens", "sent_alerts", "run_summaries")
@@ -85,11 +87,11 @@ class FakeDB:
 
 
 class FakeAPNs:
-    def __init__(self, result: bool = True):
+    def __init__(self, result: str = DELIVERED):
         self.alerts: list[tuple[str, list[dict]]] = []
         self.result = result
 
-    def send_alert(self, watch, openings, db) -> bool:
+    def send_alert(self, watch, openings, db, errors=None) -> str:
         self.alerts.append((watch["id"], openings))
         return self.result
 

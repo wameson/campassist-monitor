@@ -3,6 +3,7 @@
 import random
 from datetime import timedelta
 
+import apns as apns_module
 import monitor
 from helpers import NOW, FakeAPNs, FakeDB, FakeHTTP, FakeResponse, availability_payload, make_watch
 
@@ -77,6 +78,49 @@ def test_alert_cooldown():
     assert [w for w, _ in apns.alerts] == ["w1"] and summary["alerts_sent"] == 1
     [alert_row] = db.tables["sent_alerts"]  # upsert refreshed, not duplicated
     assert alert_row["sent_at"] == monitor.iso_now(NOW)
+
+
+def test_retryable_apns_failure_keeps_hash_and_retries():
+    def seeded_db():
+        return FakeDB({
+            "watches": [make_watch(state_hash="stale-hash")],
+            "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+        })
+
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+
+    # retryable failure: old hash kept, nothing recorded as sent
+    db = seeded_db()
+    summary, apns = run_cycle(db, payload, FakeAPNs(result=apns_module.RETRYABLE_FAILURE))
+    assert [w for w, _ in apns.alerts] == ["w1"] and summary["alerts_sent"] == 0
+    row = db.tables["watches"][0]
+    assert row["state_hash"] == "stale-hash"
+    assert row["last_found_at"] is None and row["last_checked_at"] is not None
+    assert db.tables["sent_alerts"] == []
+
+    # next cycle: hash still differs -> the same alert fires and delivers
+    summary, apns = run_cycle(db, payload)
+    assert [w for w, _ in apns.alerts] == ["w1"] and summary["alerts_sent"] == 1
+    assert db.tables["watches"][0]["state_hash"] != "stale-hash"
+    assert len(db.tables["sent_alerts"]) == 1
+
+
+def test_permanent_apns_failure_advances_hash():
+    db = FakeDB({
+        "watches": [make_watch(state_hash="stale-hash")],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+    })
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+
+    summary, apns = run_cycle(db, payload, FakeAPNs(result=apns_module.PERMANENT_FAILURE))
+    assert summary["alerts_sent"] == 0
+    row = db.tables["watches"][0]
+    assert row["state_hash"] != "stale-hash" and row["last_found_at"] is None
+    assert db.tables["sent_alerts"] == []
+
+    # no retry: unchanged availability next cycle stays silent
+    summary, apns = run_cycle(db, payload)
+    assert apns.alerts == [] and summary["alerts_sent"] == 0
 
 
 def test_write_budget():

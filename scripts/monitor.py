@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
-from apns import APNsClient
+from apns import DELIVERED, RETRYABLE_FAILURE, APNsClient
 from db import SupabaseClient
 
 USER_AGENTS = [
@@ -72,11 +72,14 @@ def iso_now(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat()
 
 
-def months_for_watch(start: date, end: date) -> list[date]:
-    """First-of-month dates covering [start, end] — one API call each."""
+def months_for_watch(start: date, end: date, today: date) -> list[date]:
+    """First-of-month dates covering the stay's remaining nights — one API
+    call each. The check-out day's month is not polled, and months that are
+    entirely in the past are skipped."""
+    last_night = end - timedelta(days=1) if end > start else start
     months = []
-    cur = start.replace(day=1)
-    while cur <= end:
+    cur = max(start, today).replace(day=1)
+    while cur <= last_night:
         months.append(cur)
         cur = (cur + timedelta(days=32)).replace(day=1)
     return months
@@ -91,13 +94,13 @@ def date_in_watch(d: date, start: date, end: date) -> bool:
 
 # --- poll plan ------------------------------------------------------------
 
-def dedupe_poll_plan(watches: list[dict]) -> list[tuple[str, date]]:
+def dedupe_poll_plan(watches: list[dict], today: date) -> list[tuple[str, date]]:
     """One (campground_id, month) entry per unique pair across ALL users."""
     plan = set()
     for watch in watches:
         start = as_date(watch["start_date"])
         end = as_date(watch["end_date"])
-        for month in months_for_watch(start, end):
+        for month in months_for_watch(start, end, today):
             plan.add((str(watch["campground_id"]), month))
     return sorted(plan)
 
@@ -192,16 +195,17 @@ def state_hash(obj) -> str:
     return hashlib.sha256(canonical_json(obj).encode()).hexdigest()
 
 
-def extract_relevant(availability: dict, watch: dict) -> dict[str, dict] | None:
+def extract_relevant(availability: dict, watch: dict, today: date) -> dict[str, dict] | None:
     """Current open-site state relevant to one watch, or None if any of
     the watch's months failed to poll this cycle (keep old hash, retry
-    next run rather than hashing partial data)."""
+    next run rather than hashing partial data). Past nights are excluded:
+    they are unbookable, so they count toward neither the hash nor alerts."""
     start = as_date(watch["start_date"])
     end = as_date(watch["end_date"])
     wanted = {str(s) for s in (watch.get("site_ids") or [])}
 
     merged: dict[str, dict] = {}
-    for month in months_for_watch(start, end):
+    for month in months_for_watch(start, end, today):
         parsed = availability.get((str(watch["campground_id"]), month))
         if parsed is None:
             return None
@@ -218,7 +222,9 @@ def extract_relevant(availability: dict, watch: dict) -> dict[str, dict] | None:
         open_dates = sorted(
             d
             for d, status in cs["dates"].items()
-            if status == "Available" and date_in_watch(as_date(d), start, end)
+            if status == "Available"
+            and as_date(d) >= today
+            and date_in_watch(as_date(d), start, end)
         )
         if open_dates:
             current[cs_id] = {
@@ -298,7 +304,7 @@ def run(
         )
     active = [w for w in watches if w["id"] not in expired_ids]
 
-    plan = dedupe_poll_plan(active)
+    plan = dedupe_poll_plan(active, today)
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
 
@@ -312,7 +318,7 @@ def run(
 
     alerts_sent = 0
     for watch in active:
-        current = extract_relevant(availability, watch)
+        current = extract_relevant(availability, watch, today)
         if current is None:
             continue  # poll failed for this watch's months; keep old hash
         new_hash = state_hash(current)
@@ -320,15 +326,19 @@ def run(
             continue
         openings = available_sites(current)
         fresh = filter_unalerted(db, watch, openings, now)
-        if fresh and apns.send_alert(watch, fresh, db):
-            db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
-            alerts_sent += len(fresh)
-        else:
-            fresh = []
+        delivered = False
+        if fresh:
+            outcome = apns.send_alert(watch, fresh, db, errors=errors)
+            if outcome == RETRYABLE_FAILURE:
+                continue  # keep old hash so the alert is retried next cycle
+            if outcome == DELIVERED:
+                db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
+                alerts_sent += len(fresh)
+                delivered = True
         db.patch(
             "watches",
             {"id": f"eq.{watch['id']}"},
-            {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if fresh else {})},
+            {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
         )
 
     if active:
