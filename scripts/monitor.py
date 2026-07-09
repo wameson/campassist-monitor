@@ -3,9 +3,9 @@
 Cycle: jittered start → read active watches → expire past-date watches →
 dedupe poll plan by (campground_id, month) → poll recreation.gov politely
 (one browser UA per run, shuffled order, 1.2–2.8 s gaps, exponential
-backoff) → delta-detect per watch via state_hash → APNs alert with
-(site, date) dedup + 6 h cooldown → batched last_checked_at write →
-one run_summaries row → 30-day retention pruning.
+backoff, all under a per-cycle time budget) → delta-detect per watch via
+state_hash → APNs alert with (site, date) dedup + 6 h cooldown → batched
+last_checked_at write → one run_summaries row → 30-day retention pruning.
 
 Write budget (see PLAN.md): a cycle with no availability changes performs
 at most 5 DB writes regardless of watch count.
@@ -17,7 +17,6 @@ import hashlib
 import json
 import random
 import re
-import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -37,6 +36,14 @@ AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground
 START_JITTER_MAX_SECONDS = 240.0
 INTER_REQUEST_DELAY_RANGE = (1.2, 2.8)
 BACKOFF_DELAYS_SECONDS = [2, 4, 8]
+# Keeps jitter (≤240 s) + polling + one in-flight request (≤20 s) + the
+# bookkeeping writes inside the workflow's 15-minute timeout even under
+# sustained 403/429 blocking.
+CYCLE_TIME_BUDGET_SECONDS = 480.0
+# Fixed westmost-US offset (UTC-8, no DST) for deriving "today": same-night
+# openings at US campgrounds stay alertable during US evening hours after
+# UTC midnight.
+WESTMOST_US_OFFSET = timezone(timedelta(hours=-8))
 RETRYABLE_STATUS = {403, 429}
 ALERT_COOLDOWN_HOURS = 6
 RETENTION_DAYS = 30
@@ -73,6 +80,11 @@ def parse_timestamp(value: str) -> datetime:
 
 def iso_now(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat()
+
+
+def monitor_today(now: datetime) -> date:
+    """'Today' for the poll plan, alert date filter, and watch expiry."""
+    return now.astimezone(WESTMOST_US_OFFSET).date()
 
 
 def horizon_month(today: date) -> date:
@@ -164,11 +176,14 @@ def poll_with_backoff(
     *,
     sleep=time.sleep,
     errors: list[str] | None = None,
+    budget_exhausted=lambda: False,
 ) -> dict[str, dict] | None:
     """GET one campground-month with exponential backoff on 403/429/5xx.
 
     Retries after 2 s, 4 s, 8 s, then gives up for this cycle (returns
-    None) so the rest of the run continues.
+    None) so the rest of the run continues. Once budget_exhausted()
+    reports the cycle's time budget is spent, remaining retries and their
+    backoff sleeps are skipped.
     """
     url = AVAILABILITY_URL.format(campground_id=campground_id)
     params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
@@ -192,6 +207,8 @@ def poll_with_backoff(
             if not (status in RETRYABLE_STATUS or status >= 500):
                 break
         if attempt < len(BACKOFF_DELAYS_SECONDS):
+            if budget_exhausted():
+                break
             sleep(BACKOFF_DELAYS_SECONDS[attempt])
     if errors is not None:
         errors.append(failure)
@@ -305,12 +322,19 @@ def run(
     rng: random.Random | None = None,
     sleep=time.sleep,
     now_fn=lambda: datetime.now(timezone.utc),
+    monotonic=time.monotonic,
+    time_budget_seconds: float = CYCLE_TIME_BUDGET_SECONDS,
 ) -> dict:
     rng = rng or random.Random()
-    started = time.monotonic()
+    started = monotonic()
+    deadline = started + time_budget_seconds
+
+    def budget_exhausted() -> bool:
+        return monotonic() >= deadline
+
     errors: list[str] = []
     now = now_fn()
-    today = now.date()
+    today = monitor_today(now)
 
     watches = db.select("watches", {"status": "eq.monitoring"})
 
@@ -334,10 +358,16 @@ def run(
 
     availability: dict[tuple[str, date], dict | None] = {}
     for i, (campground_id, month) in enumerate(plan):
+        if budget_exhausted():
+            errors.append(
+                f"time budget exhausted: skipped {len(plan) - i} remaining poll(s)"
+            )
+            break
         availability[(campground_id, month)] = poll_with_backoff(
-            http, campground_id, month, session_ua, sleep=sleep, errors=errors
+            http, campground_id, month, session_ua,
+            sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
         )
-        if i < len(plan) - 1:
+        if i < len(plan) - 1 and not budget_exhausted():
             sleep(inter_request_delay(rng))
 
     alerts_sent = 0
@@ -376,7 +406,7 @@ def run(
         "watches_checked": len(active),
         "campgrounds_polled": len({cg for cg, _ in plan}),
         "alerts_sent": alerts_sent,
-        "duration_ms": int((time.monotonic() - started) * 1000),
+        "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(errors) or None,
     }
     db.insert("run_summaries", summary)
@@ -385,6 +415,15 @@ def run(
     db.delete("sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
     db.delete("run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
     return summary
+
+
+def error_annotation(summary: dict) -> str | None:
+    """GitHub Actions warning annotation when the cycle recorded errors,
+    surfacing them in the run history while the exit code stays 0 so
+    scheduled runs remain green."""
+    if summary.get("errors"):
+        return f"::warning::monitor completed with errors: {summary['errors']}"
+    return None
 
 
 def main() -> None:
@@ -398,8 +437,9 @@ def main() -> None:
     with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
         summary = run(db, apns, http, rng=rng)
     print(json.dumps(summary), flush=True)
-    if summary["errors"]:
-        print(f"completed with errors: {summary['errors']}", file=sys.stderr, flush=True)
+    warning = error_annotation(summary)
+    if warning:
+        print(warning, flush=True)
 
 
 if __name__ == "__main__":

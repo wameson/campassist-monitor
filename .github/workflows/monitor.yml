@@ -4,6 +4,9 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: monitor
   cancel-in-progress: false

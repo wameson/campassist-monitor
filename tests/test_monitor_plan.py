@@ -1,7 +1,7 @@
 """Poll-plan dedupe, jitter bounds, and backend-owned watch expiry."""
 
 import random
-from datetime import date
+from datetime import date, datetime, timezone
 
 import monitor
 from helpers import NOW, FakeAPNs, FakeDB, FakeHTTP, FakeResponse, availability_payload, make_watch
@@ -120,6 +120,31 @@ def test_in_progress_watch_ignores_past_dates():
     assert [r["params"]["start_date"] for r in http.requests] == ["2026-08-01T00:00:00.000Z"]
     assert apns.alerts == [] and summary["alerts_sent"] == 0
     assert db.tables["watches"][0]["state_hash"] == monitor.state_hash({})
+
+
+def test_same_night_alertable_after_utc_midnight():
+    # 04:00 UTC on Aug 11 is still the evening of Aug 10 in the westmost US
+    # offset (UTC-8): a same-night Aug 10 opening must still alert, and the
+    # watch whose last night is Aug 10 must not expire yet
+    us_evening = datetime(2026, 8, 11, 4, 0, 0, tzinfo=timezone.utc)
+    assert monitor.monitor_today(us_evening) == date(2026, 8, 10)
+
+    db = FakeDB({
+        "watches": [make_watch(start_date="2026-08-10", end_date="2026-08-11")],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+    })
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+    http = FakeHTTP(lambda cg: FakeResponse(200, payload))
+    apns = FakeAPNs()
+
+    summary = monitor.run(
+        db, apns, http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: us_evening
+    )
+
+    assert db.tables["watches"][0]["status"] == "monitoring"
+    assert summary["alerts_sent"] == 1
+    [(watch_id, openings)] = apns.alerts
+    assert watch_id == "w1" and [o["date"] for o in openings] == ["2026-08-10"]
 
 
 def test_jitter_bounds():

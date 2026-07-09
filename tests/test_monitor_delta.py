@@ -144,6 +144,14 @@ def test_write_budget():
     assert summary["campgrounds_polled"] == 1
 
 
+def test_error_annotation():
+    # errors surface as a GitHub Actions warning annotation; quiet runs emit none
+    assert monitor.error_annotation({"errors": None}) is None
+    line = monitor.error_annotation({"errors": "111/2026-08-01: HTTP 429"})
+    assert line.startswith("::warning::")
+    assert "111/2026-08-01: HTTP 429" in line
+
+
 def test_retention():
     old = monitor.iso_now(NOW - timedelta(days=40))
     recent = monitor.iso_now(NOW - timedelta(days=1))

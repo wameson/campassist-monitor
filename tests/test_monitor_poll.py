@@ -66,6 +66,79 @@ def test_backoff():
     assert blocked["state_hash"] is None
 
 
+class FakeClock:
+    """Deterministic monotonic clock; sleeping advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_backoff_stops_when_budget_exhausted():
+    # 429 forever, but the cycle budget runs out mid-backoff: the remaining
+    # retry (and its 8s sleep) is skipped and the entry gives up early
+    clock = FakeClock()
+    http = FakeHTTP(lambda cg: FakeResponse(429))
+    sleeps, errors = [], []
+
+    def sleep(s):
+        sleeps.append(s)
+        clock.sleep(s)
+
+    result = monitor.poll_with_backoff(
+        http, "111", date(2026, 8, 1), "UA",
+        sleep=sleep, errors=errors,
+        budget_exhausted=lambda: clock.monotonic() >= 5,
+    )
+    assert result is None
+    assert sleeps == [2, 4]  # third backoff skipped: budget hit at t=6
+    assert len(http.requests) == 3
+    assert errors == ["111/2026-08-01: HTTP 429"]
+
+
+def test_time_budget_cycle_reaches_bookkeeping():
+    # sustained blocking with slow (timeout-length) responses: once the
+    # budget is spent, remaining polls are skipped and the cycle still
+    # performs its bookkeeping writes
+    clock = FakeClock()
+
+    def responder(cg):
+        clock.sleep(20)  # each request runs to the httpx timeout
+        return FakeResponse(429)
+
+    watches = [
+        make_watch(id=f"w{i}", user_id=f"u{i}", campground_id=str(111 + i))
+        for i in range(10)
+    ]
+    db = FakeDB({"watches": watches})
+    http = FakeHTTP(responder)
+
+    summary = monitor.run(
+        db, FakeAPNs(), http,
+        rng=random.Random(0), sleep=clock.sleep, now_fn=lambda: NOW,
+        monotonic=clock.monotonic, time_budget_seconds=120,
+    )
+
+    # far fewer than the 40 requests full backoff on 10 entries would make
+    assert len(http.requests) < 10
+    assert "time budget exhausted" in summary["errors"]
+    assert "skipped" in summary["errors"]
+    # bookkeeping still ran: batched last_checked_at PATCH, run_summaries
+    # INSERT, and both retention DELETEs
+    assert len(db.calls_of("patch", "watches")) == 1
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert len(db.calls_of("delete")) == 2
+    rows = db.tables["watches"]
+    assert all(r["last_checked_at"] is not None for r in rows)
+    # nothing polled successfully -> every watch keeps its old hash for retry
+    assert all(r["state_hash"] is None for r in rows)
+
+
 @pytest.mark.parametrize("bad_id", ["123\n456", "232447?injected=1", "232447#frag", "a/b", ""])
 def test_invalid_campground_id_skipped(bad_id):
     # a malformed campground_id never reaches the HTTP client: the entry is
