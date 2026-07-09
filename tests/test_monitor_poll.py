@@ -66,6 +66,31 @@ def test_backoff():
     assert blocked["state_hash"] is None
 
 
+@pytest.mark.parametrize("bad_id", ["123\n456", "232447?injected=1", "232447#frag", "a/b", ""])
+def test_invalid_campground_id_skipped(bad_id):
+    # a malformed campground_id never reaches the HTTP client: the entry is
+    # skipped with an error recorded, and the rest of the cycle proceeds
+    db = FakeDB({
+        "watches": [
+            make_watch(id="w-bad", campground_id=bad_id),
+            make_watch(id="w-ok", user_id="u2", campground_id="222"),
+        ],
+        "device_tokens": [{"user_id": "u2", "apns_token": "tok", "environment": "production"}],
+    })
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+    http = FakeHTTP(lambda cg: FakeResponse(200, payload))
+    apns = FakeAPNs()
+
+    summary = monitor.run(db, apns, http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
+
+    assert {r["campground_id"] for r in http.requests} == {"222"}
+    assert [w for w, _ in apns.alerts] == ["w-ok"]
+    assert "invalid campground_id" in summary["errors"]
+    bad = next(w for w in db.tables["watches"] if w["id"] == "w-bad")
+    assert bad["state_hash"] is None  # old hash kept; nothing hashed from a skipped poll
+    assert bad["last_checked_at"] is not None
+
+
 @pytest.mark.parametrize(
     "fixture", ["normal", "missing_campsites", "renamed_fields", "junk_types", "not_a_dict"]
 )

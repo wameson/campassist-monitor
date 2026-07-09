@@ -47,6 +47,56 @@ def test_poll_plan_clamped_to_today():
     ]
 
 
+def test_poll_plan_clamped_to_horizon():
+    # far-future end_date: the plan never extends past 12 months from today
+    watches = [make_watch(start_date="2026-08-10", end_date="2100-01-01")]
+    plan = monitor.dedupe_poll_plan(watches, TODAY)
+    assert plan[0] == ("232447", date(2026, 8, 1))
+    assert plan[-1] == ("232447", date(2027, 8, 1))
+    assert len(plan) == 13
+
+
+def test_watch_entirely_beyond_horizon_polls_nothing():
+    # stay starts >12 months out: no polls, no error, watch stays monitoring
+    # and becomes pollable once the horizon reaches it
+    db = FakeDB({"watches": [make_watch(id="w-far", start_date="2028-06-01", end_date="2028-06-05")]})
+    http = FakeHTTP(lambda cg: FakeResponse(200, availability_payload({})))
+
+    summary = monitor.run(db, FakeAPNs(), http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
+
+    assert http.requests == []
+    row = db.tables["watches"][0]
+    assert row["status"] == "monitoring"
+    assert row["state_hash"] is None  # delta detection deferred, not seeded
+    assert row["last_checked_at"] is not None
+    assert summary["errors"] is None
+
+
+def test_horizon_clamped_watch_detects_in_horizon_openings():
+    # stay straddles the horizon (Jul–Sep 2027, horizon month = Aug 2027):
+    # only in-horizon months are polled, and their openings still alert
+    db = FakeDB({
+        "watches": [make_watch(start_date="2027-07-20", end_date="2027-09-10")],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+    })
+    payload = availability_payload({"100": {"2027-08-03": "Available"}})
+    http = FakeHTTP(lambda cg: FakeResponse(200, payload))
+    apns = FakeAPNs()
+
+    summary = monitor.run(db, apns, http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
+
+    assert sorted(r["params"]["start_date"] for r in http.requests) == [
+        "2027-07-01T00:00:00.000Z",
+        "2027-08-01T00:00:00.000Z",
+    ]
+    assert summary["alerts_sent"] == 1
+    [(watch_id, openings)] = apns.alerts
+    assert watch_id == "w1" and [o["date"] for o in openings] == ["2027-08-03"]
+    assert db.tables["watches"][0]["state_hash"] == monitor.state_hash(
+        {"100": {"campsite_id": "100", "site": "S100", "dates": ["2027-08-03"]}}
+    )
+
+
 def test_months_exclude_checkout_day():
     # stay ending on the 1st: last night is Aug 31, September is never polled
     assert monitor.months_for_watch(date(2026, 8, 28), date(2026, 9, 1), TODAY) == [date(2026, 8, 1)]

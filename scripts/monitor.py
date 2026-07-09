@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +40,8 @@ BACKOFF_DELAYS_SECONDS = [2, 4, 8]
 RETRYABLE_STATUS = {403, 429}
 ALERT_COOLDOWN_HOURS = 6
 RETENTION_DAYS = 30
+POLL_HORIZON_MONTHS = 12
+CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 # --- jitter ---------------------------------------------------------------
@@ -72,14 +75,24 @@ def iso_now(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat()
 
 
+def horizon_month(today: date) -> date:
+    """First-of-month containing today + POLL_HORIZON_MONTHS: the last
+    month the poll plan may include."""
+    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
+    return date(today.year + years, month0 + 1, 1)
+
+
 def months_for_watch(start: date, end: date, today: date) -> list[date]:
     """First-of-month dates covering the stay's remaining nights — one API
-    call each. The check-out day's month is not polled, and months that are
-    entirely in the past are skipped."""
+    call each. The check-out day's month is not polled, and months entirely
+    in the past or beyond the polling horizon (today + POLL_HORIZON_MONTHS)
+    are skipped; a watch wholly beyond the horizon yields no months until
+    the horizon reaches it."""
     last_night = end - timedelta(days=1) if end > start else start
+    last_month = min(last_night, horizon_month(today))
     months = []
     cur = max(start, today).replace(day=1)
-    while cur <= last_night:
+    while cur <= last_month:
         months.append(cur)
         cur = (cur + timedelta(days=32)).replace(day=1)
     return months
@@ -165,7 +178,7 @@ def poll_with_backoff(
         try:
             resp = http.get(url, params=params, headers=headers)
             status = resp.status_code
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             status = None
             failure = f"{campground_id}/{month.isoformat()}: {exc!r}"
         if status == 200:
@@ -199,13 +212,20 @@ def extract_relevant(availability: dict, watch: dict, today: date) -> dict[str, 
     """Current open-site state relevant to one watch, or None if any of
     the watch's months failed to poll this cycle (keep old hash, retry
     next run rather than hashing partial data). Past nights are excluded:
-    they are unbookable, so they count toward neither the hash nor alerts."""
+    they are unbookable, so they count toward neither the hash nor alerts.
+    A watch wholly beyond the polling horizon has no pollable months yet,
+    so it also returns None; a watch straddling the horizon is hashed on
+    its in-horizon months alone."""
     start = as_date(watch["start_date"])
     end = as_date(watch["end_date"])
     wanted = {str(s) for s in (watch.get("site_ids") or [])}
 
+    months = months_for_watch(start, end, today)
+    if not months:
+        return None
+
     merged: dict[str, dict] = {}
-    for month in months_for_watch(start, end, today):
+    for month in months:
         parsed = availability.get((str(watch["campground_id"]), month))
         if parsed is None:
             return None
@@ -305,6 +325,10 @@ def run(
     active = [w for w in watches if w["id"] not in expired_ids]
 
     plan = dedupe_poll_plan(active, today)
+    invalid_ids = {cg for cg, _ in plan if not CAMPGROUND_ID_RE.fullmatch(cg)}
+    for campground_id in sorted(invalid_ids):
+        errors.append(f"{campground_id!r}: invalid campground_id, skipped")
+    plan = [entry for entry in plan if entry[0] not in invalid_ids]
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
 
