@@ -140,9 +140,10 @@ def test_time_budget_cycle_reaches_bookkeeping():
 
 
 @pytest.mark.parametrize("bad_id", ["123\n456", "232447?injected=1", "232447#frag", "a/b", ""])
-def test_invalid_campground_id_skipped(bad_id):
-    # a malformed campground_id never reaches the HTTP client: the entry is
-    # skipped with an error recorded, and the rest of the cycle proceeds
+def test_invalid_campground_id_errored(bad_id):
+    # a malformed campground_id never reaches the HTTP client: the watch
+    # transitions to status='error' with an error recorded once, and the
+    # rest of the cycle proceeds
     db = FakeDB({
         "watches": [
             make_watch(id="w-bad", campground_id=bad_id),
@@ -159,9 +160,17 @@ def test_invalid_campground_id_skipped(bad_id):
     assert {r["campground_id"] for r in http.requests} == {"222"}
     assert [w for w, _ in apns.alerts] == ["w-ok"]
     assert "invalid campground_id" in summary["errors"]
+    assert summary["watches_checked"] == 1
     bad = next(w for w in db.tables["watches"] if w["id"] == "w-bad")
-    assert bad["state_hash"] is None  # old hash kept; nothing hashed from a skipped poll
-    assert bad["last_checked_at"] is not None
+    assert bad["status"] == "error"  # out of the monitoring pool for good
+    assert bad["state_hash"] is None
+    assert bad["last_checked_at"] is None  # errored before bookkeeping
+
+    # next cycle: the errored watch is excluded, so the error does not recur
+    summary = monitor.run(db, FakeAPNs(), http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
+    assert summary["errors"] is None or "invalid campground_id" not in summary["errors"]
+    assert summary["watches_checked"] == 1
+    assert {r["campground_id"] for r in http.requests} == {"222"}
 
 
 @pytest.mark.parametrize(

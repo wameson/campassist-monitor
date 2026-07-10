@@ -1,6 +1,7 @@
 """CampAssist availability monitor — one cycle per GitHub Actions run.
 
 Cycle: jittered start → read active watches → expire past-date watches →
+error watches with invalid campground ids →
 dedupe poll plan by (campground_id, month) → poll recreation.gov politely
 (one browser UA per run, shuffled order, 1.2–2.8 s gaps, exponential
 backoff, all under a per-cycle time budget) → delta-detect per watch via
@@ -348,11 +349,22 @@ def run(
         )
     active = [w for w in watches if w["id"] not in expired_ids]
 
+    # Backend-owned lifecycle: watches with malformed campground ids can
+    # never poll successfully, so they move to status='error' once (one
+    # batched write, failure case only) instead of re-erroring every cycle.
+    invalid = [w for w in active if not CAMPGROUND_ID_RE.fullmatch(str(w["campground_id"]))]
+    if invalid:
+        for campground_id in sorted({str(w["campground_id"]) for w in invalid}):
+            errors.append(f"{campground_id!r}: invalid campground_id, skipped")
+        db.patch(
+            "watches",
+            {"id": f"in.({','.join(sorted(str(w['id']) for w in invalid))})"},
+            {"status": "error"},
+        )
+        invalid_watch_ids = {w["id"] for w in invalid}
+        active = [w for w in active if w["id"] not in invalid_watch_ids]
+
     plan = dedupe_poll_plan(active, today)
-    invalid_ids = {cg for cg, _ in plan if not CAMPGROUND_ID_RE.fullmatch(cg)}
-    for campground_id in sorted(invalid_ids):
-        errors.append(f"{campground_id!r}: invalid campground_id, skipped")
-    plan = [entry for entry in plan if entry[0] not in invalid_ids]
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
 
