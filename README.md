@@ -94,9 +94,12 @@ faked. CI runs the same suite on every PR and push to `main`.
 - **Alert delivery:** an APNs 5xx/429 or transport error keeps the watch's
   old `state_hash` so the alert is retried next cycle; a 410 means the
   device token is dead and its row is deleted.
-- **Errors:** the monitor always exits 0 so scheduled runs stay green;
-  per-cycle errors surface as a `::warning::` annotation in the Actions run
-  and in the `run_summaries.errors` column.
+- **Errors:** per-cycle polling and alert errors (recreation.gov failures,
+  unrecognized responses, APNs delivery problems) are contained: the run
+  exits 0 and stays green, with the errors surfaced as a `::warning::`
+  annotation in the Actions run and in the `run_summaries.errors` column.
+  Failures outside that containment — an unreachable Supabase, a malformed
+  `APNS_P8_KEY`, a missing secret — exit non-zero and turn the run red.
 - **Retention:** `sent_alerts` and `run_summaries` rows older than 30 days are
   pruned every run.
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo

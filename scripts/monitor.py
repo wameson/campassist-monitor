@@ -133,18 +133,22 @@ def dedupe_poll_plan(watches: list[dict], today: date) -> list[tuple[str, date]]
 
 # --- recreation.gov -------------------------------------------------------
 
-def parse_availability(raw) -> dict[str, dict]:
+def parse_availability(raw) -> dict[str, dict] | None:
     """Defensively parse a recreation.gov month-availability response.
 
-    Missing or renamed fields degrade to a partial parse — never a crash.
-    Returns {campsite_id: {"campsite_id", "site", "availabilities": {date: status}}}.
+    Missing or renamed fields inside campsites degrade to a partial parse —
+    never a crash. Returns {campsite_id: {"campsite_id", "site",
+    "availabilities": {date: status}}}. A body with no recognizable
+    'campsites' dict returns None (unrecognized response shape — not
+    authoritative); a well-formed empty campsites dict parses to {}
+    (authoritative no availability).
     """
-    sites: dict[str, dict] = {}
     if not isinstance(raw, dict):
-        return sites
+        return None
     campsites = raw.get("campsites")
     if not isinstance(campsites, dict):
-        return sites
+        return None
+    sites: dict[str, dict] = {}
     for cs_key, cs in campsites.items():
         if not isinstance(cs, dict):
             continue
@@ -182,9 +186,11 @@ def poll_with_backoff(
     """GET one campground-month with exponential backoff on 403/429/5xx.
 
     Retries after 2 s, 4 s, 8 s, then gives up for this cycle (returns
-    None) so the rest of the run continues. Once budget_exhausted()
-    reports the cycle's time budget is spent, remaining retries and their
-    backoff sleeps are skipped.
+    None) so the rest of the run continues. A 200 whose body is invalid
+    JSON or has no recognizable campsites dict is a non-retryable failure:
+    the month counts as failed rather than as empty availability. Once
+    budget_exhausted() reports the cycle's time budget is spent, remaining
+    retries and their backoff sleeps are skipped.
     """
     url = AVAILABILITY_URL.format(campground_id=campground_id)
     params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
@@ -199,10 +205,15 @@ def poll_with_backoff(
             failure = f"{campground_id}/{month.isoformat()}: {exc!r}"
         if status == 200:
             try:
-                return parse_availability(resp.json())
+                body = resp.json()
             except ValueError:
                 failure = f"{campground_id}/{month.isoformat()}: invalid JSON"
                 break
+            parsed = parse_availability(body)
+            if parsed is not None:
+                return parsed
+            failure = f"{campground_id}/{month.isoformat()}: unrecognized response body"
+            break
         if status is not None:
             failure = f"{campground_id}/{month.isoformat()}: HTTP {status}"
             if not (status in RETRYABLE_STATUS or status >= 500):

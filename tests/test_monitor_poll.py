@@ -173,15 +173,58 @@ def test_invalid_campground_id_errored(bad_id):
     assert {r["campground_id"] for r in http.requests} == {"222"}
 
 
-@pytest.mark.parametrize(
-    "fixture", ["normal", "missing_campsites", "renamed_fields", "junk_types", "not_a_dict"]
-)
+def test_unrecognized_200_body_is_failed_month():
+    # a 200 whose body has no recognizable campsites dict is treated like a
+    # poll error: no retry, an error recorded for the campground/month, and
+    # the watch keeps its old state_hash instead of advancing to "empty"
+    db = FakeDB({"watches": [make_watch(state_hash="old-hash")]})
+    http = FakeHTTP(lambda cg: FakeResponse(200, load_fixture("availability_missing_campsites")))
+    sleeps = []
+
+    summary = monitor.run(
+        db, FakeAPNs(), http, rng=random.Random(0), sleep=sleeps.append, now_fn=lambda: NOW
+    )
+
+    assert len(http.requests) == 1
+    assert sleeps == []
+    assert "232447/2026-08-01: unrecognized response body" in summary["errors"]
+    watch = db.tables["watches"][0]
+    assert watch["state_hash"] == "old-hash"
+    assert watch["last_checked_at"] is not None
+    assert monitor.error_annotation(summary) is not None
+
+
+def test_wellformed_empty_body_is_authoritative():
+    # a well-formed empty campsites dict is authoritative no-availability:
+    # no error, and the hash advances away from the old state
+    db = FakeDB({"watches": [make_watch(state_hash="old-hash")]})
+    http = FakeHTTP(lambda cg: FakeResponse(200, availability_payload({})))
+
+    summary = monitor.run(
+        db, FakeAPNs(), http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW
+    )
+
+    assert summary["errors"] is None
+    watch = db.tables["watches"][0]
+    assert watch["state_hash"] == monitor.state_hash({})
+
+
+@pytest.mark.parametrize("fixture", ["normal", "renamed_fields", "junk_types"])
 def test_parser_defensive(fixture):
-    # every fixture parses without raising and yields a dict
+    # every fixture with a recognizable campsites dict parses without
+    # raising and yields a dict
     result = monitor.parse_availability(load_fixture(f"availability_{fixture}"))
     assert isinstance(result, dict)
     for entry in result.values():
         assert set(entry) == {"campsite_id", "site", "availabilities"}
+
+
+@pytest.mark.parametrize("fixture", ["missing_campsites", "not_a_dict"])
+def test_parser_unrecognized_body(fixture):
+    # no recognizable campsites dict -> None (not authoritative), while a
+    # well-formed empty campsites dict is an authoritative empty parse
+    assert monitor.parse_availability(load_fixture(f"availability_{fixture}")) is None
+    assert monitor.parse_availability({"campsites": {}}) == {}
 
 
 def test_parser_fixture_contents():
@@ -190,8 +233,8 @@ def test_parser_fixture_contents():
     assert normal["100"]["availabilities"]["2026-08-10"] == "Available"
     assert normal["101"]["availabilities"] == {"2026-08-10": "Reserved", "2026-08-11": "Available"}
 
-    # campsites key missing entirely -> empty parse, no crash
-    assert monitor.parse_availability(load_fixture("availability_missing_campsites")) == {}
+    # campsites key missing entirely -> unrecognized shape, no crash
+    assert monitor.parse_availability(load_fixture("availability_missing_campsites")) is None
 
     # renamed fields degrade to a partial parse: the intact campsite survives,
     # the renamed one falls back to its key with no dates
@@ -206,5 +249,5 @@ def test_parser_fixture_contents():
     assert junk["300"]["campsite_id"] == "300" and junk["300"]["site"] == "300"
     assert junk["303"]["availabilities"] == {}  # availabilities-as-list ignored
 
-    # whole body not a dict -> empty parse
-    assert monitor.parse_availability(load_fixture("availability_not_a_dict")) == {}
+    # whole body not a dict -> unrecognized shape
+    assert monitor.parse_availability(load_fixture("availability_not_a_dict")) is None
