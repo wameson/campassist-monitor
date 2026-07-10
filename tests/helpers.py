@@ -134,6 +134,7 @@ def make_watch(**overrides) -> dict:
         "end_date": "2026-08-12",
         "status": "monitoring",
         "state_hash": None,
+        "consecutive_not_found": 0,
         "created_at": None,
         "last_checked_at": None,
         "last_found_at": None,

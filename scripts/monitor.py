@@ -1,7 +1,7 @@
 """CampAssist availability monitor — one cycle per GitHub Actions run.
 
 Cycle: jittered start → read active watches → expire past-date watches →
-error watches with invalid campground ids →
+error watches with invalid campground ids or persistently-404ing campgrounds →
 dedupe poll plan by (campground_id, month) → poll recreation.gov politely
 (one browser UA per run, shuffled order, 1.2–2.8 s gaps, exponential
 backoff, all under a per-cycle time budget) → delta-detect per watch via
@@ -49,6 +49,7 @@ RETRYABLE_STATUS = {403, 429}
 ALERT_COOLDOWN_HOURS = 6
 RETENTION_DAYS = 30
 POLL_HORIZON_MONTHS = 12
+NOT_FOUND_ERROR_THRESHOLD = 3
 CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -140,14 +141,17 @@ def parse_availability(raw) -> dict[str, dict] | None:
     never a crash. Returns {campsite_id: {"campsite_id", "site",
     "availabilities": {date: status}}}. A body with no recognizable
     'campsites' dict returns None (unrecognized response shape — not
-    authoritative); a well-formed empty campsites dict parses to {}
-    (authoritative no availability).
+    authoritative), as does a non-empty campsites dict in which no entry
+    carries a recognizable availabilities dict (the entry shape itself has
+    changed); a well-formed empty campsites dict — or campsites whose
+    availabilities dicts are genuinely empty — parses as authoritative.
     """
     if not isinstance(raw, dict):
         return None
     campsites = raw.get("campsites")
     if not isinstance(campsites, dict):
         return None
+    recognized = False
     sites: dict[str, dict] = {}
     for cs_key, cs in campsites.items():
         if not isinstance(cs, dict):
@@ -155,6 +159,7 @@ def parse_availability(raw) -> dict[str, dict] | None:
         availabilities = cs.get("availabilities")
         dates: dict[str, str] = {}
         if isinstance(availabilities, dict):
+            recognized = True
             for date_str, status in availabilities.items():
                 if not isinstance(status, str):
                     continue
@@ -170,6 +175,8 @@ def parse_availability(raw) -> dict[str, dict] | None:
             "site": site if isinstance(site, str) else str(cs_key),
             "availabilities": dates,
         }
+    if campsites and not recognized:
+        return None
     return sites
 
 
@@ -182,15 +189,18 @@ def poll_with_backoff(
     sleep=time.sleep,
     errors: list[str] | None = None,
     budget_exhausted=lambda: False,
+    not_found: set[str] | None = None,
 ) -> dict[str, dict] | None:
     """GET one campground-month with exponential backoff on 403/429/5xx.
 
     Retries after 2 s, 4 s, 8 s, then gives up for this cycle (returns
     None) so the rest of the run continues. A 200 whose body is invalid
     JSON or has no recognizable campsites dict is a non-retryable failure:
-    the month counts as failed rather than as empty availability. Once
-    budget_exhausted() reports the cycle's time budget is spent, remaining
-    retries and their backoff sleeps are skipped.
+    the month counts as failed rather than as empty availability. A 404
+    additionally records the campground into `not_found` so the caller can
+    error watches whose campground keeps missing. Once budget_exhausted()
+    reports the cycle's time budget is spent, remaining retries and their
+    backoff sleeps are skipped.
     """
     url = AVAILABILITY_URL.format(campground_id=campground_id)
     params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
@@ -217,6 +227,8 @@ def poll_with_backoff(
         if status is not None:
             failure = f"{campground_id}/{month.isoformat()}: HTTP {status}"
             if not (status in RETRYABLE_STATUS or status >= 500):
+                if status == 404 and not_found is not None:
+                    not_found.add(campground_id)
                 break
         if attempt < len(BACKOFF_DELAYS_SECONDS):
             if budget_exhausted():
@@ -379,6 +391,7 @@ def run(
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
 
+    not_found: set[str] = set()
     availability: dict[tuple[str, date], dict | None] = {}
     for i, (campground_id, month) in enumerate(plan):
         if budget_exhausted():
@@ -389,9 +402,51 @@ def run(
         availability[(campground_id, month)] = poll_with_backoff(
             http, campground_id, month, session_ua,
             sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+            not_found=not_found,
         )
         if i < len(plan) - 1 and not budget_exhausted():
             sleep(inter_request_delay(rng))
+
+    # Backend-owned lifecycle: a syntactically valid campground id that
+    # keeps 404ing (typo or delisted campground) errors its watches after
+    # NOT_FOUND_ERROR_THRESHOLD consecutive cycles instead of warning
+    # forever; any successful poll resets the strike count. All writes here
+    # happen only in the failure/recovery cases, so a healthy no-change
+    # cycle stays within the write budget.
+    polled_ok = {cg for (cg, _), parsed in availability.items() if parsed is not None}
+    strike_updates: dict[int, set] = {}
+    errored_404 = []
+    for watch in active:
+        campground_id = str(watch["campground_id"])
+        strikes = int(watch.get("consecutive_not_found") or 0)
+        if campground_id in polled_ok:
+            if strikes:
+                strike_updates.setdefault(0, set()).add(watch["id"])
+        elif campground_id in not_found:
+            strikes += 1
+            if strikes >= NOT_FOUND_ERROR_THRESHOLD:
+                errored_404.append(watch)
+            else:
+                strike_updates.setdefault(strikes, set()).add(watch["id"])
+    for strikes in sorted(strike_updates):
+        db.patch(
+            "watches",
+            {"id": f"in.({','.join(sorted(str(i) for i in strike_updates[strikes]))})"},
+            {"consecutive_not_found": strikes},
+        )
+    if errored_404:
+        for campground_id in sorted({str(w["campground_id"]) for w in errored_404}):
+            errors.append(
+                f"{campground_id}: not found for {NOT_FOUND_ERROR_THRESHOLD} "
+                "consecutive cycles, watch(es) errored"
+            )
+        db.patch(
+            "watches",
+            {"id": f"in.({','.join(sorted(str(w['id']) for w in errored_404))})"},
+            {"status": "error", "consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
+        )
+        errored_404_ids = {w["id"] for w in errored_404}
+        active = [w for w in active if w["id"] not in errored_404_ids]
 
     alerts_sent = 0
     for watch in active:
@@ -418,16 +473,30 @@ def run(
             {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
         )
 
-    if active:
+    # Bookkeeping covers only watches whose needed months were all attempted
+    # this cycle: when the time budget exhausts mid-plan, skipped watches
+    # keep their old last_checked_at and the summary reports what was
+    # actually polled rather than what was planned.
+    attempted = set(availability)
+    checked = [
+        w for w in active
+        if all(
+            (str(w["campground_id"]), month) in attempted
+            for month in months_for_watch(
+                as_date(w["start_date"]), as_date(w["end_date"]), today
+            )
+        )
+    ]
+    if checked:
         db.patch(
             "watches",
-            {"id": f"in.({','.join(sorted(str(w['id']) for w in active))})"},
+            {"id": f"in.({','.join(sorted(str(w['id']) for w in checked))})"},
             {"last_checked_at": iso_now(now)},
         )
 
     summary = {
-        "watches_checked": len(active),
-        "campgrounds_polled": len({cg for cg, _ in plan}),
+        "watches_checked": len(checked),
+        "campgrounds_polled": len({cg for cg, _ in availability}),
         "alerts_sent": alerts_sent,
         "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(errors) or None,

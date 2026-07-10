@@ -90,7 +90,8 @@ class APNsClient:
     ) -> str:
         """Push an availability alert for a watch. Returns a delivery outcome:
         DELIVERED, PERMANENT_FAILURE (410 Unregistered — token row deleted —
-        other 4xx, or no device token), or RETRYABLE_FAILURE (5xx, 429, or a
+        other 4xx, no device token, or a user-supplied token so malformed the
+        push URL cannot be built), or RETRYABLE_FAILURE (5xx, 429, or a
         transport-level error, recorded into `errors`)."""
         rows = db.select("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
         if not rows:
@@ -115,9 +116,11 @@ class APNsClient:
         }
         try:
             resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             if errors is not None:
                 errors.append(f"apns {watch['id']}: {exc!r}")
+            if isinstance(exc, httpx.InvalidURL):
+                return PERMANENT_FAILURE
             return RETRYABLE_FAILURE
         if resp.status_code == 200:
             return DELIVERED

@@ -14,6 +14,7 @@ CREATE TABLE watches (
     status       TEXT NOT NULL DEFAULT 'monitoring'
                  CHECK (status IN ('monitoring','paused','expired','error')),
     state_hash   TEXT,                               -- delta detection
+    consecutive_not_found INT NOT NULL DEFAULT 0,    -- cycles the campground 404ed; status='error' at 3
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     last_checked_at TIMESTAMPTZ,
     last_found_at   TIMESTAMPTZ

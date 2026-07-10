@@ -82,7 +82,9 @@ faked. CI runs the same suite on every PR and push to `main`.
 - **Time budget:** polling (including backoff retries) stops once an
   8-minute per-cycle budget is spent, keeping every run — even under
   sustained 403/429 blocking — inside the workflow's 15-minute timeout.
-  Skipped campgrounds are simply retried next cycle.
+  Skipped campgrounds are simply retried next cycle; skipped watches keep
+  their old `last_checked_at`, and the run summary counts only what was
+  actually polled.
 - **Poll horizon:** each watch's months are clamped to today through
   today + 12 months; "today" uses a fixed UTC-8 offset so same-night
   openings at US campgrounds stay alertable during US evening hours after
@@ -90,7 +92,9 @@ faked. CI runs the same suite on every PR and push to `main`.
   horizon reaches it.
 - **Watch lifecycle:** the backend expires watches whose end date has
   passed (`status='expired'`) and errors watches with malformed campground
-  ids (`status='error'`, once) — the app never has to clean these up.
+  ids (`status='error'`, once) or whose campground has 404ed for 3
+  consecutive cycles (typo or delisted campground; any successful poll
+  resets the count) — the app never has to clean these up.
 - **Alert delivery:** an APNs 5xx/429 or transport error keeps the watch's
   old `state_hash` so the alert is retried next cycle; a 410 means the
   device token is dead and its row is deleted.

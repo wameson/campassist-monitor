@@ -134,7 +134,12 @@ def test_time_budget_cycle_reaches_bookkeeping():
     assert len(db.calls_of("insert", "run_summaries")) == 1
     assert len(db.calls_of("delete")) == 2
     rows = db.tables["watches"]
-    assert all(r["last_checked_at"] is not None for r in rows)
+    # telemetry reflects only what was actually attempted: skipped watches
+    # keep their old last_checked_at and are not counted as checked
+    checked_rows = [r for r in rows if r["last_checked_at"] is not None]
+    assert 0 < len(checked_rows) < len(rows)
+    assert summary["watches_checked"] == len(checked_rows)
+    assert summary["campgrounds_polled"] == len({r["campground_id"] for r in http.requests})
     # nothing polled successfully -> every watch keeps its old hash for retry
     assert all(r["state_hash"] is None for r in rows)
 
@@ -192,6 +197,111 @@ def test_unrecognized_200_body_is_failed_month():
     assert watch["state_hash"] == "old-hash"
     assert watch["last_checked_at"] is not None
     assert monitor.error_annotation(summary) is not None
+
+
+def test_degraded_entry_shape_is_failed_month():
+    # campsites is non-empty but no entry carries a recognizable
+    # availabilities dict (renamed field / non-dict campsites): the month is
+    # a failed poll like an unrecognized body, not authoritative empty — an
+    # error is recorded and the watch keeps its old state_hash
+    payload = {
+        "campsites": {
+            "100": {
+                "campsite_id": "100",
+                "site": "042",
+                "availability": {"2026-08-10T00:00:00Z": "Available"},
+            },
+            "101": "this campsite is a string, not an object",
+        },
+        "count": 2,
+    }
+    assert monitor.parse_availability(payload) is None
+
+    db = FakeDB({"watches": [make_watch(state_hash="old-hash")]})
+    http = FakeHTTP(lambda cg: FakeResponse(200, payload))
+
+    summary = monitor.run(
+        db, FakeAPNs(), http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW
+    )
+
+    assert "232447/2026-08-01: unrecognized response body" in summary["errors"]
+    assert db.tables["watches"][0]["state_hash"] == "old-hash"
+    assert monitor.error_annotation(summary) is not None
+
+
+def test_empty_availabilities_dicts_are_authoritative():
+    # a well-formed response whose campsites all have genuinely empty
+    # availabilities dicts is authoritative, not a failed month
+    payload = {
+        "campsites": {
+            "100": {"campsite_id": "100", "site": "042", "availabilities": {}},
+        },
+        "count": 1,
+    }
+    parsed = monitor.parse_availability(payload)
+    assert parsed == {
+        "100": {"campsite_id": "100", "site": "042", "availabilities": {}}
+    }
+
+
+QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
+
+
+def test_persistent_404_errors_watch_after_three_cycles():
+    # a syntactically valid campground id that keeps 404ing accumulates one
+    # strike per cycle and moves the watch to status='error' on the third
+    db = FakeDB({"watches": [make_watch()]})
+
+    for cycle in (1, 2):
+        summary = monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
+        row = db.tables["watches"][0]
+        assert row["status"] == "monitoring"
+        assert row["consecutive_not_found"] == cycle
+        assert "HTTP 404" in summary["errors"]
+
+    summary = monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
+    row = db.tables["watches"][0]
+    assert row["status"] == "error"
+    assert row["consecutive_not_found"] == 3
+    assert "consecutive cycles" in summary["errors"]
+    assert summary["watches_checked"] == 0  # errored before bookkeeping
+
+    # next cycle: the errored watch is out of the monitoring pool for good
+    http = FakeHTTP(lambda cg: FakeResponse(404))
+    summary = monitor.run(db, FakeAPNs(), http, **QUIET)
+    assert http.requests == []
+    assert summary["errors"] is None
+
+
+def test_404_strikes_reset_on_successful_poll():
+    db = FakeDB({"watches": [make_watch()]})
+    for _ in range(2):
+        monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
+    assert db.tables["watches"][0]["consecutive_not_found"] == 2
+
+    # a successful poll resets the strike count with one recovery write
+    ok = FakeHTTP(lambda cg: FakeResponse(200, availability_payload({})))
+    db.calls.clear()
+    monitor.run(db, FakeAPNs(), ok, **QUIET)
+    row = db.tables["watches"][0]
+    assert row["status"] == "monitoring"
+    assert row["consecutive_not_found"] == 0
+    reset_patches = [
+        c for c in db.calls_of("patch", "watches") if "consecutive_not_found" in c[3]
+    ]
+    assert len(reset_patches) == 1
+
+    # steady state after recovery: no strike writes at all
+    db.calls.clear()
+    monitor.run(db, FakeAPNs(), ok, **QUIET)
+    assert not any(
+        "consecutive_not_found" in c[3] for c in db.calls_of("patch", "watches")
+    )
+
+    # the counter starts over: a fresh 404 is strike one, not strike three
+    monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
+    row = db.tables["watches"][0]
+    assert row["consecutive_not_found"] == 1 and row["status"] == "monitoring"
 
 
 def test_wellformed_empty_body_is_authoritative():

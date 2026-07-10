@@ -177,6 +177,55 @@ def test_transport_error_is_retryable_and_recorded(signing_key):
     assert len(errors) == 1 and "ConnectError" in errors[0]
 
 
+def test_malformed_token_is_permanent_and_recorded(signing_key):
+    # a user-writable apns_token with a non-printable character makes httpx
+    # raise InvalidURL while building the push URL (not an HTTPError): it is
+    # a permanent failure with an error recorded, never a crash or a retry
+    _, pem = signing_key
+    client = make_client(
+        pem, handler=lambda request: pytest.fail("unbuildable URL must not reach transport")
+    )
+    db = FakeDB({"device_tokens": [
+        {"user_id": "u1", "apns_token": "bad\ntoken", "environment": "production"},
+    ]})
+    errors = []
+
+    outcome = client.send_alert(make_watch(), OPENINGS, db, errors=errors)
+
+    assert outcome == apns.PERMANENT_FAILURE
+    assert len(errors) == 1 and "InvalidURL" in errors[0]
+
+
+def test_malformed_token_does_not_abort_cycle(signing_key):
+    # one user's malformed token is contained: the other watch still alerts,
+    # and the bad watch's hash advances so the dud token is not retried
+    _, pem = signing_key
+    client = make_client(pem)
+    db = FakeDB({
+        "watches": [
+            make_watch(id="w1"),
+            make_watch(id="w2", user_id="u2", campground_id="999"),
+        ],
+        "device_tokens": [
+            {"user_id": "u1", "apns_token": "bad\ntoken", "environment": "production"},
+            {"user_id": "u2", "apns_token": "goodtoken", "environment": "production"},
+        ],
+    })
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+    http = FakeHTTP(lambda cg: FakeResponse(200, payload))
+
+    summary = monitor.run(
+        db, client, http, rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW
+    )
+
+    assert summary["watches_checked"] == 2
+    assert summary["alerts_sent"] == 1
+    assert "InvalidURL" in summary["errors"]
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert all(r["state_hash"] is not None for r in rows.values())
+    assert {r["watch_id"] for r in db.tables["sent_alerts"]} == {"w2"}
+
+
 def test_transport_error_does_not_abort_cycle(signing_key):
     _, pem = signing_key
 
