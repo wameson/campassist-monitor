@@ -478,15 +478,15 @@ def run(
     # keep their old last_checked_at and the summary reports what was
     # actually polled rather than what was planned.
     attempted = set(availability)
-    checked = [
-        w for w in active
-        if all(
-            (str(w["campground_id"]), month) in attempted
-            for month in months_for_watch(
-                as_date(w["start_date"]), as_date(w["end_date"]), today
-            )
+    checked = []
+    for w in active:
+        needed = months_for_watch(
+            as_date(w["start_date"]), as_date(w["end_date"]), today
         )
-    ]
+        if needed and all(
+            (str(w["campground_id"]), month) in attempted for month in needed
+        ):
+            checked.append(w)
     if checked:
         db.patch(
             "watches",

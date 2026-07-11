@@ -175,6 +175,7 @@ def test_transport_error_is_retryable_and_recorded(signing_key):
 
     assert outcome == apns.RETRYABLE_FAILURE
     assert len(errors) == 1 and "ConnectError" in errors[0]
+    assert "connection refused" not in errors[0]  # class name only, no detail
 
 
 def test_malformed_token_is_permanent_and_recorded(signing_key):
@@ -194,6 +195,7 @@ def test_malformed_token_is_permanent_and_recorded(signing_key):
 
     assert outcome == apns.PERMANENT_FAILURE
     assert len(errors) == 1 and "InvalidURL" in errors[0]
+    assert "bad" not in errors[0] and "token" not in errors[0]  # no token fragment
 
 
 def test_malformed_token_does_not_abort_cycle(signing_key):

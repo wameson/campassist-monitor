@@ -118,7 +118,7 @@ class APNsClient:
             resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             if errors is not None:
-                errors.append(f"apns {watch['id']}: {exc!r}")
+                errors.append(f"apns {watch['id']}: {type(exc).__name__}")
             if isinstance(exc, httpx.InvalidURL):
                 return PERMANENT_FAILURE
             return RETRYABLE_FAILURE

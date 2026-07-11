@@ -68,7 +68,8 @@ def test_watch_entirely_beyond_horizon_polls_nothing():
     row = db.tables["watches"][0]
     assert row["status"] == "monitoring"
     assert row["state_hash"] is None  # delta detection deferred, not seeded
-    assert row["last_checked_at"] is not None
+    assert row["last_checked_at"] is None  # zero pollable months: not "checked"
+    assert summary["watches_checked"] == 0
     assert summary["errors"] is None
 
 
