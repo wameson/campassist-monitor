@@ -95,9 +95,11 @@ faked. CI runs the same suite on every PR and push to `main`.
   ids (`status='error'`, once) or whose campground has 404ed for 3
   consecutive cycles (typo or delisted campground; any successful poll
   resets the count) — the app never has to clean these up.
-- **Alert delivery:** an APNs 5xx/429 or transport error keeps the watch's
-  old `state_hash` so the alert is retried next cycle; a 410 means the
-  device token is dead and its row is deleted.
+- **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
+  the watch's old `state_hash` so the alert is retried next cycle; a 410
+  means the device token is dead and its row is deleted. Any other 4xx, a
+  missing token row, or a device token so malformed the push URL can't be
+  built is given up on (no retry) and the watch's hash still advances.
 - **Errors:** per-cycle polling and alert errors (recreation.gov failures,
   unrecognized responses, APNs delivery problems) are contained: the run
   exits 0 and stays green, with the errors surfaced as a `::warning::`
