@@ -1,0 +1,18 @@
+{
+  "campsites": {
+    "200": {
+      "campsiteId": "200",
+      "siteNumber": "051",
+      "avail": {
+        "2026-08-10T00:00:00Z": "Available"
+      }
+    },
+    "201": {
+      "campsite_id": "201",
+      "site": "052",
+      "availabilities": {
+        "2026-08-10T00:00:00Z": "Available"
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "campsites": {
+    "300": {
+      "campsite_id": 300,
+      "site": 42,
+      "availabilities": {
+        "2026-08-10T00:00:00Z": "Available",
+        "not-a-date": "Available",
+        "2026-08-11T00:00:00Z": 7,
+        "2026-08-12T00:00:00Z": null
+      }
+    },
+    "301": "this campsite is a string, not an object",
+    "302": null,
+    "303": {
+      "campsite_id": "303",
+      "site": "045",
+      "availabilities": ["Available", "Reserved"]
+    }
+  }
+}
