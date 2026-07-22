@@ -1,6 +1,12 @@
 -- CampAssist Supabase schema (Phase 1).
 -- Paste this whole file into the Supabase SQL editor and run it once.
 -- Source of truth: CampAssist PLAN.md "Supabase Schema".
+--
+-- This is the fresh-install bootstrap: the full current schema for a brand-new
+-- database. For an EXISTING database, do not re-run this — instead apply any
+-- unapplied files in supabase/migrations/ (idempotent, manual; see README
+-- "Database migrations"). When you change the schema here, add a matching
+-- idempotent migration so already-live databases receive the change too.
 
 CREATE TABLE watches (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -17,7 +17,8 @@ anti-blocking rules, and the recreation.gov API contract.
 | `scripts/monitor.py` | One monitoring cycle: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), retention pruning, run summary |
 | `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
-| `supabase/schema.sql` | Database schema + RLS policies — paste into the Supabase SQL editor |
+| `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
+| `supabase/migrations/` | Ordered, idempotent SQL applied **by hand** to keep **existing** DBs in sync (see [Database migrations](#database-migrations)) |
 | `.github/workflows/monitor.yml` | 30-minute cron + manual `workflow_dispatch` |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
@@ -59,6 +60,32 @@ Actions → **Monitor Campsites** → **Run workflow**. A run with zero watches
 completes cleanly and writes one `run_summaries` row. Scheduled runs then fire
 every 30 minutes (GitHub adds its own 0–5 min cron jitter; the script adds a
 random 0–4 min start delay on top by design).
+
+## Database migrations
+
+`supabase/schema.sql` is only the **fresh-install bootstrap** — running it creates a
+new database with the current schema. It does **not** update a database that already
+exists. When a column or object is added to `schema.sql` later, an already-live DB
+(created from an earlier version) never receives it, and the monitor's writes start
+failing (a column present in `schema.sql` but missing from the pre-existing live DB
+once caused a multi-day PATCH-400 outage). Migrations close that gap.
+
+- **Where:** `supabase/migrations/` holds ordered, numbered files (`0001_<desc>.sql`,
+  `0002_<desc>.sql`, …). Each is **idempotent** (`ADD COLUMN IF NOT EXISTS`,
+  `CREATE INDEX IF NOT EXISTS`, …), so re-running an already-applied one is a no-op.
+- **Applying them (manual):** in the Supabase **SQL Editor**, run each
+  `supabase/migrations/*.sql` that has not yet been applied to that database, in
+  numeric order. Because they are idempotent, running the whole directory in order is
+  always safe if you are unsure which are outstanding. Do this after pulling schema
+  changes and before the next monitor run.
+- **CI does not run migrations** — this is deliberate for now. There is no automation;
+  a human applies them against Supabase by hand. (Fresh installs still just run
+  `schema.sql` once, as in Setup above.)
+- **Adding a migration when you change the schema:** update `supabase/schema.sql` (so
+  fresh installs get the change) **and** add a new `supabase/migrations/NNNN_<desc>.sql`
+  with the next number, using idempotent DDL (so existing DBs get the same change).
+  Keep the two in sync — every additive change to `schema.sql` needs a matching
+  migration.
 
 ## Local development
 
