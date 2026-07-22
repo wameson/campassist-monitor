@@ -67,8 +67,8 @@ random 0–4 min start delay on top by design).
 new database with the current schema. It does **not** update a database that already
 exists. When a column or object is added to `schema.sql` later, an already-live DB
 (created from an earlier version) never receives it, and the monitor's writes start
-failing (an added column once caused a multi-day PATCH-400 outage — see the incident
-report). Migrations close that gap.
+failing (a column present in `schema.sql` but missing from the pre-existing live DB
+once caused a multi-day PATCH-400 outage). Migrations close that gap.
 
 - **Where:** `supabase/migrations/` holds ordered, numbered files (`0001_<desc>.sql`,
   `0002_<desc>.sql`, …). Each is **idempotent** (`ADD COLUMN IF NOT EXISTS`,

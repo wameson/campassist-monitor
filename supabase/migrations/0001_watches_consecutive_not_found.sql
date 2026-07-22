@@ -3,7 +3,8 @@
 -- Why: this column was added to supabase/schema.sql after the watches table was
 -- first created. Databases bootstrapped from the original schema never received
 -- it, so the monitor's PATCH writes to watches started returning HTTP 400 against
--- those live DBs (a 3-day outage). See data/monitor-fail-investigation/report.md.
+-- those live DBs — a schema drift that caused a multi-day outage until the column
+-- was backfilled by hand.
 --
 -- Idempotent: safe to re-run. The captain has already applied this by hand to the
 -- live DB; it is recorded here so fresh installs and existing DBs converge.
