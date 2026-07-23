@@ -9,10 +9,12 @@ systemic still fails the run loudly (B).
 
 import random
 
+import httpx
 import pytest
 
 import monitor
 from helpers import (
+    FAKE_SERVICE_KEY,
     NOW,
     FakeAPNs,
     FakeDB,
@@ -510,6 +512,26 @@ def test_fanout_stops_when_its_allowance_runs_out():
     assert outcome.isolated == frozenset({"w0", "w1"})
 
 
+def test_every_per_id_write_is_charged_to_the_allowance():
+    # the allowance is cycle-wide, so a fan-out that spent it must leave nothing
+    # for the next site: charging a write only when the *next* one is checked
+    # would let every fan-out of the cycle overspend by one full 30 s PATCH
+    clock = Clock()
+    db = FakeDB(fail_on=slow_rejections(clock))
+    budget = monitor.FanoutBudget(50, deadline=10_000, monotonic=clock)
+
+    monitor.patch_watches(db, ["w0", "w1"], {"last_checked_at": "t"}, budget=budget)
+
+    assert len(db.calls_of("patch")) == 3  # the batch plus both per-id writes
+    assert budget.remaining <= 0  # two 30 s writes against a 50 s allowance
+
+    db.calls.clear()
+    outcome = monitor.patch_watches(db, ["w2", "w3"], {"last_checked_at": "t"}, budget=budget)
+
+    assert len(db.calls_of("patch")) == 1  # the batch only: the allowance is gone
+    assert outcome.isolated == frozenset()
+
+
 def test_fanout_stops_at_its_absolute_deadline():
     # the second cap: however much allowance is left, the fan-out may not run
     # past the instant that still leaves room for the summary row and pruning
@@ -595,6 +617,51 @@ def test_permanent_vs_transient_classification():
     assert monitor.is_permanent_failure(postgrest_error(429)) is False
     assert monitor.is_permanent_failure(postgrest_error(503)) is False
     assert monitor.is_permanent_failure(TimeoutError("read timeout")) is False
+
+
+def test_summarize_exception_keeps_the_rejection_reason():
+    exc = postgrest_error(400, "column watches.last_checked_at does not exist")
+    # what httpx itself says: a status line, the request URL and a doc link —
+    # everything except why the write was refused
+    assert "developer.mozilla.org" in str(exc)
+    assert "column watches.last_checked_at" not in str(exc)
+
+    detail = monitor.summarize_exception(exc)
+
+    assert "400" in detail
+    assert "column watches.last_checked_at does not exist" in detail
+    # the boilerplate that used to crowd the reason out of the length cap
+    assert "developer.mozilla.org" not in detail and "rest/v1" not in detail
+    # and never the credentials the rejected request was sent with
+    assert FAKE_SERVICE_KEY not in detail and "apikey" not in detail
+
+    verbose = monitor.summarize_exception(postgrest_error(400, "constraint " * 200))
+    assert len(verbose) <= monitor.MAX_ERROR_MESSAGE_CHARS
+
+
+def test_summarize_exception_falls_back_to_a_non_json_body():
+    # a proxy or gateway between us and PostgREST answers in HTML, not JSON
+    request = httpx.Request("PATCH", "https://project.supabase.invalid/rest/v1/watches")
+    response = httpx.Response(502, request=request, text="upstream connect error")
+    exc = httpx.HTTPStatusError("boom", request=request, response=response)
+
+    detail = monitor.summarize_exception(exc)
+
+    assert "502" in detail and "upstream connect error" in detail
+
+
+def test_recorded_failures_name_the_missing_column():
+    # the outage this branch exists for: an operator reading run_summaries.errors
+    # must learn *which* column the live DB is missing, not just that a PATCH 400ed
+    db, _ = pool(2, fail_on=fails_watch_patch("w0", columns=("last_checked_at",)))
+
+    result, _ = run_cycle(db)
+
+    assert "watch w0: last-checked:" in result["errors"]
+    assert "column watches.last_checked_at does not exist" in result["errors"]
+    assert FAKE_SERVICE_KEY not in result["errors"]
+    assert "developer.mozilla.org" not in result["errors"]
+    assert FAKE_SERVICE_KEY not in monitor.error_annotation(result)
 
 
 def test_error_messages_stay_bounded():

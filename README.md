@@ -138,7 +138,10 @@ faked. CI runs the same suite on every PR and push to `main`.
   and pruning. For the same reason batches larger than `PER_ID_FALLBACK_MAX`
   (50) skip the fan-out entirely, and the fan-out itself is capped twice: it
   may spend `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of wall clock in total
-  across a cycle, and it may never run past `FANOUT_DEADLINE_SECONDS` (600 s)
+  across a cycle — every per-id write is charged when it returns, so however
+  many batches fall back, the cycle's whole fan-out spend is that allowance
+  plus the one PATCH still in flight when it runs out (30 s) — and it may
+  never run past `FANOUT_DEADLINE_SECONDS` (600 s)
   measured from **process start** — so the up-to-240 s start jitter counts
   against it instead of stacking on top of it. The arithmetic closes against
   the workflow's `timeout-minutes: 15` (900 s): 120 s for checkout /
@@ -166,7 +169,11 @@ faked. CI runs the same suite on every PR and push to `main`.
   failures, unrecognized responses, APNs delivery problems) and contained
   per-watch failures are all recorded in the `run_summaries.errors` column
   (a count plus a bounded sample of messages) and surfaced as a
-  `::warning::` annotation. The **exit status is decided by error rate**, so
+  `::warning::` annotation. Each recorded message is one capped line carrying
+  the server's own reason — for a rejected write, the PostgREST body naming
+  the column or constraint at fault, rather than the generic HTTP status line
+  and request URL, so a schema drift says which column is missing.
+  The **exit status is decided by error rate**, so
   a broken watch does not cry wolf but broad breakage cannot hide:
   - *isolated* — the run exits 0 and the schedule stays **green**, because
     the healthy watches were served;

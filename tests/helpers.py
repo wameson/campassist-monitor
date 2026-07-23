@@ -39,12 +39,31 @@ def _matches(row: dict, params: dict | None) -> bool:
     return True
 
 
+FAKE_SERVICE_KEY = "fake-service-role-key"
+
+
 def postgrest_error(status: int = 400, message: str = "column watches.x does not exist"):
     """An httpx.HTTPStatusError shaped like a PostgREST rejection, i.e. what
-    db.SupabaseClient's raise_for_status() raises on a bad write."""
-    request = httpx.Request("PATCH", "https://example.invalid/rest/v1/watches")
-    response = httpx.Response(status, request=request, json={"message": message})
-    return httpx.HTTPStatusError(message, request=request, response=response)
+    db.SupabaseClient's raise_for_status() raises on a bad write — raised by
+    httpx itself, so the exception's own message is the generic status line and
+    doc link a real client produces, and `message` is reachable only through the
+    response body. The request carries service-key headers like the real one, so
+    a rendering that leaked them would show up in the tests."""
+    request = httpx.Request(
+        "PATCH",
+        "https://project.supabase.invalid/rest/v1/watches?id=in.%28w0,w1%29",
+        headers={"apikey": FAKE_SERVICE_KEY, "Authorization": f"Bearer {FAKE_SERVICE_KEY}"},
+    )
+    response = httpx.Response(
+        status,
+        request=request,
+        json={"code": "42703", "message": message, "details": None, "hint": None},
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError(f"status {status} is not an error status")
 
 
 class FakeDB:

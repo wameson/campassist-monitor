@@ -28,6 +28,7 @@ import json
 import random
 import re
 import time
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 
@@ -89,8 +90,11 @@ PER_ID_FALLBACK_MAX = 50
 # = 900 s  the whole job
 #
 # PER_ID_FALLBACK_BUDGET_SECONDS is the second cap: the total wall-clock every
-# fan-out of one cycle may spend between them, charged by elapsed time so an
-# early-finishing poll phase cannot hand the fan-out the leftover budget.
+# fan-out of one cycle may spend between them, charged by the time each per-id
+# write actually takes, so an early-finishing poll phase cannot hand the fan-out
+# the leftover budget. No per-id write starts once the allowance is gone, so a
+# whole cycle's fan-out spend is at most 100 s plus the one PATCH still in
+# flight (30 s, db.py) — across every fan-out site together, not per site.
 JOB_TIMEOUT_SECONDS = 900.0
 JOB_SETUP_RESERVE_SECONDS = 120.0
 SHUTDOWN_RESERVE_SECONDS = 180.0
@@ -389,9 +393,43 @@ def alert_rows(watch: dict, openings: list[dict], now: datetime) -> list[dict]:
 
 # --- failure containment --------------------------------------------------
 
+def rejection_reason(response) -> str:
+    """The server's own account of why a request was rejected: PostgREST answers
+    a bad write with a JSON body naming the column, constraint or payload at
+    fault, which is the one thing an operator needs and the one thing httpx's
+    exception message leaves out. Only body fields are read — never the request,
+    whose headers carry the service-role key."""
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        parts = [str(body[key]) for key in ("message", "details", "hint") if body.get(key)]
+        if parts:
+            return " ".join(parts)
+    try:
+        return response.text or ""
+    except Exception:
+        return ""
+
+
 def summarize_exception(exc: BaseException) -> str:
-    """One-line, length-capped rendering of a contained failure."""
-    detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+    """One-line, length-capped rendering of a contained failure.
+
+    A rejected request is rendered as its status plus the server's reason rather
+    than str(exc): httpx's message spends its length on the full request URL and
+    a documentation link, which would push the reason past
+    MAX_ERROR_MESSAGE_CHARS and leave run_summaries.errors saying only that
+    *something* 400ed.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        detail = f"{type(exc).__name__}: {exc}"
+    else:
+        reason = rejection_reason(response)
+        detail = f"{type(exc).__name__}: {status} {reason}".rstrip()
+    detail = " ".join(detail.split())
     if len(detail) > MAX_ERROR_MESSAGE_CHARS:
         detail = detail[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
     return detail
@@ -435,6 +473,10 @@ class FanoutBudget:
     `allowance` is the total wall-clock every fan-out of one cycle may spend
     between them, charged by the time the per-id writes actually take, so a
     cycle whose polling finished early cannot hand the fan-out the leftover.
+    Each write is charged when it *returns*, the last one of a fan-out included,
+    so one fan-out cannot hand the next site time it has already spent; since no
+    write starts on an exhausted allowance, the cycle overshoots by at most the
+    single PATCH still in flight.
     `deadline` is an absolute monotonic instant derived from process start
     (see FANOUT_DEADLINE_SECONDS). Whichever binds first stops the fan-out,
     so the run always reaches its summary insert and pruning inside the job
@@ -446,17 +488,18 @@ class FanoutBudget:
         self.remaining = float(allowance)
         self.deadline = deadline
         self._monotonic = monotonic
-        self._entered: float | None = None
-
-    def start(self) -> None:
-        self._entered = self._monotonic()
 
     def allowed(self) -> bool:
-        at = self._monotonic()
-        if self._entered is not None:
-            self.remaining -= at - self._entered
-        self._entered = at
-        return self.remaining > 0 and at < self.deadline
+        return self.remaining > 0 and self._monotonic() < self.deadline
+
+    @contextmanager
+    def charging(self):
+        """Charge the allowance for the write run inside, however it ends."""
+        started = self._monotonic()
+        try:
+            yield
+        finally:
+            self.remaining -= self._monotonic() - started
 
 
 def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = None) -> PatchOutcome:
@@ -491,14 +534,13 @@ def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = No
         return PatchOutcome({watch_id: batch_failure for watch_id in ids}, frozenset())
     failures: dict[str, BaseException] = {}
     isolated: set[str] = set()
-    if budget is not None:
-        budget.start()
     for watch_id in ids:
         if budget is not None and not budget.allowed():
             failures[watch_id] = batch_failure
             continue
         try:
-            db.patch("watches", {"id": f"eq.{watch_id}"}, data)
+            with budget.charging() if budget is not None else nullcontext():
+                db.patch("watches", {"id": f"eq.{watch_id}"}, data)
         except Exception as exc:  # containment boundary
             failures[watch_id] = exc
             isolated.add(watch_id)
