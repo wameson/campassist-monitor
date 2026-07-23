@@ -14,10 +14,11 @@ at most 5 DB writes regardless of watch count.
 Failure containment: a failure that belongs to one watch is caught,
 recorded, and skipped — never propagated — so the rest of the watches are
 still polled and alerted and the cycle still writes its run summary and
-prunes. The exit status is then decided by error *rate*: isolated failures
-keep the scheduled run green (and mark their own watch status='error'),
-while breakage crossing the systemic threshold exits non-zero so the
-Action turns red.
+prunes. Only a failure a write actually pinned to one row moves that watch
+to status='error'. The exit status is then decided by error *rate* over the
+watches the cycle actually tried to serve: isolated failures keep the
+scheduled run green, while breakage crossing the systemic threshold exits
+non-zero so the Action turns red.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import random
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
+from typing import NamedTuple
 
 import httpx
 
@@ -62,11 +64,11 @@ CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 # Systemic-failure threshold (tune here). A cycle exits non-zero only when
 # contained watch failures affect more than SYSTEMIC_ERROR_RATE of the watches
-# it handled AND at least SYSTEMIC_ERROR_FLOOR watches. The rate is what makes
-# broad breakage loud — a whole-pool write failure once ran green-looking for
-# days; the floor keeps one bad row in a tiny pool (1 of 2) from crying wolf,
-# while 2 of 2 still goes red. Failures that belong to no watch (the
-# run_summaries INSERT, retention pruning) are always systemic.
+# it actually tried to serve AND at least SYSTEMIC_ERROR_FLOOR watches. The
+# rate is what makes broad breakage loud — a whole-pool write failure once ran
+# green-looking for days; the floor keeps one bad row in a tiny pool (1 of 2)
+# from crying wolf, while 2 of 2 still goes red. Failures that belong to no
+# watch (the run_summaries INSERT, retention pruning) are always systemic.
 SYSTEMIC_ERROR_RATE = 0.25
 SYSTEMIC_ERROR_FLOOR = 2
 # Caps on what a failing cycle may cost: error text stays readable, and a
@@ -75,6 +77,11 @@ SYSTEMIC_ERROR_FLOOR = 2
 MAX_ERROR_MESSAGE_CHARS = 200
 MAX_LOGGED_WATCH_ERRORS = 10
 PER_ID_FALLBACK_MAX = 50
+# Wall-clock room, past the poll budget, that per-id fan-out may use. The
+# fan-out runs after polling, so its worst case is this plus one in-flight
+# request (≤30 s in db.py) — it must never eat the workflow's 15-minute
+# timeout, or the run dies before the summary row and the pruning.
+PER_ID_FALLBACK_BUDGET_SECONDS = 300.0
 
 
 # --- jitter ---------------------------------------------------------------
@@ -383,38 +390,73 @@ def is_permanent_failure(exc: BaseException) -> bool:
     return status is not None and 400 <= status < 500 and status != 429
 
 
-def patch_watches(db, watch_ids, data: dict) -> dict[str, BaseException]:
+class PatchOutcome(NamedTuple):
+    """Which watches a batched PATCH could not write, and which of those
+    failures a write actually *pinned* to that row (`isolated`).
+
+    An unpinned failure is one exception blamed on every id in the batch;
+    nobody showed that row is bad, so it may be recorded and counted but must
+    never move a watch to status='error' — users must not have to recreate a
+    watch over a failure that was never attributed to it.
+    """
+
+    failures: dict[str, BaseException]
+    isolated: frozenset[str]
+
+
+def isolated_failure(watch_id: str, exc: BaseException) -> PatchOutcome:
+    """A failure the caller already pinned to exactly one watch."""
+    return PatchOutcome({watch_id: exc}, frozenset({watch_id}))
+
+
+def patch_watches(db, watch_ids, data: dict, *, fanout_allowed=lambda: True) -> PatchOutcome:
     """PATCH `data` onto many watches, isolating the row that is actually bad.
 
     The healthy path is the single batched `id=in.(…)` write the write budget
-    assumes. If that batch fails, it is retried one id at a time so one
-    unwritable row cannot silently drop everyone else's update — unless the
-    batch is larger than PER_ID_FALLBACK_MAX, where a fan-out would be both
-    expensive and pointless (a failure that broad is systemic, not one row).
-    Returns {watch_id: exception} for the ids that could not be written.
+    assumes. Only a *permanently* rejected batch (a PostgREST 4xx other than
+    429) is retried one id at a time, so one unwritable row cannot silently
+    drop everyone else's update. A transient batch failure (429, 5xx, timeout,
+    transport error) is never fanned out: it marks nothing errored, so
+    isolating it buys nothing, while dozens of sequential 30-second PATCHes
+    against a struggling Supabase would blow the workflow timeout and kill the
+    run before its summary and pruning. For the same reason a fan-out stops
+    once `fanout_allowed()` goes false, and a batch larger than
+    PER_ID_FALLBACK_MAX is not fanned out at all.
+
+    Ids the fan-out never reached — and every id of a batch that was not fanned
+    out — carry the batch exception but are absent from `isolated`.
     """
     ids = sorted(str(i) for i in watch_ids)
     if not ids:
-        return {}
+        return PatchOutcome({}, frozenset())
     try:
         db.patch("watches", {"id": f"in.({','.join(ids)})"}, data)
-        return {}
+        return PatchOutcome({}, frozenset())
     except Exception as exc:  # containment boundary
         batch_failure = exc
-    if len(ids) == 1 or len(ids) > PER_ID_FALLBACK_MAX:
-        return {watch_id: batch_failure for watch_id in ids}
+    if len(ids) == 1:
+        # the batch *was* a single-row write, so it named the bad row itself
+        return isolated_failure(ids[0], batch_failure)
+    if not is_permanent_failure(batch_failure) or len(ids) > PER_ID_FALLBACK_MAX:
+        return PatchOutcome({watch_id: batch_failure for watch_id in ids}, frozenset())
     failures: dict[str, BaseException] = {}
+    isolated: set[str] = set()
     for watch_id in ids:
+        if not fanout_allowed():
+            failures[watch_id] = batch_failure
+            continue
         try:
             db.patch("watches", {"id": f"eq.{watch_id}"}, data)
         except Exception as exc:  # containment boundary
             failures[watch_id] = exc
-    return failures
+            isolated.add(watch_id)
+    return PatchOutcome(failures, frozenset(isolated))
 
 
 def is_systemic(failed: int, considered: int) -> bool:
     """Whether this cycle's contained watch failures are broad enough to fail
-    the run (see SYSTEMIC_ERROR_RATE / SYSTEMIC_ERROR_FLOOR)."""
+    the run (see SYSTEMIC_ERROR_RATE / SYSTEMIC_ERROR_FLOOR). Both counts are
+    over the watches the cycle actually tried to serve."""
     if failed < SYSTEMIC_ERROR_FLOOR:
         return False
     return failed > considered * SYSTEMIC_ERROR_RATE
@@ -432,36 +474,52 @@ def run(
     now_fn=lambda: datetime.now(timezone.utc),
     monotonic=time.monotonic,
     time_budget_seconds: float = CYCLE_TIME_BUDGET_SECONDS,
+    per_id_fallback_budget_seconds: float = PER_ID_FALLBACK_BUDGET_SECONDS,
 ) -> dict:
     rng = rng or random.Random()
     started = monotonic()
     deadline = started + time_budget_seconds
+    # Fan-out runs after the poll budget is spent, so it gets its own deadline
+    # rather than sharing budget_exhausted() (which is already true by then).
+    fanout_deadline = deadline + per_id_fallback_budget_seconds
 
     def budget_exhausted() -> bool:
         return monotonic() >= deadline
+
+    def fanout_allowed() -> bool:
+        return monotonic() < fanout_deadline
 
     errors: list[str] = []
     now = now_fn()
     today = monitor_today(now)
 
     # Contained failures. watch_failures holds the first failure per watch
-    # (its message); mark_errored is the subset whose failure looks permanent
-    # and so should surface on the watch itself; cycle_failures are failures
-    # attributable to no single watch, which are systemic by definition.
+    # (its message); mark_errored is the subset whose failure was pinned to
+    # that row *and* looks permanent, so it should surface on the watch itself;
+    # blocked_ids are watches whose failure stops the cycle from serving them
+    # further; cycle_failures are failures attributable to no single watch,
+    # which are systemic by definition.
     watch_failures: dict[str, str] = {}
     mark_errored: set[str] = set()
+    blocked_ids: set[str] = set()
     cycle_failures: list[str] = []
 
-    def record_failures(failures: dict[str, BaseException], context: str, *, errorable=True) -> None:
-        for watch_id, exc in failures.items():
-            if watch_id in watch_failures:
-                continue  # one watch, one recorded failure
-            watch_failures[watch_id] = f"{context}: {summarize_exception(exc)}"
-            if errorable and is_permanent_failure(exc):
-                mark_errored.add(watch_id)
+    def write_watches(watch_ids, data: dict) -> PatchOutcome:
+        return patch_watches(db, watch_ids, data, fanout_allowed=fanout_allowed)
 
-    def failed(watch: dict) -> bool:
-        return str(watch["id"]) in watch_failures
+    def record_failures(
+        outcome: PatchOutcome, context: str, *, errorable=True, blocking=True
+    ) -> None:
+        for watch_id, exc in outcome.failures.items():
+            if watch_id not in watch_failures:  # one watch, one recorded failure
+                watch_failures[watch_id] = f"{context}: {summarize_exception(exc)}"
+                if errorable and watch_id in outcome.isolated and is_permanent_failure(exc):
+                    mark_errored.add(watch_id)
+            if blocking:
+                blocked_ids.add(watch_id)
+
+    def blocked(watch: dict) -> bool:
+        return str(watch["id"]) in blocked_ids
 
     watches = db.select("watches", {"status": "eq.monitoring"})
 
@@ -471,7 +529,10 @@ def run(
     expired_ids = {w["id"] for w in watches if as_date(w["end_date"]) < today}
     if expired_ids:
         record_failures(
-            patch_watches(db, expired_ids, {"status": "expired"}), "expire", errorable=False
+            write_watches(expired_ids, {"status": "expired"}),
+            "expire",
+            errorable=False,
+            blocking=False,
         )
     active = [w for w in watches if w["id"] not in expired_ids]
 
@@ -485,9 +546,10 @@ def run(
         # errorable=False: this write *is* the status='error' write, so there
         # is nothing for the end-of-cycle marking to retry.
         record_failures(
-            patch_watches(db, (w["id"] for w in invalid), {"status": "error"}),
+            write_watches((w["id"] for w in invalid), {"status": "error"}),
             "error-invalid",
             errorable=False,
+            blocking=False,
         )
         invalid_watch_ids = {w["id"] for w in invalid}
         active = [w for w in active if w["id"] not in invalid_watch_ids]
@@ -533,10 +595,16 @@ def run(
                 errored_404.append(watch)
             else:
                 strike_updates.setdefault(strikes, set()).add(watch["id"])
+    # The strike count is bookkeeping: a rejected write is recorded and counted,
+    # but must neither error the watch nor stop the cycle from serving it. The
+    # reset group is the case that matters — those campgrounds polled fine this
+    # cycle, so those watches may have a new opening to alert on.
     for strikes in sorted(strike_updates):
         record_failures(
-            patch_watches(db, strike_updates[strikes], {"consecutive_not_found": strikes}),
+            write_watches(strike_updates[strikes], {"consecutive_not_found": strikes}),
             "strike-count",
+            errorable=False,
+            blocking=False,
         )
     if errored_404:
         for campground_id in sorted({str(w["campground_id"]) for w in errored_404}):
@@ -545,12 +613,12 @@ def run(
                 "consecutive cycles, watch(es) errored"
             )
         record_failures(
-            patch_watches(
-                db,
+            write_watches(
                 (w["id"] for w in errored_404),
                 {"status": "error", "consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
             ),
             "error-404",
+            blocking=False,
         )
         errored_404_ids = {w["id"] for w in errored_404}
         active = [w for w in active if w["id"] not in errored_404_ids]
@@ -560,8 +628,8 @@ def run(
     # others still alert, and the cycle still reaches its bookkeeping below.
     alerts_sent = 0
     for watch in active:
-        if failed(watch):
-            continue  # already failed a lifecycle write this cycle
+        if blocked(watch):
+            continue  # already failed a lifecycle write that blocks serving it
         try:
             current = extract_relevant(availability, watch, today)
             if current is None:
@@ -586,47 +654,66 @@ def run(
                 {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
             )
         except Exception as exc:  # containment boundary
-            record_failures({str(watch["id"]): exc}, "process")
+            record_failures(isolated_failure(str(watch["id"]), exc), "process")
 
-    # Bookkeeping covers only watches whose needed months were all attempted
-    # this cycle: when the time budget exhausts mid-plan, skipped watches
-    # keep their old last_checked_at and the summary reports what was
-    # actually polled rather than what was planned.
+    # The served set: watches this cycle actually tried to serve — still active
+    # after the lifecycle passes (not expired this cycle, not errored for an
+    # invalid or persistently-404ing campground) and not left unpolled by the
+    # time budget. It is both the denominator and the scope of the numerator of
+    # the systemic rate, so a cycle that failed every watch it served goes red
+    # however many watches left the pool for unrelated reasons.
+    #
+    # Bookkeeping covers the served watches whose needed months were all
+    # attempted: skipped watches keep their old last_checked_at and the summary
+    # reports what was actually polled rather than what was planned.
     attempted = set(availability)
-    checked = []
+    served, checked = [], []
     for w in active:
-        if failed(w):
-            continue  # a failed watch was not successfully checked
         needed = months_for_watch(
             as_date(w["start_date"]), as_date(w["end_date"]), today
         )
-        if needed and all(
-            (str(w["campground_id"]), month) in attempted for month in needed
-        ):
+        if not all((str(w["campground_id"]), month) in attempted for month in needed):
+            continue  # never reached: the poll time budget ran out first
+        served.append(w)
+        if needed and not blocked(w):
             checked.append(w)
+    served_ids = {str(w["id"]) for w in served}
     if checked:
-        failures = patch_watches(db, (w["id"] for w in checked), {"last_checked_at": iso_now(now)})
-        record_failures(failures, "last-checked")
-        checked = [w for w in checked if not failed(w)]
+        outcome = write_watches((w["id"] for w in checked), {"last_checked_at": iso_now(now)})
+        record_failures(outcome, "last-checked")
+        checked = [w for w in checked if str(w["id"]) not in outcome.failures]
 
     # Threshold gate (B): decide isolated vs systemic before writing the
     # summary, so the run_summaries row records which verdict was reached.
-    considered = len(watches)
-    systemic = is_systemic(len(watch_failures), considered)
+    considered = len(served)
+    failed_served = sum(1 for watch_id in watch_failures if watch_id in served_ids)
+    systemic = is_systemic(failed_served, considered)
 
     # Isolated, permanent failures surface on the watch itself (A) so the user
     # sees a broken watch instead of one that silently stops updating. Systemic
     # breakage is the operator's to fix, so the pool is left intact rather than
-    # erroring every watch at once.
+    # erroring every watch at once. Failing to mark belongs to no watch — it is
+    # a DB-level problem that would otherwise leave every affected watch quietly
+    # 'monitoring' — so it counts as systemic.
     if mark_errored and not systemic:
-        for watch_id, exc in patch_watches(db, mark_errored, {"status": "error"}).items():
+        outcome = write_watches(mark_errored, {"status": "error"})
+        for watch_id, exc in outcome.failures.items():
             errors.append(f"watch {watch_id}: error-mark: {summarize_exception(exc)}")
+        if outcome.failures:
+            cycle_failures.append(
+                f"error-mark: {len(outcome.failures)} of {len(mark_errored)} watch(es) "
+                "could not be moved to status='error'"
+            )
 
     if watch_failures:
-        errors.append(
-            f"{len(watch_failures)} of {considered} watch(es) failed this cycle "
+        tally = (
+            f"{failed_served} of {considered} served watch(es) failed this cycle "
             f"({'systemic' if systemic else 'isolated'})"
         )
+        unserved = len(watch_failures) - failed_served
+        if unserved:
+            tally += f", plus {unserved} on watch(es) this cycle did not serve"
+        errors.append(tally)
         for watch_id in sorted(watch_failures)[:MAX_LOGGED_WATCH_ERRORS]:
             errors.append(f"watch {watch_id}: {watch_failures[watch_id]}")
         undisplayed = len(watch_failures) - MAX_LOGGED_WATCH_ERRORS

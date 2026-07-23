@@ -27,6 +27,19 @@ QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 OPEN_PAYLOAD = availability_payload({"100": {"2026-08-10": "Available"}})
 
 
+class Clock:
+    """Monotonic stand-in the test advances by hand."""
+
+    def __init__(self, now: float = 0.0):
+        self.now = now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def fails_watch_patch(*watch_ids, columns=None, status=400):
     """Reject any watches PATCH that touches one of `watch_ids` — optionally
     only when it writes one of `columns`, which is how a column missing from a
@@ -88,7 +101,7 @@ def test_isolated_write_failure_completes_the_cycle():
     assert result["systemic_failure"] is False
     assert monitor.exit_code(result) == 0
     assert result["watch_errors"] == 1 and result["watches_considered"] == 4
-    assert "1 of 4 watch(es) failed this cycle (isolated)" in result["errors"]
+    assert "1 of 4 served watch(es) failed this cycle (isolated)" in result["errors"]
     assert "watch w1: last-checked:" in result["errors"]
     assert monitor.error_annotation(result).startswith("::warning::")
     assert monitor.failure_annotation(result) is None
@@ -144,6 +157,78 @@ def test_batched_write_falls_back_to_per_id():
     assert [c[2]["id"] for c in checked[1:]] == ["eq.w0", "eq.w1", "eq.w2", "eq.w3"]
 
 
+def test_unattributed_batch_failure_never_errors_watches():
+    # 51 watches share a campground that has now 404ed three cycles running.
+    # Their batched status='error' write is too big to fan out, so one exception
+    # is blamed on every row without showing any single row is bad — those
+    # watches must be counted and logged, never parked in status='error' where
+    # their users would have to recreate them.
+    doomed = [
+        make_watch(
+            id=f"d{i}",
+            user_id=f"u{i}",
+            campground_id="9999",
+            consecutive_not_found=monitor.NOT_FOUND_ERROR_THRESHOLD - 1,
+        )
+        for i in range(monitor.PER_ID_FALLBACK_MAX + 1)
+    ]
+    healthy = [make_watch(id=f"h{i}", user_id=f"v{i}") for i in range(4)]
+
+    def fail_on(call):
+        if call[0] == "patch" and call[1] == "watches" and "status" in call[3]:
+            return postgrest_error(400, "column watches.consecutive_not_found does not exist")
+        return None
+
+    db = FakeDB({"watches": doomed + healthy}, fail_on=fail_on)
+    apns = FakeAPNs()
+    result = monitor.run(
+        db,
+        apns,
+        FakeHTTP(
+            lambda cg: FakeResponse(404) if cg == "9999" else FakeResponse(200, OPEN_PAYLOAD)
+        ),
+        **QUIET,
+    )
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert all(rows[w["id"]]["status"] == "monitoring" for w in doomed)
+    # one batch, no fan-out, and no end-of-cycle status='error' retry either
+    assert len([c for c in db.calls_of("patch", "watches") if "status" in c[3]]) == 1
+    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+
+    # the healthy watches were served, and the failures are still counted
+    assert sorted(w for w, _ in apns.alerts) == ["h0", "h1", "h2", "h3"]
+    assert result["watch_errors"] == len(doomed)
+    assert result["watches_considered"] == 4
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    assert f"plus {len(doomed)} on watch(es) this cycle did not serve" in result["errors"]
+
+
+def test_strike_count_failure_still_serves_the_watch():
+    # a rejected consecutive_not_found write is bookkeeping only: the watch's
+    # campground polled fine and may have a new opening, so it must still be
+    # delta-checked, alerted and stamped — and never errored
+    watches = [make_watch(id=f"w{i}", user_id=f"u{i}") for i in range(4)]
+    watches[1]["consecutive_not_found"] = 1  # a reset is due for w1
+    db = FakeDB(
+        {"watches": watches},
+        fail_on=fails_watch_patch("w1", columns=("consecutive_not_found",)),
+    )
+
+    result, apns = run_cycle(db)
+
+    assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
+    row = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert row["state_hash"] and row["last_checked_at"] is not None
+    assert row["status"] == "monitoring"
+    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+
+    # recorded and counted, but isolated — the run stays green
+    assert result["watch_errors"] == 1 and result["watches_checked"] == 4
+    assert "watch w1: strike-count:" in result["errors"]
+    assert monitor.exit_code(result) == 0
+
+
 def test_healthy_cycle_keeps_the_write_budget():
     # containment must not cost the no-change cycle any extra write
     db, _ = pool(50)
@@ -169,7 +254,7 @@ def test_systemic_failure_exits_nonzero():
     assert result["systemic_failure"] is True
     assert monitor.exit_code(result) == 1
     assert monitor.failure_annotation(result).startswith("::error::")
-    assert "4 of 4 watch(es) failed this cycle (systemic)" in result["errors"]
+    assert "4 of 4 served watch(es) failed this cycle (systemic)" in result["errors"]
 
     # the summary row and pruning still run: the cycle reports, then fails
     assert len(db.calls_of("insert", "run_summaries")) == 1
@@ -198,6 +283,73 @@ def test_summary_and_retention_failures_are_systemic():
     assert "::error::" in monitor.failure_annotation(result)
     # the watches themselves were served normally
     assert all(r["last_checked_at"] is not None for r in db.tables["watches"])
+
+
+def test_expired_watches_are_out_of_the_systemic_rate():
+    # 8 of 10 watches expire this cycle; the 2 the cycle actually served both
+    # fail. 2-of-10 would look isolated and stay green — 2-of-2 is total
+    # breakage of everything this run tried to do, and must go red.
+    expired = [
+        make_watch(id=f"e{i}", user_id=f"u{i}", start_date="2026-06-30", end_date="2026-07-01")
+        for i in range(8)
+    ]
+    served = [make_watch(id=f"w{i}", user_id=f"v{i}") for i in range(2)]
+    db = FakeDB({"watches": expired + served}, fail_on=fails_watch_patch("w0", "w1"))
+
+    result, _ = run_cycle(db)
+
+    assert all(r["status"] == "expired" for r in db.tables["watches"] if r["id"].startswith("e"))
+    assert result["watches_considered"] == 2 and result["watch_errors"] == 2
+    assert "2 of 2 served watch(es) failed this cycle (systemic)" in result["errors"]
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+
+
+def test_watches_the_poll_budget_never_reached_are_out_of_the_rate():
+    # the time budget cuts the plan short; the watches that were never polled
+    # were not served, so they belong in neither side of the rate
+    clock = Clock()
+    watches = [make_watch(id=f"w{i}", user_id=f"u{i}", campground_id=f"c{i}") for i in range(3)]
+    db = FakeDB({"watches": watches}, fail_on=fails_watch_patch("w0", "w1", "w2"))
+
+    result = monitor.run(
+        db,
+        FakeAPNs(),
+        FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        rng=random.Random(0),
+        sleep=lambda s: clock.tick(1000),
+        now_fn=lambda: NOW,
+        monotonic=clock,
+        time_budget_seconds=100,
+    )
+
+    assert "time budget exhausted: skipped 2 remaining poll(s)" in result["errors"]
+    assert result["watches_considered"] == 1  # only the campground actually polled
+    assert result["watch_errors"] == 1
+
+
+def test_failing_to_mark_a_watch_errored_is_systemic():
+    # the end-of-cycle status='error' write is the last chance to surface a
+    # broken watch; losing it for the whole set must not pass silently
+    def fail_on(call):
+        if call[0] != "patch" or call[1] != "watches":
+            return None
+        ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        if "w1" in ids and set(call[3]) & {"state_hash", "status"}:
+            return postgrest_error(400)
+        return None
+
+    db, _ = pool(4, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    row = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert row["status"] == "monitoring"  # the mark never landed
+    assert "watch w1: error-mark:" in result["errors"]
+    assert "error-mark: 1 of 1 watch(es) could not be moved" in result["cycle_errors"]
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+    # the run still reported and pruned before going red
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert len(db.calls_of("delete")) == 2
 
 
 @pytest.mark.parametrize(
@@ -233,37 +385,103 @@ def test_exit_code_and_annotations():
 
 def test_patch_watches_batches_then_isolates():
     db = FakeDB({"watches": [make_watch(id=f"w{i}") for i in range(3)]})
-    assert monitor.patch_watches(db, [], {"status": "expired"}) == {}
+    assert monitor.patch_watches(db, [], {"status": "expired"}).failures == {}
     assert db.calls == []
 
-    assert monitor.patch_watches(db, ["w0", "w1"], {"status": "paused"}) == {}
+    assert monitor.patch_watches(db, ["w0", "w1"], {"status": "paused"}).failures == {}
     assert [c[2]["id"] for c in db.calls_of("patch")] == ["in.(w0,w1)"]
 
     db.fail_on = fails_watch_patch("w1", columns=("state_hash",))
     db.calls.clear()
-    failures = monitor.patch_watches(db, ["w0", "w1", "w2"], {"state_hash": "h"})
-    assert set(failures) == {"w1"}
-    assert monitor.is_permanent_failure(failures["w1"]) is True
+    outcome = monitor.patch_watches(db, ["w0", "w1", "w2"], {"state_hash": "h"})
+    assert set(outcome.failures) == {"w1"}
+    # the per-id write pinned the failure to w1, so it may be errored
+    assert outcome.isolated == frozenset({"w1"})
+    assert monitor.is_permanent_failure(outcome.failures["w1"]) is True
     rows = {r["id"]: r for r in db.tables["watches"]}
     assert rows["w0"]["state_hash"] == "h" and rows["w2"]["state_hash"] == "h"
     assert rows["w1"]["state_hash"] is None
 
-    # a single id is not retried: the batch write was already that one write
+    # a single id is not retried: the batch write was already that one write,
+    # and it named the bad row itself
     db.calls.clear()
-    failures = monitor.patch_watches(db, ["w1"], {"state_hash": "h"})
-    assert set(failures) == {"w1"} and len(db.calls_of("patch")) == 1
+    outcome = monitor.patch_watches(db, ["w1"], {"state_hash": "h"})
+    assert set(outcome.failures) == {"w1"} and len(db.calls_of("patch")) == 1
+    assert outcome.isolated == frozenset({"w1"})
 
 
 def test_large_failing_batch_does_not_fan_out():
     # a batch too big to isolate is systemic anyway; retrying it row by row
-    # would spend hundreds of writes to learn the same thing
+    # would spend hundreds of writes to learn the same thing. Nothing pinned
+    # the failure to any row, so none of them may be errored.
     ids = [f"w{i}" for i in range(monitor.PER_ID_FALLBACK_MAX + 1)]
     db = FakeDB(fail_on=lambda call: postgrest_error(400))
 
-    failures = monitor.patch_watches(db, ids, {"last_checked_at": "t"})
+    outcome = monitor.patch_watches(db, ids, {"last_checked_at": "t"})
 
-    assert set(failures) == set(ids)
+    assert set(outcome.failures) == set(ids)
+    assert outcome.isolated == frozenset()
     assert len(db.calls_of("patch")) == 1
+
+
+def test_transient_batch_failure_does_not_fan_out():
+    # a 503 marks nothing errored, so isolating it buys nothing — and dozens of
+    # sequential 30 s PATCHes against a struggling Supabase would blow the
+    # workflow timeout and kill the run before its summary row and pruning
+    ids = [f"w{i}" for i in range(4)]
+    db = FakeDB(fail_on=lambda call: postgrest_error(503))
+
+    outcome = monitor.patch_watches(db, ids, {"last_checked_at": "t"})
+
+    assert set(outcome.failures) == set(ids)
+    assert outcome.isolated == frozenset()
+    assert len(db.calls_of("patch")) == 1
+
+
+def test_fanout_stops_when_its_time_budget_runs_out():
+    # the fan-out is bounded: ids it never reached carry the batch failure and
+    # stay unattributed, so they are counted but never errored
+    ids = [f"w{i}" for i in range(4)]
+    db = FakeDB(fail_on=lambda call: postgrest_error(400))
+    allowed = iter([True, True, False, False])
+
+    outcome = monitor.patch_watches(
+        db, ids, {"last_checked_at": "t"}, fanout_allowed=lambda: next(allowed)
+    )
+
+    assert len(db.calls_of("patch")) == 3  # the batch plus two per-id writes
+    assert set(outcome.failures) == set(ids)
+    assert outcome.isolated == frozenset({"w0", "w1"})
+
+
+def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
+    # run() wires a deadline into the fan-out: a Supabase slow enough to eat the
+    # job timeout one row at a time is cut off, and the cycle still reports
+    clock = Clock()
+
+    def fail_on(call):
+        exc = fails_watch_patch("w0", "w1", "w2", "w3", columns=("last_checked_at",))(call)
+        if exc is not None:
+            clock.tick(200)  # each rejected round-trip is slow
+        return exc
+
+    db, _ = pool(4, fail_on=fail_on)
+    apns = FakeAPNs()
+    result = monitor.run(
+        db, apns, FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        **QUIET,
+        monotonic=clock,
+        time_budget_seconds=300,
+        per_id_fallback_budget_seconds=0,
+    )
+
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    assert len(checked) == 2  # the batch plus one per-id write, then cut off
+    # the cycle still served everyone and reached its end-of-cycle bookkeeping
+    assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert len(db.calls_of("delete")) == 2
+    assert monitor.exit_code(result) == 1  # every served watch failed: loud
 
 
 def test_permanent_vs_transient_classification():

@@ -127,14 +127,27 @@ faked. CI runs the same suite on every PR and push to `main`.
   write, a malformed row — is caught, recorded, and skipped; it never
   aborts the cycle. The other watches are still polled and alerted, and the
   run still writes its `run_summaries` row and prunes. Batched watch writes
-  (`id=in.(…)`) are attempted as one write, as the write budget assumes, and
-  only *on failure* fall back to one write per id, so a single unwritable
-  row cannot silently drop everyone else's update (batches larger than
-  `PER_ID_FALLBACK_MAX` skip the fan-out — a failure that broad is systemic
-  anyway). A permanently rejected write (a PostgREST 4xx other than 429:
-  missing column, constraint violation) moves that one watch to
-  `status='error'` so it surfaces to its user; a transient failure (429,
-  5xx, timeout) leaves it `monitoring` to retry next cycle.
+  (`id=in.(…)`) are attempted as one write, as the write budget assumes.
+  Only a *permanently* rejected batch (a PostgREST 4xx other than 429:
+  missing column, constraint violation) falls back to one write per id, so a
+  single unwritable row cannot silently drop everyone else's update. A
+  transient batch failure (429, 5xx, timeout, transport error) is never
+  fanned out: it errors nothing, so isolating it buys nothing, while dozens
+  of sequential 30-second PATCHes against a struggling Supabase would blow
+  the workflow's 15-minute timeout and kill the run before its summary row
+  and pruning. For the same reason the fan-out stops at
+  `PER_ID_FALLBACK_BUDGET_SECONDS` past the poll budget, and batches larger
+  than `PER_ID_FALLBACK_MAX` skip it entirely.
+
+  A watch moves to `status='error'` only when the failure was **pinned to
+  that row** — a single-watch write, a per-id fallback write, or its own
+  per-watch processing — and looks permanent. A batch failure nobody
+  attributed to a specific row is recorded and counted but never errors a
+  watch: users must not have to recreate a watch over a failure that was
+  never shown to be theirs. A transient failure likewise leaves the watch
+  `monitoring` to retry next cycle. Strike-count (`consecutive_not_found`)
+  writes are pure bookkeeping: a rejected one is recorded, but the watch is
+  still delta-checked, alerted, and stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
   means the device token is dead and its row is deleted. Any other 4xx, a
@@ -150,11 +163,18 @@ faked. CI runs the same suite on every PR and push to `main`.
     the healthy watches were served;
   - *systemic* — the run prints an `::error::` annotation, exits non-zero
     and turns the schedule **red**. Systemic means more than
-    `SYSTEMIC_ERROR_RATE` (25%) of the cycle's watches failed **and** at
-    least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of 2 stays green
-    while 2 of 2 goes red — or that a failure belonging to no watch (the
-    `run_summaries` INSERT, retention pruning) occurred. Both constants live
-    at the top of `scripts/monitor.py` and are the tuning knobs.
+    `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
+    failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
+    2 stays green while 2 of 2 goes red — or that a failure belonging to no
+    watch (the `run_summaries` INSERT, retention pruning, or being unable to
+    write `status='error'`) occurred. Both constants live at the top of
+    `scripts/monitor.py` and are the tuning knobs.
+
+    The served set is the rate's denominator *and* the scope of its
+    numerator: it excludes watches that expired this cycle, that were errored
+    for an invalid or persistently-404ing campground, and that the poll time
+    budget never reached. A cycle that failed every watch it served goes red
+    no matter how much of the pool left for unrelated reasons.
 
   Systemic runs deliberately leave the watch pool untouched: broad breakage
   is the operator's to fix, not something users should have to recreate
