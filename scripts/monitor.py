@@ -77,11 +77,31 @@ SYSTEMIC_ERROR_FLOOR = 2
 MAX_ERROR_MESSAGE_CHARS = 200
 MAX_LOGGED_WATCH_ERRORS = 10
 PER_ID_FALLBACK_MAX = 50
-# Wall-clock room, past the poll budget, that per-id fan-out may use. The
-# fan-out runs after polling, so its worst case is this plus one in-flight
-# request (≤30 s in db.py) — it must never eat the workflow's 15-minute
-# timeout, or the run dies before the summary row and the pruning.
-PER_ID_FALLBACK_BUDGET_SECONDS = 300.0
+# The per-id fan-out must never cost the run its summary row and its pruning,
+# so it is capped twice and the arithmetic closes against the workflow's
+# `timeout-minutes: 15` (900 s, .github/workflows/monitor.yml):
+#
+#   120 s  job setup      checkout + setup-python + pip install
+# + 600 s  FANOUT_DEADLINE_SECONDS, measured from PROCESS start — the start
+#          jitter main() sleeps (≤240 s) is inside it, not on top of it
+# + 180 s  shutdown       one in-flight PATCH (30 s, db.py) + the run_summaries
+#                         insert and both prunes (30 s each), plus margin
+# = 900 s  the whole job
+#
+# PER_ID_FALLBACK_BUDGET_SECONDS is the second cap: the total wall-clock every
+# fan-out of one cycle may spend between them, charged by elapsed time so an
+# early-finishing poll phase cannot hand the fan-out the leftover budget.
+JOB_TIMEOUT_SECONDS = 900.0
+JOB_SETUP_RESERVE_SECONDS = 120.0
+SHUTDOWN_RESERVE_SECONDS = 180.0
+FANOUT_DEADLINE_SECONDS = (
+    JOB_TIMEOUT_SECONDS - JOB_SETUP_RESERVE_SECONDS - SHUTDOWN_RESERVE_SECONDS
+)
+PER_ID_FALLBACK_BUDGET_SECONDS = 100.0
+
+# Process start, captured at import — before main() sleeps its start jitter —
+# so the fan-out deadline covers the jitter instead of stacking on top of it.
+PROCESS_STARTED = time.monotonic()
 
 
 # --- jitter ---------------------------------------------------------------
@@ -409,7 +429,37 @@ def isolated_failure(watch_id: str, exc: BaseException) -> PatchOutcome:
     return PatchOutcome({watch_id: exc}, frozenset({watch_id}))
 
 
-def patch_watches(db, watch_ids, data: dict, *, fanout_allowed=lambda: True) -> PatchOutcome:
+class FanoutBudget:
+    """Cycle-wide cap on the per-id fallback, enforcing two limits at once.
+
+    `allowance` is the total wall-clock every fan-out of one cycle may spend
+    between them, charged by the time the per-id writes actually take, so a
+    cycle whose polling finished early cannot hand the fan-out the leftover.
+    `deadline` is an absolute monotonic instant derived from process start
+    (see FANOUT_DEADLINE_SECONDS). Whichever binds first stops the fan-out,
+    so the run always reaches its summary insert and pruning inside the job
+    timeout — a run killed mid-fan-out is the silent outage all of this
+    exists to prevent.
+    """
+
+    def __init__(self, allowance: float, deadline: float, monotonic=time.monotonic):
+        self.remaining = float(allowance)
+        self.deadline = deadline
+        self._monotonic = monotonic
+        self._entered: float | None = None
+
+    def start(self) -> None:
+        self._entered = self._monotonic()
+
+    def allowed(self) -> bool:
+        at = self._monotonic()
+        if self._entered is not None:
+            self.remaining -= at - self._entered
+        self._entered = at
+        return self.remaining > 0 and at < self.deadline
+
+
+def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = None) -> PatchOutcome:
     """PATCH `data` onto many watches, isolating the row that is actually bad.
 
     The healthy path is the single batched `id=in.(…)` write the write budget
@@ -419,9 +469,9 @@ def patch_watches(db, watch_ids, data: dict, *, fanout_allowed=lambda: True) -> 
     transport error) is never fanned out: it marks nothing errored, so
     isolating it buys nothing, while dozens of sequential 30-second PATCHes
     against a struggling Supabase would blow the workflow timeout and kill the
-    run before its summary and pruning. For the same reason a fan-out stops
-    once `fanout_allowed()` goes false, and a batch larger than
-    PER_ID_FALLBACK_MAX is not fanned out at all.
+    run before its summary and pruning. For the same reason a fan-out stops as
+    soon as `budget` is spent, and a batch larger than PER_ID_FALLBACK_MAX is
+    not fanned out at all.
 
     Ids the fan-out never reached — and every id of a batch that was not fanned
     out — carry the batch exception but are absent from `isolated`.
@@ -441,8 +491,10 @@ def patch_watches(db, watch_ids, data: dict, *, fanout_allowed=lambda: True) -> 
         return PatchOutcome({watch_id: batch_failure for watch_id in ids}, frozenset())
     failures: dict[str, BaseException] = {}
     isolated: set[str] = set()
+    if budget is not None:
+        budget.start()
     for watch_id in ids:
-        if not fanout_allowed():
+        if budget is not None and not budget.allowed():
             failures[watch_id] = batch_failure
             continue
         try:
@@ -474,20 +526,27 @@ def run(
     now_fn=lambda: datetime.now(timezone.utc),
     monotonic=time.monotonic,
     time_budget_seconds: float = CYCLE_TIME_BUDGET_SECONDS,
+    process_started: float | None = None,
     per_id_fallback_budget_seconds: float = PER_ID_FALLBACK_BUDGET_SECONDS,
+    fanout_deadline_seconds: float = FANOUT_DEADLINE_SECONDS,
 ) -> dict:
     rng = rng or random.Random()
     started = monotonic()
     deadline = started + time_budget_seconds
-    # Fan-out runs after the poll budget is spent, so it gets its own deadline
-    # rather than sharing budget_exhausted() (which is already true by then).
-    fanout_deadline = deadline + per_id_fallback_budget_seconds
+    # The fan-out runs after the poll budget is spent, so it cannot share
+    # budget_exhausted() (already true by then) and gets its own cap instead —
+    # anchored to process start, not to run() entry, so the start jitter counts
+    # against it rather than being added on top of it.
+    if process_started is None:
+        process_started = PROCESS_STARTED
+    fanout_budget = FanoutBudget(
+        per_id_fallback_budget_seconds,
+        process_started + fanout_deadline_seconds,
+        monotonic,
+    )
 
     def budget_exhausted() -> bool:
         return monotonic() >= deadline
-
-    def fanout_allowed() -> bool:
-        return monotonic() < fanout_deadline
 
     errors: list[str] = []
     now = now_fn()
@@ -505,16 +564,18 @@ def run(
     cycle_failures: list[str] = []
 
     def write_watches(watch_ids, data: dict) -> PatchOutcome:
-        return patch_watches(db, watch_ids, data, fanout_allowed=fanout_allowed)
+        return patch_watches(db, watch_ids, data, budget=fanout_budget)
 
     def record_failures(
         outcome: PatchOutcome, context: str, *, errorable=True, blocking=True
     ) -> None:
         for watch_id, exc in outcome.failures.items():
-            if watch_id not in watch_failures:  # one watch, one recorded failure
-                watch_failures[watch_id] = f"{context}: {summarize_exception(exc)}"
-                if errorable and watch_id in outcome.isolated and is_permanent_failure(exc):
-                    mark_errored.add(watch_id)
+            # One watch, one recorded message — but every failure still gets
+            # its own say on whether the watch is errored, so an earlier
+            # bookkeeping-only failure cannot shadow a later isolated one.
+            watch_failures.setdefault(watch_id, f"{context}: {summarize_exception(exc)}")
+            if errorable and watch_id in outcome.isolated and is_permanent_failure(exc):
+                mark_errored.add(watch_id)
             if blocking:
                 blocked_ids.add(watch_id)
 
@@ -658,24 +719,27 @@ def run(
 
     # The served set: watches this cycle actually tried to serve — still active
     # after the lifecycle passes (not expired this cycle, not errored for an
-    # invalid or persistently-404ing campground) and not left unpolled by the
-    # time budget. It is both the denominator and the scope of the numerator of
-    # the systemic rate, so a cycle that failed every watch it served goes red
-    # however many watches left the pool for unrelated reasons.
+    # invalid or persistently-404ing campground), with something pollable this
+    # cycle, and not left unpolled by the time budget. It is both the
+    # denominator and the scope of the numerator of the systemic rate, so a
+    # cycle that failed every watch it served goes red however many watches left
+    # the pool — or never entered it — for unrelated reasons.
     #
-    # Bookkeeping covers the served watches whose needed months were all
-    # attempted: skipped watches keep their old last_checked_at and the summary
-    # reports what was actually polled rather than what was planned.
+    # Bookkeeping covers exactly the served watches that were not blocked:
+    # skipped watches keep their old last_checked_at and the summary reports
+    # what was actually polled rather than what was planned.
     attempted = set(availability)
     served, checked = [], []
     for w in active:
         needed = months_for_watch(
             as_date(w["start_date"]), as_date(w["end_date"]), today
         )
+        if not needed:
+            continue  # wholly beyond the poll horizon: nothing to serve yet
         if not all((str(w["campground_id"]), month) in attempted for month in needed):
             continue  # never reached: the poll time budget ran out first
         served.append(w)
-        if needed and not blocked(w):
+        if not blocked(w):
             checked.append(w)
     served_ids = {str(w["id"]) for w in served}
     if checked:

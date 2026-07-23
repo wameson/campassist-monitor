@@ -135,9 +135,18 @@ faked. CI runs the same suite on every PR and push to `main`.
   fanned out: it errors nothing, so isolating it buys nothing, while dozens
   of sequential 30-second PATCHes against a struggling Supabase would blow
   the workflow's 15-minute timeout and kill the run before its summary row
-  and pruning. For the same reason the fan-out stops at
-  `PER_ID_FALLBACK_BUDGET_SECONDS` past the poll budget, and batches larger
-  than `PER_ID_FALLBACK_MAX` skip it entirely.
+  and pruning. For the same reason batches larger than `PER_ID_FALLBACK_MAX`
+  (50) skip the fan-out entirely, and the fan-out itself is capped twice: it
+  may spend `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of wall clock in total
+  across a cycle, and it may never run past `FANOUT_DEADLINE_SECONDS` (600 s)
+  measured from **process start** — so the up-to-240 s start jitter counts
+  against it instead of stacking on top of it. The arithmetic closes against
+  the workflow's `timeout-minutes: 15` (900 s): 120 s for checkout /
+  setup-python / pip, 600 s to the fan-out deadline, 180 s of shutdown
+  reserve for one in-flight PATCH (30 s) plus the summary insert and both
+  prunes. A worst-case run — full jitter and a full poll budget — therefore
+  gets no fan-out at all, which is the right trade: reaching the summary row
+  and the pruning matters more than isolating one row.
 
   A watch moves to `status='error'` only when the failure was **pinned to
   that row** — a single-watch write, a per-id fallback write, or its own
@@ -171,10 +180,13 @@ faked. CI runs the same suite on every PR and push to `main`.
     `scripts/monitor.py` and are the tuning knobs.
 
     The served set is the rate's denominator *and* the scope of its
-    numerator: it excludes watches that expired this cycle, that were errored
-    for an invalid or persistently-404ing campground, and that the poll time
-    budget never reached. A cycle that failed every watch it served goes red
-    no matter how much of the pool left for unrelated reasons.
+    numerator, so the ratio can never exceed 1. It excludes watches that
+    expired this cycle, that were errored for an invalid or
+    persistently-404ing campground, that are wholly beyond the 12-month poll
+    horizon (nothing to poll for them yet), and that the poll time budget
+    never reached. A cycle that failed every watch it served goes red no
+    matter how much of the pool left — or never entered — for unrelated
+    reasons.
 
   Systemic runs deliberately leave the watch pool untouched: broad breakage
   is the operator's to fix, not something users should have to recreate

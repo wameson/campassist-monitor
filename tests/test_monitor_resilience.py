@@ -229,6 +229,29 @@ def test_strike_count_failure_still_serves_the_watch():
     assert monitor.exit_code(result) == 0
 
 
+def test_bookkeeping_failure_does_not_shadow_a_later_isolated_failure():
+    # w1's strike-count write is rejected first (bookkeeping only, so it never
+    # errors the watch), and its own state_hash write is then rejected too. The
+    # earlier, non-errorable record must not swallow the later isolated one, or
+    # the watch silently stops updating instead of surfacing as broken.
+    watches = [make_watch(id=f"w{i}", user_id=f"u{i}") for i in range(4)]
+    watches[1]["consecutive_not_found"] = 1
+    db = FakeDB(
+        {"watches": watches},
+        fail_on=fails_watch_patch("w1", columns=("consecutive_not_found", "state_hash")),
+    )
+
+    result, apns = run_cycle(db)
+
+    assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
+    row = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert row["status"] == "error"
+    # one watch, one message: the first failure is the one that is logged
+    assert result["watch_errors"] == 1
+    assert "watch w1: strike-count:" in result["errors"]
+    assert monitor.exit_code(result) == 0
+
+
 def test_healthy_cycle_keeps_the_write_budget():
     # containment must not cost the no-change cycle any extra write
     db, _ = pool(50)
@@ -299,6 +322,25 @@ def test_expired_watches_are_out_of_the_systemic_rate():
     result, _ = run_cycle(db)
 
     assert all(r["status"] == "expired" for r in db.tables["watches"] if r["id"].startswith("e"))
+    assert result["watches_considered"] == 2 and result["watch_errors"] == 2
+    assert "2 of 2 served watch(es) failed this cycle (systemic)" in result["errors"]
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+
+
+def test_beyond_horizon_watches_are_out_of_the_systemic_rate():
+    # 8 of 10 watches start past the 12-month poll horizon: the cycle never
+    # polls them, never writes them and cannot alert them. They must not dilute
+    # the rate for the 2 watches it did work for and failed.
+    beyond = [
+        make_watch(id=f"b{i}", user_id=f"u{i}", start_date="2028-06-01", end_date="2028-06-05")
+        for i in range(8)
+    ]
+    servable = [make_watch(id=f"w{i}", user_id=f"v{i}") for i in range(2)]
+    db = FakeDB({"watches": beyond + servable}, fail_on=fails_watch_patch("w0", "w1"))
+
+    result, _ = run_cycle(db)
+
+    assert all(r["status"] == "monitoring" for r in db.tables["watches"])
     assert result["watches_considered"] == 2 and result["watch_errors"] == 2
     assert "2 of 2 served watch(es) failed this cycle (systemic)" in result["errors"]
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
@@ -438,50 +480,113 @@ def test_transient_batch_failure_does_not_fan_out():
     assert len(db.calls_of("patch")) == 1
 
 
-def test_fanout_stops_when_its_time_budget_runs_out():
-    # the fan-out is bounded: ids it never reached carry the batch failure and
-    # stay unattributed, so they are counted but never errored
-    ids = [f"w{i}" for i in range(4)]
-    db = FakeDB(fail_on=lambda call: postgrest_error(400))
-    allowed = iter([True, True, False, False])
+def slow_rejections(clock, seconds=30, columns=None, watch_ids=("w0", "w1", "w2", "w3")):
+    """Reject watch PATCHes, each costing `seconds` — a Supabase degraded into
+    burning db.py's httpx timeout on every round-trip."""
+    reject = fails_watch_patch(*watch_ids, columns=columns)
 
-    outcome = monitor.patch_watches(
-        db, ids, {"last_checked_at": "t"}, fanout_allowed=lambda: next(allowed)
-    )
+    def fail_on(call):
+        exc = reject(call)
+        if exc is not None:
+            clock.tick(seconds)
+        return exc
+
+    return fail_on
+
+
+def test_fanout_stops_when_its_allowance_runs_out():
+    # the fan-out is bounded by the time it actually spends: ids it never
+    # reached carry the batch failure and stay unattributed, so they are
+    # counted but never errored
+    ids = [f"w{i}" for i in range(4)]
+    clock = Clock()
+    db = FakeDB(fail_on=slow_rejections(clock, watch_ids=ids))
+    budget = monitor.FanoutBudget(50, deadline=10_000, monotonic=clock)
+
+    outcome = monitor.patch_watches(db, ids, {"last_checked_at": "t"}, budget=budget)
 
     assert len(db.calls_of("patch")) == 3  # the batch plus two per-id writes
     assert set(outcome.failures) == set(ids)
     assert outcome.isolated == frozenset({"w0", "w1"})
 
 
-def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
-    # run() wires a deadline into the fan-out: a Supabase slow enough to eat the
-    # job timeout one row at a time is cut off, and the cycle still reports
+def test_fanout_stops_at_its_absolute_deadline():
+    # the second cap: however much allowance is left, the fan-out may not run
+    # past the instant that still leaves room for the summary row and pruning
+    ids = [f"w{i}" for i in range(4)]
     clock = Clock()
+    db = FakeDB(fail_on=slow_rejections(clock, watch_ids=ids))
+    budget = monitor.FanoutBudget(10_000, deadline=90, monotonic=clock)
 
-    def fail_on(call):
-        exc = fails_watch_patch("w0", "w1", "w2", "w3", columns=("last_checked_at",))(call)
-        if exc is not None:
-            clock.tick(200)  # each rejected round-trip is slow
-        return exc
+    outcome = monitor.patch_watches(db, ids, {"last_checked_at": "t"}, budget=budget)
 
-    db, _ = pool(4, fail_on=fail_on)
+    assert len(db.calls_of("patch")) == 3
+    assert outcome.isolated == frozenset({"w0", "w1"})
+
+
+def test_fanout_deadline_fits_inside_the_job_timeout():
+    # the arithmetic must close: setup + fan-out deadline + shutdown reserve
+    # cannot exceed the workflow's timeout-minutes: 15, and the start jitter
+    # lives inside the deadline rather than stacking on top of it
+    assert (
+        monitor.JOB_SETUP_RESERVE_SECONDS
+        + monitor.FANOUT_DEADLINE_SECONDS
+        + monitor.SHUTDOWN_RESERVE_SECONDS
+    ) <= monitor.JOB_TIMEOUT_SECONDS
+    assert (
+        monitor.START_JITTER_MAX_SECONDS + monitor.CYCLE_TIME_BUDGET_SECONDS
+        > monitor.FANOUT_DEADLINE_SECONDS
+    )  # a worst-case jitter + poll phase leaves no fan-out room at all
+
+
+def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
+    # run() wires the allowance into the fan-out: a Supabase slow enough to eat
+    # the job timeout one row at a time is cut off, and the cycle still reports
+    clock = Clock()
+    db, _ = pool(4, fail_on=slow_rejections(clock, columns=("last_checked_at",)))
     apns = FakeAPNs()
+
     result = monitor.run(
         db, apns, FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
         **QUIET,
         monotonic=clock,
-        time_budget_seconds=300,
-        per_id_fallback_budget_seconds=0,
+        process_started=0.0,
+        per_id_fallback_budget_seconds=50,
     )
 
     checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
-    assert len(checked) == 2  # the batch plus one per-id write, then cut off
+    assert len(checked) == 3  # the batch plus two per-id writes, then cut off
     # the cycle still served everyone and reached its end-of-cycle bookkeeping
     assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
     assert len(db.calls_of("insert", "run_summaries")) == 1
     assert len(db.calls_of("delete")) == 2
     assert monitor.exit_code(result) == 1  # every served watch failed: loud
+
+
+def test_run_anchors_the_fanout_deadline_to_process_start():
+    # the start jitter main() sleeps counts against the fan-out, so a run that
+    # started late gets no fan-out at all — reaching the summary row and the
+    # pruning matters more than isolating one row
+    clock = Clock(monitor.FANOUT_DEADLINE_SECONDS + 100)
+    db, _ = pool(4, fail_on=fails_watch_patch("w0", "w1", "w2", "w3",
+                                              columns=("last_checked_at",)))
+    apns = FakeAPNs()
+
+    result = monitor.run(
+        db, apns, FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        **QUIET,
+        monotonic=clock,
+        process_started=0.0,
+    )
+
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    assert len(checked) == 1  # the batch only: no room left to fan out
+    # nothing was pinned to a row, so nobody is parked in status='error'
+    assert all(r["status"] == "monitoring" for r in db.tables["watches"])
+    assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert len(db.calls_of("delete")) == 2
+    assert monitor.exit_code(result) == 1
 
 
 def test_permanent_vs_transient_classification():
