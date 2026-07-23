@@ -2,13 +2,17 @@
 
 FakeDB implements the same interface as db.SupabaseClient against
 in-memory tables, supporting the PostgREST filter subset the monitor
-uses (eq, in, lt). FakeHTTP stands in for the recreation.gov client.
-No test touches the network or real secrets.
+uses (eq, in, lt), and can be given a `fail_on` hook that raises for
+chosen calls the way a real PostgREST rejection would. FakeHTTP stands
+in for the recreation.gov client. No test touches the network or real
+secrets.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+
+import httpx
 
 from apns import DELIVERED
 
@@ -35,12 +39,29 @@ def _matches(row: dict, params: dict | None) -> bool:
     return True
 
 
+def postgrest_error(status: int = 400, message: str = "column watches.x does not exist"):
+    """An httpx.HTTPStatusError shaped like a PostgREST rejection, i.e. what
+    db.SupabaseClient's raise_for_status() raises on a bad write."""
+    request = httpx.Request("PATCH", "https://example.invalid/rest/v1/watches")
+    response = httpx.Response(status, request=request, json={"message": message})
+    return httpx.HTTPStatusError(message, request=request, response=response)
+
+
 class FakeDB:
-    def __init__(self, tables: dict | None = None):
+    def __init__(self, tables: dict | None = None, fail_on=None):
         self.tables: dict[str, list[dict]] = {t: [] for t in TABLES}
         for name, rows in (tables or {}).items():
             self.tables[name] = [dict(r) for r in rows]
         self.calls: list[tuple] = []
+        # fail_on(call_tuple) -> exception to raise, or None to let it through
+        self.fail_on = fail_on or (lambda call: None)
+
+    def _guard(self, call: tuple) -> None:
+        """Raise for an injected fault after recording the attempt — a real
+        client also issues the request before learning it was rejected."""
+        exc = self.fail_on(call)
+        if exc is not None:
+            raise exc
 
     @property
     def write_count(self) -> int:
@@ -50,16 +71,22 @@ class FakeDB:
         return [c for c in self.calls if c[0] == op and (table is None or c[1] == table)]
 
     def select(self, table, params=None):
-        self.calls.append(("select", table, params))
+        call = ("select", table, params)
+        self.calls.append(call)
+        self._guard(call)
         return [dict(r) for r in self.tables[table] if _matches(r, params)]
 
     def insert(self, table, rows):
-        self.calls.append(("insert", table, rows))
+        call = ("insert", table, rows)
+        self.calls.append(call)
+        self._guard(call)
         rows = [rows] if isinstance(rows, dict) else rows
         self.tables[table].extend(dict(r) for r in rows)
 
     def upsert(self, table, rows, on_conflict=None):
-        self.calls.append(("upsert", table, rows))
+        call = ("upsert", table, rows)
+        self.calls.append(call)
+        self._guard(call)
         rows = [rows] if isinstance(rows, dict) else rows
         keys = on_conflict.split(",") if on_conflict else None
         for row in rows:
@@ -76,13 +103,17 @@ class FakeDB:
                 self.tables[table].append(dict(row))
 
     def patch(self, table, params, data):
-        self.calls.append(("patch", table, params, data))
+        call = ("patch", table, params, data)
+        self.calls.append(call)
+        self._guard(call)
         for row in self.tables[table]:
             if _matches(row, params):
                 row.update(data)
 
     def delete(self, table, params):
-        self.calls.append(("delete", table, params))
+        call = ("delete", table, params)
+        self.calls.append(call)
+        self._guard(call)
         self.tables[table] = [r for r in self.tables[table] if not _matches(r, params)]
 
 

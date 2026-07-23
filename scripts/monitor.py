@@ -10,6 +10,14 @@ last_checked_at write → one run_summaries row → 30-day retention pruning.
 
 Write budget (see PLAN.md): a cycle with no availability changes performs
 at most 5 DB writes regardless of watch count.
+
+Failure containment: a failure that belongs to one watch is caught,
+recorded, and skipped — never propagated — so the rest of the watches are
+still polled and alerted and the cycle still writes its run summary and
+prunes. The exit status is then decided by error *rate*: isolated failures
+keep the scheduled run green (and mark their own watch status='error'),
+while breakage crossing the systemic threshold exits non-zero so the
+Action turns red.
 """
 
 from __future__ import annotations
@@ -51,6 +59,22 @@ RETENTION_DAYS = 30
 POLL_HORIZON_MONTHS = 12
 NOT_FOUND_ERROR_THRESHOLD = 3
 CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+# Systemic-failure threshold (tune here). A cycle exits non-zero only when
+# contained watch failures affect more than SYSTEMIC_ERROR_RATE of the watches
+# it handled AND at least SYSTEMIC_ERROR_FLOOR watches. The rate is what makes
+# broad breakage loud — a whole-pool write failure once ran green-looking for
+# days; the floor keeps one bad row in a tiny pool (1 of 2) from crying wolf,
+# while 2 of 2 still goes red. Failures that belong to no watch (the
+# run_summaries INSERT, retention pruning) are always systemic.
+SYSTEMIC_ERROR_RATE = 0.25
+SYSTEMIC_ERROR_FLOOR = 2
+# Caps on what a failing cycle may cost: error text stays readable, and a
+# batched write that fails for a large pool is not retried one row at a time
+# (it is systemic anyway — fanning out would spend hundreds of writes).
+MAX_ERROR_MESSAGE_CHARS = 200
+MAX_LOGGED_WATCH_ERRORS = 10
+PER_ID_FALLBACK_MAX = 50
 
 
 # --- jitter ---------------------------------------------------------------
@@ -336,6 +360,66 @@ def alert_rows(watch: dict, openings: list[dict], now: datetime) -> list[dict]:
     ]
 
 
+# --- failure containment --------------------------------------------------
+
+def summarize_exception(exc: BaseException) -> str:
+    """One-line, length-capped rendering of a contained failure."""
+    detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+    if len(detail) > MAX_ERROR_MESSAGE_CHARS:
+        detail = detail[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+    return detail
+
+
+def is_permanent_failure(exc: BaseException) -> bool:
+    """True when a contained DB failure would fail identically next cycle.
+
+    A PostgREST 4xx other than 429 is a rejected *request* — missing column,
+    constraint violation, malformed payload — so retrying it forever is
+    pointless and the watch it belongs to is marked status='error' instead.
+    429s, 5xx, timeouts and transport errors are transient: the watch stays
+    'monitoring' and is simply retried next cycle.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status is not None and 400 <= status < 500 and status != 429
+
+
+def patch_watches(db, watch_ids, data: dict) -> dict[str, BaseException]:
+    """PATCH `data` onto many watches, isolating the row that is actually bad.
+
+    The healthy path is the single batched `id=in.(…)` write the write budget
+    assumes. If that batch fails, it is retried one id at a time so one
+    unwritable row cannot silently drop everyone else's update — unless the
+    batch is larger than PER_ID_FALLBACK_MAX, where a fan-out would be both
+    expensive and pointless (a failure that broad is systemic, not one row).
+    Returns {watch_id: exception} for the ids that could not be written.
+    """
+    ids = sorted(str(i) for i in watch_ids)
+    if not ids:
+        return {}
+    try:
+        db.patch("watches", {"id": f"in.({','.join(ids)})"}, data)
+        return {}
+    except Exception as exc:  # containment boundary
+        batch_failure = exc
+    if len(ids) == 1 or len(ids) > PER_ID_FALLBACK_MAX:
+        return {watch_id: batch_failure for watch_id in ids}
+    failures: dict[str, BaseException] = {}
+    for watch_id in ids:
+        try:
+            db.patch("watches", {"id": f"eq.{watch_id}"}, data)
+        except Exception as exc:  # containment boundary
+            failures[watch_id] = exc
+    return failures
+
+
+def is_systemic(failed: int, considered: int) -> bool:
+    """Whether this cycle's contained watch failures are broad enough to fail
+    the run (see SYSTEMIC_ERROR_RATE / SYSTEMIC_ERROR_FLOOR)."""
+    if failed < SYSTEMIC_ERROR_FLOOR:
+        return False
+    return failed > considered * SYSTEMIC_ERROR_RATE
+
+
 # --- main cycle -----------------------------------------------------------
 
 def run(
@@ -360,15 +444,34 @@ def run(
     now = now_fn()
     today = monitor_today(now)
 
+    # Contained failures. watch_failures holds the first failure per watch
+    # (its message); mark_errored is the subset whose failure looks permanent
+    # and so should surface on the watch itself; cycle_failures are failures
+    # attributable to no single watch, which are systemic by definition.
+    watch_failures: dict[str, str] = {}
+    mark_errored: set[str] = set()
+    cycle_failures: list[str] = []
+
+    def record_failures(failures: dict[str, BaseException], context: str, *, errorable=True) -> None:
+        for watch_id, exc in failures.items():
+            if watch_id in watch_failures:
+                continue  # one watch, one recorded failure
+            watch_failures[watch_id] = f"{context}: {summarize_exception(exc)}"
+            if errorable and is_permanent_failure(exc):
+                mark_errored.add(watch_id)
+
+    def failed(watch: dict) -> bool:
+        return str(watch["id"]) in watch_failures
+
     watches = db.select("watches", {"status": "eq.monitoring"})
 
-    # Backend-owned lifecycle: expire past-date watches (one batched write)
+    # Backend-owned lifecycle: expire past-date watches (one batched write).
+    # An expiring watch is leaving the pool either way, so a failure here is
+    # recorded but never turned into status='error' (errorable=False).
     expired_ids = {w["id"] for w in watches if as_date(w["end_date"]) < today}
     if expired_ids:
-        db.patch(
-            "watches",
-            {"id": f"in.({','.join(sorted(str(i) for i in expired_ids))})"},
-            {"status": "expired"},
+        record_failures(
+            patch_watches(db, expired_ids, {"status": "expired"}), "expire", errorable=False
         )
     active = [w for w in watches if w["id"] not in expired_ids]
 
@@ -379,10 +482,12 @@ def run(
     if invalid:
         for campground_id in sorted({str(w["campground_id"]) for w in invalid}):
             errors.append(f"{campground_id!r}: invalid campground_id, skipped")
-        db.patch(
-            "watches",
-            {"id": f"in.({','.join(sorted(str(w['id']) for w in invalid))})"},
-            {"status": "error"},
+        # errorable=False: this write *is* the status='error' write, so there
+        # is nothing for the end-of-cycle marking to retry.
+        record_failures(
+            patch_watches(db, (w["id"] for w in invalid), {"status": "error"}),
+            "error-invalid",
+            errorable=False,
         )
         invalid_watch_ids = {w["id"] for w in invalid}
         active = [w for w in active if w["id"] not in invalid_watch_ids]
@@ -429,10 +534,9 @@ def run(
             else:
                 strike_updates.setdefault(strikes, set()).add(watch["id"])
     for strikes in sorted(strike_updates):
-        db.patch(
-            "watches",
-            {"id": f"in.({','.join(sorted(str(i) for i in strike_updates[strikes]))})"},
-            {"consecutive_not_found": strikes},
+        record_failures(
+            patch_watches(db, strike_updates[strikes], {"consecutive_not_found": strikes}),
+            "strike-count",
         )
     if errored_404:
         for campground_id in sorted({str(w["campground_id"]) for w in errored_404}):
@@ -440,38 +544,49 @@ def run(
                 f"{campground_id}: not found for {NOT_FOUND_ERROR_THRESHOLD} "
                 "consecutive cycles, watch(es) errored"
             )
-        db.patch(
-            "watches",
-            {"id": f"in.({','.join(sorted(str(w['id']) for w in errored_404))})"},
-            {"status": "error", "consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
+        record_failures(
+            patch_watches(
+                db,
+                (w["id"] for w in errored_404),
+                {"status": "error", "consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
+            ),
+            "error-404",
         )
         errored_404_ids = {w["id"] for w in errored_404}
         active = [w for w in active if w["id"] not in errored_404_ids]
 
+    # Per-watch processing is contained: anything unexpected here (a rejected
+    # write, a malformed row, an APNs client bug) fails just this watch. The
+    # others still alert, and the cycle still reaches its bookkeeping below.
     alerts_sent = 0
     for watch in active:
-        current = extract_relevant(availability, watch, today)
-        if current is None:
-            continue  # poll failed for this watch's months; keep old hash
-        new_hash = state_hash(current)
-        if new_hash == watch.get("state_hash"):
-            continue
-        openings = available_sites(current)
-        fresh = filter_unalerted(db, watch, openings, now)
-        delivered = False
-        if fresh:
-            outcome = apns.send_alert(watch, fresh, db, errors=errors)
-            if outcome == RETRYABLE_FAILURE:
-                continue  # keep old hash so the alert is retried next cycle
-            if outcome == DELIVERED:
-                db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
-                alerts_sent += len(fresh)
-                delivered = True
-        db.patch(
-            "watches",
-            {"id": f"eq.{watch['id']}"},
-            {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
-        )
+        if failed(watch):
+            continue  # already failed a lifecycle write this cycle
+        try:
+            current = extract_relevant(availability, watch, today)
+            if current is None:
+                continue  # poll failed for this watch's months; keep old hash
+            new_hash = state_hash(current)
+            if new_hash == watch.get("state_hash"):
+                continue
+            openings = available_sites(current)
+            fresh = filter_unalerted(db, watch, openings, now)
+            delivered = False
+            if fresh:
+                outcome = apns.send_alert(watch, fresh, db, errors=errors)
+                if outcome == RETRYABLE_FAILURE:
+                    continue  # keep old hash so the alert is retried next cycle
+                if outcome == DELIVERED:
+                    db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
+                    alerts_sent += len(fresh)
+                    delivered = True
+            db.patch(
+                "watches",
+                {"id": f"eq.{watch['id']}"},
+                {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
+            )
+        except Exception as exc:  # containment boundary
+            record_failures({str(watch["id"]): exc}, "process")
 
     # Bookkeeping covers only watches whose needed months were all attempted
     # this cycle: when the time budget exhausts mid-plan, skipped watches
@@ -480,6 +595,8 @@ def run(
     attempted = set(availability)
     checked = []
     for w in active:
+        if failed(w):
+            continue  # a failed watch was not successfully checked
         needed = months_for_watch(
             as_date(w["start_date"]), as_date(w["end_date"]), today
         )
@@ -488,11 +605,33 @@ def run(
         ):
             checked.append(w)
     if checked:
-        db.patch(
-            "watches",
-            {"id": f"in.({','.join(sorted(str(w['id']) for w in checked))})"},
-            {"last_checked_at": iso_now(now)},
+        failures = patch_watches(db, (w["id"] for w in checked), {"last_checked_at": iso_now(now)})
+        record_failures(failures, "last-checked")
+        checked = [w for w in checked if not failed(w)]
+
+    # Threshold gate (B): decide isolated vs systemic before writing the
+    # summary, so the run_summaries row records which verdict was reached.
+    considered = len(watches)
+    systemic = is_systemic(len(watch_failures), considered)
+
+    # Isolated, permanent failures surface on the watch itself (A) so the user
+    # sees a broken watch instead of one that silently stops updating. Systemic
+    # breakage is the operator's to fix, so the pool is left intact rather than
+    # erroring every watch at once.
+    if mark_errored and not systemic:
+        for watch_id, exc in patch_watches(db, mark_errored, {"status": "error"}).items():
+            errors.append(f"watch {watch_id}: error-mark: {summarize_exception(exc)}")
+
+    if watch_failures:
+        errors.append(
+            f"{len(watch_failures)} of {considered} watch(es) failed this cycle "
+            f"({'systemic' if systemic else 'isolated'})"
         )
+        for watch_id in sorted(watch_failures)[:MAX_LOGGED_WATCH_ERRORS]:
+            errors.append(f"watch {watch_id}: {watch_failures[watch_id]}")
+        undisplayed = len(watch_failures) - MAX_LOGGED_WATCH_ERRORS
+        if undisplayed > 0:
+            errors.append(f"and {undisplayed} more watch error(s)")
 
     summary = {
         "watches_checked": len(checked),
@@ -501,21 +640,56 @@ def run(
         "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(errors) or None,
     }
-    db.insert("run_summaries", summary)
+    # The summary row and the pruning are contained too: losing one must not
+    # cost the other, and neither belongs to a watch, so either failing is
+    # systemic — the run goes red even if every watch was served.
+    def contained(label: str, write, *args) -> None:
+        try:
+            write(*args)
+        except Exception as exc:  # containment boundary
+            cycle_failures.append(f"{label}: {summarize_exception(exc)}")
 
     retention_cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
-    db.delete("sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
-    db.delete("run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
-    return summary
+    contained("run_summaries insert", db.insert, "run_summaries", summary)
+    contained("sent_alerts prune", db.delete, "sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
+    contained("run_summaries prune", db.delete, "run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
+
+    return {
+        **summary,
+        "watches_considered": considered,
+        "watch_errors": len(watch_failures),
+        # Failures with no watch to blame. Recorded here rather than in the
+        # run_summaries row: that row is written (or lost) before they happen.
+        "cycle_errors": "; ".join(cycle_failures) or None,
+        "systemic_failure": systemic or bool(cycle_failures),
+    }
 
 
 def error_annotation(summary: dict) -> str | None:
     """GitHub Actions warning annotation when the cycle recorded errors,
-    surfacing them in the run history while the exit code stays 0 so
-    scheduled runs remain green."""
+    surfacing them in the run history. On its own it does not fail the run:
+    isolated errors keep the schedule green (see failure_annotation)."""
     if summary.get("errors"):
         return f"::warning::monitor completed with errors: {summary['errors']}"
     return None
+
+
+def failure_annotation(result: dict) -> str | None:
+    """GitHub Actions error annotation for a run that exits non-zero: the
+    failures crossed the systemic threshold, so this cycle served few or no
+    watches and needs an operator."""
+    if not result.get("systemic_failure"):
+        return None
+    detail = "; ".join(
+        part for part in (result.get("errors"), result.get("cycle_errors")) if part
+    )
+    return f"::error::monitor cycle failed systemically: {detail or 'see run_summaries'}"
+
+
+def exit_code(result: dict) -> int:
+    """0 for a cycle whose failures were isolated (healthy watches were still
+    served), 1 when they were systemic and the run must go red."""
+    return 1 if result.get("systemic_failure") else 0
 
 
 def main() -> None:
@@ -527,11 +701,12 @@ def main() -> None:
     db = SupabaseClient.from_env()
     apns = APNsClient.from_env()
     with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
-        summary = run(db, apns, http, rng=rng)
-    print(json.dumps(summary), flush=True)
-    warning = error_annotation(summary)
-    if warning:
-        print(warning, flush=True)
+        result = run(db, apns, http, rng=rng)
+    print(json.dumps(result), flush=True)
+    for annotation in (error_annotation(result), failure_annotation(result)):
+        if annotation:
+            print(annotation, flush=True)
+    raise SystemExit(exit_code(result))
 
 
 if __name__ == "__main__":
