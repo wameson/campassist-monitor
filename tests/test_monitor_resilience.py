@@ -271,7 +271,7 @@ def test_healthy_cycle_keeps_the_write_budget():
 
 def test_systemic_failure_exits_nonzero():
     # every watch's write is rejected — the schedule must go red, not green
-    db, watches = pool(4, fail_on=fails_watch_patch("w0", "w1", "w2", "w3"))
+    db, _ = pool(4, fail_on=fails_watch_patch("w0", "w1", "w2", "w3"))
 
     result, _ = run_cycle(db)
 
