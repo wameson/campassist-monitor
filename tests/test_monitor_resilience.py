@@ -104,8 +104,13 @@ def test_isolated_write_failure_completes_the_cycle():
     assert monitor.exit_code(result) == 0
     assert result["watch_errors"] == 1 and result["watches_considered"] == 4
     assert "1 of 4 served watch(es) failed this cycle (isolated)" in result["errors"]
-    assert "watch w1: last-checked:" in result["errors"]
-    assert monitor.error_annotation(result).startswith("::warning::")
+    # the persisted, world-readable row is sanitized: a per-run ordinal, no UUID
+    assert "watch #1: last-checked:" in result["errors"]
+    assert "watch w1" not in result["errors"]
+    # the operator-only annotation keeps the UUID + full reason
+    assert "watch w1: last-checked:" in result["errors_detail"]
+    annotation = monitor.error_annotation(result)
+    assert annotation.startswith("::warning::") and "watch w1: last-checked:" in annotation
     assert monitor.failure_annotation(result) is None
 
 
@@ -121,7 +126,8 @@ def test_failed_watch_does_not_stop_the_watches_after_it():
     assert rows["w0"]["state_hash"] is None  # never stored: its write failed
     assert all(rows[f"w{i}"]["state_hash"] for i in (1, 2, 3))
     assert rows["w0"]["status"] == "error"
-    assert "watch w0: process:" in result["errors"]
+    assert "watch #1: process:" in result["errors"]  # sanitized persisted row
+    assert "watch w0: process:" in result["errors_detail"]  # full operator log
     assert monitor.exit_code(result) == 0
 
 
@@ -227,7 +233,8 @@ def test_strike_count_failure_still_serves_the_watch():
 
     # recorded and counted, but isolated — the run stays green
     assert result["watch_errors"] == 1 and result["watches_checked"] == 4
-    assert "watch w1: strike-count:" in result["errors"]
+    assert "watch #1: strike-count:" in result["errors"]
+    assert "watch w1: strike-count:" in result["errors_detail"]
     assert monitor.exit_code(result) == 0
 
 
@@ -250,7 +257,8 @@ def test_bookkeeping_failure_does_not_shadow_a_later_isolated_failure():
     assert row["status"] == "error"
     # one watch, one message: the first failure is the one that is logged
     assert result["watch_errors"] == 1
-    assert "watch w1: strike-count:" in result["errors"]
+    assert "watch #1: strike-count:" in result["errors"]
+    assert "watch w1: strike-count:" in result["errors_detail"]
     assert monitor.exit_code(result) == 0
 
 
@@ -388,8 +396,15 @@ def test_failing_to_mark_a_watch_errored_is_systemic():
 
     row = next(r for r in db.tables["watches"] if r["id"] == "w1")
     assert row["status"] == "monitoring"  # the mark never landed
-    assert "watch w1: error-mark:" in result["errors"]
+    # the persisted row carries the sanitized aggregate (no UUID); the per-watch
+    # error-mark detail is operator-only
+    assert "error-mark: 1 of 1 watch(es) could not be moved" in result["errors"]
+    assert "watch w1: error-mark:" not in result["errors"]
+    assert "watch w1: error-mark:" in result["errors_detail"]
     assert "error-mark: 1 of 1 watch(es) could not be moved" in result["cycle_errors"]
+    # the persisted verdict label matches the exit code: an error-mark failure
+    # flips the run systemic, so the row must not read "(isolated)"
+    assert "(systemic)" in result["errors"] and "(isolated)" not in result["errors"]
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
     # the run still reported and pruned before going red
     assert len(db.calls_of("insert", "run_summaries")) == 1
@@ -657,10 +672,15 @@ def test_recorded_failures_name_the_missing_column():
 
     result, _ = run_cycle(db)
 
-    assert "watch w0: last-checked:" in result["errors"]
+    # the sanitized persisted row still names the missing column (the useful
+    # part), just without the watch UUID or PostgREST details/hint
+    assert "watch #1: last-checked:" in result["errors"]
     assert "column watches.last_checked_at does not exist" in result["errors"]
+    assert "watch w0" not in result["errors"]
     assert FAKE_SERVICE_KEY not in result["errors"]
     assert "developer.mozilla.org" not in result["errors"]
+    # the operator-only channel keeps the full detail, still never the key
+    assert "watch w0: last-checked:" in result["errors_detail"]
     assert FAKE_SERVICE_KEY not in monitor.error_annotation(result)
 
 
@@ -675,6 +695,175 @@ def test_error_messages_stay_bounded():
     db, _ = pool(count, fail_on=fails_watch_patch(*[f"w{i}" for i in range(count)]))
     result, _ = run_cycle(db)
     assert result["watch_errors"] == count
-    listed = [line for line in result["errors"].split("; ") if line.startswith("watch w")]
+    listed = [line for line in result["errors"].split("; ") if line.startswith("watch #")]
     assert len(listed) == monitor.MAX_LOGGED_WATCH_ERRORS
     assert "and 5 more watch error(s)" in result["errors"]
+
+
+# --- Phase 2, finding 1: only a row-pinned failure errors the watch --------
+
+@pytest.mark.parametrize("op", ["select", "upsert"])
+def test_sent_alerts_failure_does_not_error_the_watch(op):
+    # a sent_alerts schema drift surfaces inside the per-watch block (the
+    # cooldown select or the dedup upsert), but it is table-scoped — not
+    # evidence this user's watch row is broken — so the watch is recorded and
+    # counted, yet never moved to status='error'. Only w1 has a matching opening
+    # and so is the only watch that reaches sent_alerts at all.
+    watches = [
+        make_watch(id="w1", user_id="u1"),
+        *[make_watch(id=f"w{i}", user_id=f"u{i}", site_ids=["absent"]) for i in (0, 2, 3)],
+    ]
+    db = FakeDB(
+        {"watches": watches},
+        fail_on=lambda call: (
+            postgrest_error(400, "column sent_alerts.site_id does not exist")
+            if call[0] == op and call[1] == "sent_alerts" else None
+        ),
+    )
+
+    result, _ = run_cycle(db)
+
+    w1 = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert w1["status"] == "monitoring"  # finding 1: not the watch's fault
+    assert w1["state_hash"] is None  # kept old hash: it re-evaluates next cycle
+    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    # but the failure is still recorded and counted (isolated rate -> green)
+    assert result["watch_errors"] == 1
+    assert "watch #1: alert:" in result["errors"]
+    assert "watch w1: alert:" in result["errors_detail"]
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    # the three watches with no opening were unaffected
+    assert all(
+        r["status"] == "monitoring" for r in db.tables["watches"] if r["id"] != "w1"
+    )
+
+
+def test_state_hash_write_failure_still_errors_the_watch():
+    # the counterpart: a failure of the one write pinned to the watch's own row
+    # (its state_hash PATCH) is isolated, so a permanent rejection still surfaces
+    # the watch as broken — finding 1 narrows attribution, it does not remove it
+    db, _ = pool(4, fail_on=fails_watch_patch("w1", columns=("state_hash",)))
+
+    result, _ = run_cycle(db)
+
+    row = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert row["status"] == "error"
+    assert "watch #1: process:" in result["errors"]
+    assert monitor.exit_code(result) == 0
+
+
+# --- Phase 2, finding 2: persisted label matches the exit code -------------
+
+def test_prune_failure_makes_the_persisted_label_systemic():
+    # one isolated watch failure alone is green, but a retention-prune failure
+    # (owned by no watch) flips the run systemic. Pruning now runs before the
+    # summary INSERT, so the persisted row is labelled to match the exit code —
+    # never "(isolated)" on a run that exits 1.
+    def fail_on(call):
+        if call[0] == "patch" and call[1] == "watches" and "last_checked_at" in call[3]:
+            ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+            if "w1" in ids:
+                return postgrest_error(400, "column watches.last_checked_at does not exist")
+        if call[0] == "delete" and call[1] == "sent_alerts":
+            return postgrest_error(400, "relation sent_alerts does not exist")
+        return None
+
+    db, _ = pool(4, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    assert result["watch_errors"] == 1  # 1 of 4: isolated on its own
+    assert "sent_alerts prune" in result["cycle_errors"]  # but a cycle failure
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+    # the persisted row's verdict label matches the exit code
+    assert "(systemic)" in result["errors"] and "(isolated)" not in result["errors"]
+    assert "(systemic)" in db.tables["run_summaries"][-1]["errors"]
+    # the summary row and both prunes were still attempted before going red
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert len(db.calls_of("delete")) == 2
+
+
+# --- Phase 2, finding 3: run_summaries.errors is sanitized -----------------
+
+def test_summarize_exception_safe_drops_details_and_hint():
+    exc = postgrest_error(
+        400,
+        "duplicate key value violates unique constraint \"sent_alerts_key\"",
+        details="Key (watch_id, site_id, date)=(SECRET-UUID-1234, 100, 2026-08-10) already exists.",
+        hint="some internal hint",
+    )
+    full = monitor.summarize_exception(exc)
+    assert "duplicate key value" in full
+    assert "SECRET-UUID-1234" in full and "some internal hint" in full
+
+    safe = monitor.summarize_exception(exc, safe=True)
+    assert "400" in safe and "duplicate key value" in safe  # status + column kept
+    assert "SECRET-UUID-1234" not in safe  # details (echoed key values) dropped
+    assert "some internal hint" not in safe  # hint dropped
+    assert "Key (watch_id" not in safe
+
+
+def test_persisted_row_omits_uuids_and_key_values_the_annotation_keeps():
+    # run_summaries is world-readable (RLS `USING (true)`); a constraint
+    # violation's `details` echoes another user's key values, so the persisted
+    # row must drop the watch UUID, details and hint, while the operator-only
+    # Action annotation keeps them.
+    secret_details = (
+        "Key (watch_id, site_id, date)=(SECRET-UUID-1234, 100, 2026-08-10) already exists."
+    )
+
+    def fail_on(call):
+        if call[0] == "patch" and call[1] == "watches" and "last_checked_at" in call[3]:
+            ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+            if "w0" in ids:
+                return postgrest_error(
+                    400,
+                    "duplicate key value violates unique constraint",
+                    details=secret_details,
+                    hint="internal hint",
+                )
+        return None
+
+    db, _ = pool(2, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert persisted == result["errors"]  # what every app client can read
+    for secret in ("SECRET-UUID-1234", "watch w0", secret_details, "internal hint"):
+        assert secret not in persisted
+    # still enough to act on: the ordinal and the constraint that was violated
+    assert "watch #1: last-checked:" in persisted
+    assert "duplicate key value violates unique constraint" in persisted
+
+    # the operator-only annotation carries the full detail
+    annotation = monitor.error_annotation(result)
+    assert "watch w0" in annotation
+    assert "SECRET-UUID-1234" in annotation and "internal hint" in annotation
+
+
+# --- Phase 2, test-clock fix: fan-out deadline on the injected clock --------
+
+def test_fanout_deadline_uses_the_injected_clock_when_process_started_omitted():
+    # with an injected monotonic and no explicit process_started, the fan-out
+    # deadline must live on the injected clock, not the module's real-time
+    # PROCESS_STARTED anchor: otherwise the cap is an instant on a different
+    # timeline the fake clock never reaches, silently disabling it. Allowance is
+    # left huge so only the deadline can bind.
+    clock = Clock()  # starts at 0, the same reading run() takes as `started`
+    db, _ = pool(4, fail_on=slow_rejections(clock, seconds=40, columns=("last_checked_at",)))
+
+    result = monitor.run(
+        db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        **QUIET,
+        monotonic=clock,  # injected; process_started deliberately omitted
+        per_id_fallback_budget_seconds=10_000,
+        fanout_deadline_seconds=90,
+    )
+
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    # batch + two per-id writes (t=40, t=80), then t=120 >= 90 cuts it off. A
+    # deadline anchored to the real clock would never bind and all four would run.
+    assert len(checked) == 3
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+    assert monitor.exit_code(result) == 1

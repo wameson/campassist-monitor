@@ -152,14 +152,19 @@ faked. CI runs the same suite on every PR and push to `main`.
   and the pruning matters more than isolating one row.
 
   A watch moves to `status='error'` only when the failure was **pinned to
-  that row** — a single-watch write, a per-id fallback write, or its own
-  per-watch processing — and looks permanent. A batch failure nobody
-  attributed to a specific row is recorded and counted but never errors a
-  watch: users must not have to recreate a watch over a failure that was
-  never shown to be theirs. A transient failure likewise leaves the watch
-  `monitoring` to retry next cycle. Strike-count (`consecutive_not_found`)
-  writes are pure bookkeeping: a rejected one is recorded, but the watch is
-  still delta-checked, alerted, and stamped `last_checked_at`.
+  that row** — a single-watch write to `watches`, a per-id fallback write, or
+  the delta/`state_hash` write for that one watch — and looks permanent. A
+  batch failure nobody attributed to a specific row is recorded and counted
+  but never errors a watch: users must not have to recreate a watch over a
+  failure that was never shown to be theirs. The same holds for the
+  table-scoped work done while serving a watch — the `sent_alerts` cooldown
+  lookup and dedup upsert, and the APNs send: a `sent_alerts` schema drift or
+  an APNs client error is recorded and counted against that watch but never
+  errors it, because it is not evidence that this user's watch row is broken.
+  A transient failure likewise leaves the watch `monitoring` to retry next
+  cycle. Strike-count (`consecutive_not_found`) writes are pure bookkeeping: a
+  rejected one is recorded, but the watch is still delta-checked, alerted, and
+  stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
   means the device token is dead and its row is deleted. Any other 4xx, a
@@ -173,6 +178,20 @@ faked. CI runs the same suite on every PR and push to `main`.
   the server's own reason — for a rejected write, the PostgREST body naming
   the column or constraint at fault, rather than the generic HTTP status line
   and request URL, so a schema drift says which column is missing.
+
+  Two renderings of the same failures go to two audiences. `run_summaries` is
+  **world-readable** (its RLS policy is `USING (true)`, so every app client can
+  read it), so the persisted `errors` string is **sanitized**: watch UUIDs
+  become per-run ordinals (`watch #1`) and the PostgREST `details`/`hint` — a
+  constraint violation's `details` echoes the offending key values — are
+  dropped, keeping the status code and the column/constraint name. The
+  operator-only GitHub Actions `::warning::`/`::error::` annotation keeps the
+  full detail (watch UUIDs and the complete reason). Neither ever carries the
+  service-role key. The persisted `(isolated)`/`(systemic)` verdict label is
+  chosen after folding in every failure known before the row is written
+  (including retention-prune failures, which now run before the summary
+  INSERT), so it always matches the run's exit code.
+
   The **exit status is decided by error rate**, so
   a broken watch does not cry wolf but broad breakage cannot hide:
   - *isolated* — the run exits 0 and the schedule stays **green**, because
