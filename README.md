@@ -14,7 +14,7 @@ anti-blocking rules, and the recreation.gov API contract.
 
 | Path | Purpose |
 |---|---|
-| `scripts/monitor.py` | One monitoring cycle: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), retention pruning, run summary |
+| `scripts/monitor.py` | One monitoring cycle: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), per-watch failure containment + threshold-gated exit status, retention pruning, run summary |
 | `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
 | `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
@@ -119,20 +119,86 @@ faked. CI runs the same suite on every PR and push to `main`.
   horizon reaches it.
 - **Watch lifecycle:** the backend expires watches whose end date has
   passed (`status='expired'`) and errors watches with malformed campground
-  ids (`status='error'`, once) or whose campground has 404ed for 3
+  ids (`status='error'`, once), whose campground has 404ed for 3
   consecutive cycles (typo or delisted campground; any successful poll
-  resets the count) — the app never has to clean these up.
+  resets the count), or whose own database writes are permanently rejected
+  (see Failure containment) — the app never has to clean these up.
+- **Failure containment:** a failure that belongs to one watch — a rejected
+  write, a malformed row — is caught, recorded, and skipped; it never
+  aborts the cycle. The other watches are still polled and alerted, and the
+  run still writes its `run_summaries` row and prunes. Batched watch writes
+  (`id=in.(…)`) are attempted as one write, as the write budget assumes.
+  Only a *permanently* rejected batch (a PostgREST 4xx other than 429:
+  missing column, constraint violation) falls back to one write per id, so a
+  single unwritable row cannot silently drop everyone else's update. A
+  transient batch failure (429, 5xx, timeout, transport error) is never
+  fanned out: it errors nothing, so isolating it buys nothing, while dozens
+  of sequential 30-second PATCHes against a struggling Supabase would blow
+  the workflow's 15-minute timeout and kill the run before its summary row
+  and pruning. For the same reason batches larger than `PER_ID_FALLBACK_MAX`
+  (50) skip the fan-out entirely, and the fan-out itself is capped twice: it
+  may spend `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of wall clock in total
+  across a cycle — every per-id write is charged when it returns, so however
+  many batches fall back, the cycle's whole fan-out spend is that allowance
+  plus the one PATCH still in flight when it runs out (30 s) — and it may
+  never run past `FANOUT_DEADLINE_SECONDS` (600 s)
+  measured from **process start** — so the up-to-240 s start jitter counts
+  against it instead of stacking on top of it. The arithmetic closes against
+  the workflow's `timeout-minutes: 15` (900 s): 120 s for checkout /
+  setup-python / pip, 600 s to the fan-out deadline, 180 s of shutdown
+  reserve for one in-flight PATCH (30 s) plus the summary insert and both
+  prunes. A worst-case run — full jitter and a full poll budget — therefore
+  gets no fan-out at all, which is the right trade: reaching the summary row
+  and the pruning matters more than isolating one row.
+
+  A watch moves to `status='error'` only when the failure was **pinned to
+  that row** — a single-watch write, a per-id fallback write, or its own
+  per-watch processing — and looks permanent. A batch failure nobody
+  attributed to a specific row is recorded and counted but never errors a
+  watch: users must not have to recreate a watch over a failure that was
+  never shown to be theirs. A transient failure likewise leaves the watch
+  `monitoring` to retry next cycle. Strike-count (`consecutive_not_found`)
+  writes are pure bookkeeping: a rejected one is recorded, but the watch is
+  still delta-checked, alerted, and stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
   means the device token is dead and its row is deleted. Any other 4xx, a
   missing token row, or a device token so malformed the push URL can't be
   built is given up on (no retry) and the watch's hash still advances.
-- **Errors:** per-cycle polling and alert errors (recreation.gov failures,
-  unrecognized responses, APNs delivery problems) are contained: the run
-  exits 0 and stays green, with the errors surfaced as a `::warning::`
-  annotation in the Actions run and in the `run_summaries.errors` column.
-  Failures outside that containment — an unreachable Supabase, a malformed
-  `APNS_P8_KEY`, a missing secret — exit non-zero and turn the run red.
+- **Errors and run status:** polling and alert errors (recreation.gov
+  failures, unrecognized responses, APNs delivery problems) and contained
+  per-watch failures are all recorded in the `run_summaries.errors` column
+  (a count plus a bounded sample of messages) and surfaced as a
+  `::warning::` annotation. Each recorded message is one capped line carrying
+  the server's own reason — for a rejected write, the PostgREST body naming
+  the column or constraint at fault, rather than the generic HTTP status line
+  and request URL, so a schema drift says which column is missing.
+  The **exit status is decided by error rate**, so
+  a broken watch does not cry wolf but broad breakage cannot hide:
+  - *isolated* — the run exits 0 and the schedule stays **green**, because
+    the healthy watches were served;
+  - *systemic* — the run prints an `::error::` annotation, exits non-zero
+    and turns the schedule **red**. Systemic means more than
+    `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
+    failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
+    2 stays green while 2 of 2 goes red — or that a failure belonging to no
+    watch (the `run_summaries` INSERT, retention pruning, or being unable to
+    write `status='error'`) occurred. Both constants live at the top of
+    `scripts/monitor.py` and are the tuning knobs.
+
+    The served set is the rate's denominator *and* the scope of its
+    numerator, so the ratio can never exceed 1. It excludes watches that
+    expired this cycle, that were errored for an invalid or
+    persistently-404ing campground, that are wholly beyond the 12-month poll
+    horizon (nothing to poll for them yet), and that the poll time budget
+    never reached. A cycle that failed every watch it served goes red no
+    matter how much of the pool left — or never entered — for unrelated
+    reasons.
+
+  Systemic runs deliberately leave the watch pool untouched: broad breakage
+  is the operator's to fix, not something users should have to recreate
+  their watches over. Failures before any of that — an unreachable Supabase,
+  a malformed `APNS_P8_KEY`, a missing secret — still exit non-zero.
 - **Retention:** `sent_alerts` and `run_summaries` rows older than 30 days are
   pruned every run.
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo
