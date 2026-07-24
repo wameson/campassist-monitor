@@ -114,6 +114,14 @@ def test_isolated_write_failure_completes_the_cycle():
     assert monitor.failure_annotation(result) is None
 
 
+def apns_failure(status=503, body=None):
+    """What APNsClient records for a push APNs rejected: an HTTPStatusError
+    carrying the response, with no mention of the watch it was pushing for."""
+    request = httpx.Request("POST", "https://api.push.apple.com/3/device/devicetoken")
+    response = httpx.Response(status, request=request, json=body or {"reason": "TooManyRequests"})
+    return httpx.HTTPStatusError(f"apns push rejected with {status}", request=request, response=response)
+
+
 def test_failed_watch_does_not_stop_the_watches_after_it():
     # the first watch blows up mid-processing (its state_hash write is
     # rejected); the ones behind it in the loop still alert and store state
@@ -867,3 +875,122 @@ def test_fanout_deadline_uses_the_injected_clock_when_process_started_omitted():
     assert len(checked) == 3
     assert len(db.calls_of("insert", "run_summaries")) == 1
     assert monitor.exit_code(result) == 1
+
+
+# --- Phase 2 follow-up: the sanitized row holds for every failure path ------
+
+@pytest.mark.parametrize(
+    "failure, kept, operator_only",
+    [
+        (apns_failure(429), "429", "TooManyRequests"),
+        (apns_failure(503), "503", "TooManyRequests"),
+        (
+            httpx.ConnectError("connection refused by 17.188.1.1"),
+            "ConnectError",
+            "17.188.1.1",
+        ),
+    ],
+)
+def test_apns_delivery_failure_never_persists_a_watch_uuid(failure, kept, operator_only):
+    # an undelivered push is recorded like any other unattributed per-watch
+    # failure: counted, ordinalized in the world-readable row, and full only in
+    # the operator annotation. It must never write a watch UUID into
+    # run_summaries.errors, which every app client can read.
+    db, watches = pool(4)
+    apns = FakeAPNs(result=monitor.RETRYABLE_FAILURE, failure=failure)
+
+    result, _ = run_cycle(db, apns=apns)
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert persisted == result["errors"]
+    for watch in watches:
+        assert watch["id"] not in persisted
+    assert FAKE_SERVICE_KEY not in persisted
+    assert operator_only not in persisted
+    assert "watch #1: alert:" in persisted and kept in persisted
+
+    # the operator-only channel keeps the UUID and the full reason
+    assert "watch w0: alert:" in result["errors_detail"]
+    assert operator_only in monitor.error_annotation(result)
+
+    # counted against the served set, but no watch is blamed for an APNs outage
+    assert result["watch_errors"] == 4
+    rows = db.tables["watches"]
+    assert all(r["status"] == "monitoring" for r in rows)
+    # a retryable push keeps the old hash and still stamps last_checked_at:
+    # the watch was polled, only the delivery failed
+    assert all(r["state_hash"] is None for r in rows)
+    assert all(r["last_checked_at"] is not None for r in rows)
+    # four of four served watches failed: an APNs outage stays loud
+    assert monitor.exit_code(result) == 1
+
+
+def test_prune_only_failure_persists_a_sanitized_systemic_row():
+    # a healthy cycle whose only failure is a rejected retention prune exits 1.
+    # The row it leaves behind must say so — a NULL errors column on a red run
+    # is the "looked green" hole this work closes.
+    secret_details = "Key (id)=(SECRET-UUID-1234) is still referenced."
+
+    def fail_on(call):
+        if call[0] == "delete" and call[1] == "sent_alerts":
+            return postgrest_error(
+                400,
+                "relation sent_alerts does not exist",
+                details=secret_details,
+                hint="internal hint",
+            )
+        return None
+
+    db, _ = pool(4, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    assert result["watch_errors"] == 0  # no watch is to blame
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert persisted is not None and persisted == result["errors"]
+    assert "0 of 4 served watch(es) failed this cycle (systemic)" in persisted
+    assert "sent_alerts prune:" in persisted
+    assert "relation sent_alerts does not exist" in persisted  # still actionable
+    for secret in ("SECRET-UUID-1234", secret_details, "internal hint", FAKE_SERVICE_KEY):
+        assert secret not in persisted
+
+    # the operator annotation keeps the full PostgREST reason
+    annotation = monitor.failure_annotation(result)
+    assert "SECRET-UUID-1234" in annotation and "internal hint" in annotation
+
+
+def test_summarize_exception_safe_drops_a_non_http_message():
+    # an exception with no response to read carries whatever message its raiser
+    # built — often the row value that upset it — so the persisted rendering
+    # keeps the type name alone
+    exc = ValueError("invalid date '2026-13-01' for watch SECRET-UUID-1234")
+
+    full = monitor.summarize_exception(exc)
+    assert full == "ValueError: invalid date '2026-13-01' for watch SECRET-UUID-1234"
+
+    assert monitor.summarize_exception(exc, safe=True) == "ValueError"
+
+
+def test_error_mark_aggregate_is_annotated_once():
+    # the aggregate is built once and travels one channel per audience: the
+    # operator ::error:: line joins errors_detail and cycle_errors, so a copy in
+    # both would print the same sentence twice
+    def fail_on(call):
+        if call[0] != "patch" or call[1] != "watches":
+            return None
+        ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        if "w1" in ids and set(call[3]) & {"state_hash", "status"}:
+            return postgrest_error(400)
+        return None
+
+    db, _ = pool(4, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    sentence = "error-mark: 1 of 1 watch(es) could not be moved to status='error'"
+    assert monitor.failure_annotation(result).count(sentence) == 1
+    assert result["errors"].count(sentence) == 1  # still in the persisted row
+    assert sentence in result["cycle_errors"]  # and still drives the verdict
+    assert result["systemic_failure"] is True

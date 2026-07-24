@@ -86,13 +86,19 @@ class APNsClient:
         )
 
     def send_alert(
-        self, watch: dict, openings: list[dict], db, errors: list[str] | None = None
+        self, watch: dict, openings: list[dict], db, failures: list[BaseException] | None = None
     ) -> str:
         """Push an availability alert for a watch. Returns a delivery outcome:
         DELIVERED, PERMANENT_FAILURE (410 Unregistered — token row deleted —
         other 4xx, no device token, or a user-supplied token so malformed the
         push URL cannot be built), or RETRYABLE_FAILURE (5xx, 429, or a
-        transport-level error, recorded into `errors`)."""
+        transport-level error).
+
+        A push that did not land appends the *exception* behind it to
+        `failures` — the transport error itself, or an HTTPStatusError carrying
+        the APNs response. Attribution and rendering are the caller's: nothing
+        here names the watch, so an APNs failure cannot put a watch UUID into
+        the world-readable run summary."""
         rows = db.select("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
         if not rows:
             return PERMANENT_FAILURE
@@ -117,8 +123,8 @@ class APNsClient:
         try:
             resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            if errors is not None:
-                errors.append(f"apns {watch['id']}: {type(exc).__name__}")
+            if failures is not None:
+                failures.append(exc)
             if isinstance(exc, httpx.InvalidURL):
                 return PERMANENT_FAILURE
             return RETRYABLE_FAILURE
@@ -127,8 +133,14 @@ class APNsClient:
         if resp.status_code == 410:
             db.delete("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
             return PERMANENT_FAILURE
-        if errors is not None:
-            errors.append(f"apns {watch['id']}: HTTP {resp.status_code}")
+        if failures is not None:
+            failures.append(
+                httpx.HTTPStatusError(
+                    f"apns push rejected with {resp.status_code}",
+                    request=resp.request,
+                    response=resp,
+                )
+            )
         if resp.status_code == 429 or resp.status_code >= 500:
             return RETRYABLE_FAILURE
         return PERMANENT_FAILURE

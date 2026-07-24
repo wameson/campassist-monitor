@@ -434,13 +434,15 @@ def summarize_exception(exc: BaseException, *, safe: bool = False) -> str:
     `safe=True` is the rendering persisted to the world-readable
     run_summaries.errors: it keeps the status code and the PostgREST `message`
     (column/constraint name) but drops `details`/`hint`, which can echo row
-    values. `safe=False` is the fuller rendering for the operator-only Action
-    annotation.
+    values. For an exception with no response to read, `safe=True` keeps only
+    the type name: an arbitrary exception's message is built by whoever raised
+    it and can quote the row value that upset it. `safe=False` is the fuller
+    rendering for the operator-only Action annotation.
     """
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if status is None:
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = type(exc).__name__ if safe else f"{type(exc).__name__}: {exc}"
     else:
         reason = rejection_reason(response, safe=safe)
         detail = f"{type(exc).__name__}: {status} {reason}".rstrip()
@@ -628,11 +630,13 @@ def run(
     # it should surface on the watch itself; blocked_ids are watches whose
     # failure stops the cycle from serving them further; cycle_failures are
     # failures attributable to no single watch, which are systemic by
-    # definition.
+    # definition, and are rendered twice like the per-watch ones — sanitized
+    # for the persisted row, full for the operator log.
     watch_failures: dict[str, tuple[str, BaseException]] = {}
     mark_errored: set[str] = set()
     blocked_ids: set[str] = set()
     cycle_failures: list[str] = []
+    public_cycle_failures: list[str] = []
 
     def write_watches(watch_ids, data: dict) -> PatchOutcome:
         return patch_watches(db, watch_ids, data, budget=fanout_budget)
@@ -649,6 +653,16 @@ def run(
                 mark_errored.add(watch_id)
             if blocking:
                 blocked_ids.add(watch_id)
+
+    def record_cycle_failure(label: str, exc: BaseException | None = None) -> None:
+        """A failure belonging to no single watch. `label` alone is already an
+        aggregate safe to persist; an exception is rendered for each audience."""
+        if exc is None:
+            cycle_failures.append(label)
+            public_cycle_failures.append(label)
+            return
+        cycle_failures.append(f"{label}: {summarize_exception(exc)}")
+        public_cycle_failures.append(f"{label}: {summarize_exception(exc, safe=True)}")
 
     def blocked(watch: dict) -> bool:
         return str(watch["id"]) in blocked_ids
@@ -781,10 +795,22 @@ def run(
             continue
 
         delivered = False
+        delivery_failures: list[BaseException] = []
         try:
             fresh = filter_unalerted(db, watch, openings, now)
             if fresh:
-                outcome = apns.send_alert(watch, fresh, db, errors=errors)
+                outcome = apns.send_alert(watch, fresh, db, failures=delivery_failures)
+                if delivery_failures:
+                    # A push that did not land is recorded against this watch
+                    # like any other unattributed failure — counted, rendered
+                    # once per audience, and never able to error the row. It
+                    # does not block the cycle's bookkeeping for the watch: the
+                    # watch was polled, only the delivery failed.
+                    record_failures(
+                        unattributed_failure(watch_id, delivery_failures[0]),
+                        "alert",
+                        blocking=False,
+                    )
                 if outcome == RETRYABLE_FAILURE:
                     continue  # keep old hash so the alert is retried next cycle
                 if outcome == DELIVERED:
@@ -849,8 +875,10 @@ def run(
         if error_mark_failures:
             # Belongs to no single watch — a DB-level problem that would
             # otherwise leave every affected watch quietly 'monitoring' — so it
-            # counts as systemic.
-            cycle_failures.append(
+            # counts as systemic. The aggregate count names nobody, so both
+            # audiences get this one string; only the per-watch detail below is
+            # operator-only.
+            record_cycle_failure(
                 f"error-mark: {len(error_mark_failures)} of {len(mark_errored)} watch(es) "
                 "could not be moved to status='error'"
             )
@@ -864,7 +892,7 @@ def run(
         try:
             write(*args)
         except Exception as exc:  # containment boundary
-            cycle_failures.append(f"{label}: {summarize_exception(exc)}")
+            record_cycle_failure(label, exc)
 
     retention_cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
     contained("sent_alerts prune", db.delete, "sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
@@ -881,7 +909,10 @@ def run(
     # UUIDs and full reason for the operator-only GitHub Actions annotation.
     public_errors = list(errors)
     detail_errors = list(errors)
-    if watch_failures:
+    # The verdict label is emitted whenever the run has a verdict to state, so a
+    # red run whose only failure belonged to no watch still persists its label
+    # and its reason instead of a NULL that reads like a clean cycle.
+    if watch_failures or systemic_run:
         tally = (
             f"{failed_served} of {considered} served watch(es) failed this cycle "
             f"({'systemic' if systemic_run else 'isolated'})"
@@ -900,16 +931,12 @@ def run(
             line = f"and {undisplayed} more watch error(s)"
             public_errors.append(line)
             detail_errors.append(line)
-    if error_mark_failures:
-        # The aggregate count is safe to persist; the per-UUID detail is not.
-        aggregate = (
-            f"error-mark: {len(error_mark_failures)} of {len(mark_errored)} watch(es) "
-            "could not be moved to status='error'"
-        )
-        public_errors.append(aggregate)
-        detail_errors.append(aggregate)
-        for watch_id, exc in sorted(error_mark_failures.items()):
-            detail_errors.append(f"watch {watch_id}: error-mark: {summarize_exception(exc)}")
+    for watch_id, exc in sorted(error_mark_failures.items()):
+        detail_errors.append(f"watch {watch_id}: error-mark: {summarize_exception(exc)}")
+    # Cycle failures reach the persisted row sanitized. Their full rendering
+    # travels in `cycle_errors` alone, which the operator annotation joins on —
+    # putting it in `detail_errors` too would print every one of them twice.
+    public_errors.extend(public_cycle_failures)
 
     summary = {
         "watches_checked": len(checked),

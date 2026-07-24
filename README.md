@@ -184,13 +184,22 @@ faked. CI runs the same suite on every PR and push to `main`.
   read it), so the persisted `errors` string is **sanitized**: watch UUIDs
   become per-run ordinals (`watch #1`) and the PostgREST `details`/`hint` — a
   constraint violation's `details` echoes the offending key values — are
-  dropped, keeping the status code and the column/constraint name. The
-  operator-only GitHub Actions `::warning::`/`::error::` annotation keeps the
-  full detail (watch UUIDs and the complete reason). Neither ever carries the
+  dropped, keeping the status code and the column/constraint name. A failure
+  with no response to read (a transport error, a malformed row's `ValueError`)
+  is persisted as its exception type alone, since its message is whatever the
+  raiser put there and can quote the value that upset it. This holds for every
+  failure path, undelivered APNs pushes included: the client hands back the
+  exception and never names the watch, so the row it belongs to is decided —
+  and ordinalized — here. The operator-only GitHub Actions
+  `::warning::`/`::error::` annotation keeps the full detail (watch UUIDs and
+  the complete reason), each failure appearing once. Neither ever carries the
   service-role key. The persisted `(isolated)`/`(systemic)` verdict label is
   chosen after folding in every failure known before the row is written
   (including retention-prune failures, which now run before the summary
-  INSERT), so it always matches the run's exit code.
+  INSERT), so it always matches the run's exit code — and a red run whose only
+  failure belonged to no watch persists that label and the failure's sanitized
+  text rather than a NULL that would read like a clean cycle. (A summary INSERT
+  that itself fails is the one unrepresentable case: there is then no row.)
 
   The **exit status is decided by error rate**, so
   a broken watch does not cry wolf but broad breakage cannot hide:

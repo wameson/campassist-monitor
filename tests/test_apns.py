@@ -170,12 +170,14 @@ def test_transport_error_is_retryable_and_recorded(signing_key):
         raise httpx.ConnectError("connection refused", request=request)
 
     client = make_client(pem, handler=handler)
-    errors = []
-    outcome = client.send_alert(make_watch(), OPENINGS, token_db(), errors=errors)
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, token_db(), failures=failures)
 
     assert outcome == apns.RETRYABLE_FAILURE
-    assert len(errors) == 1 and "ConnectError" in errors[0]
-    assert "connection refused" not in errors[0]  # class name only, no detail
+    # the exception itself is handed back for the caller to attribute and
+    # render; nothing here names the watch, so no UUID can reach the row
+    assert len(failures) == 1 and isinstance(failures[0], httpx.ConnectError)
+    assert "w1" not in repr(failures[0])
 
 
 def test_malformed_token_is_permanent_and_recorded(signing_key):
@@ -189,13 +191,15 @@ def test_malformed_token_is_permanent_and_recorded(signing_key):
     db = FakeDB({"device_tokens": [
         {"user_id": "u1", "apns_token": "bad\ntoken", "environment": "production"},
     ]})
-    errors = []
+    failures = []
 
-    outcome = client.send_alert(make_watch(), OPENINGS, db, errors=errors)
+    outcome = client.send_alert(make_watch(), OPENINGS, db, failures=failures)
 
     assert outcome == apns.PERMANENT_FAILURE
-    assert len(errors) == 1 and "InvalidURL" in errors[0]
-    assert "bad" not in errors[0] and "token" not in errors[0]  # no token fragment
+    assert len(failures) == 1 and isinstance(failures[0], httpx.InvalidURL)
+    assert "bad" not in str(failures[0]) and "token" not in str(failures[0])
+    # what the caller persists is the type name only, never the message
+    assert monitor.summarize_exception(failures[0], safe=True) == "InvalidURL"
 
 
 def test_malformed_token_does_not_abort_cycle(signing_key):
