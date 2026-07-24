@@ -7,7 +7,9 @@ one watch's failure stays contained (A), and breakage broad enough to be
 systemic still fails the run loudly (B).
 """
 
+import functools
 import random
+import time
 
 import httpx
 import pytest
@@ -733,8 +735,14 @@ def test_sent_alerts_failure_does_not_error_the_watch(op):
 
     w1 = next(r for r in db.tables["watches"] if r["id"] == "w1")
     assert w1["status"] == "monitoring"  # finding 1: not the watch's fault
-    assert w1["state_hash"] is None  # kept old hash: it re-evaluates next cycle
     assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    # the watch was polled — only table-scoped work failed — so it is still
+    # stamped rather than left looking unchecked to its user
+    assert w1["last_checked_at"] is not None
+    if op == "select":
+        # the cooldown is unknown, so the old hash is kept and the watch
+        # re-evaluates next cycle
+        assert w1["state_hash"] is None
     # but the failure is still recorded and counted (isolated rate -> green)
     assert result["watch_errors"] == 1
     assert "watch #1: alert:" in result["errors"]
@@ -744,6 +752,62 @@ def test_sent_alerts_failure_does_not_error_the_watch(op):
     assert all(
         r["status"] == "monitoring" for r in db.tables["watches"] if r["id"] != "w1"
     )
+
+
+def test_dedup_write_failure_does_not_republish_the_alert_every_cycle():
+    # the push landed but the sent_alerts dedup row was rejected. With neither a
+    # dedup row nor a stored state_hash, filter_unalerted would find nothing to
+    # suppress and the identical push would go out again every cycle until the
+    # drift is fixed — so the state_hash write still runs. The watch keeps
+    # monitoring (a sent_alerts drift is not its fault) and simply does not
+    # re-alert these openings.
+    db = FakeDB(
+        {"watches": [make_watch(id="w1", user_id="u1")]},
+        fail_on=lambda call: (
+            postgrest_error(400, "column sent_alerts.site_id does not exist")
+            if call[0] == "upsert" and call[1] == "sent_alerts" else None
+        ),
+    )
+
+    result, apns = run_cycle(db)
+
+    assert len(apns.alerts) == 1 and result["alerts_sent"] == 1  # the push went out
+    assert db.tables["sent_alerts"] == []  # ...and nothing recorded that it did
+    row = next(r for r in db.tables["watches"] if r["id"] == "w1")
+    assert row["status"] == "monitoring"
+    assert row["state_hash"] is not None and row["last_found_at"] is not None
+    assert "watch #1: alert:" in result["errors"]
+    assert monitor.exit_code(result) == 0
+
+    # next cycle: same openings, still no dedup row, and no second push
+    _, apns_next = run_cycle(db)
+    assert apns_next.alerts == []
+
+
+def test_permanent_apns_rejection_is_reported_outside_the_rate():
+    # a non-410 4xx such as BadDeviceToken is one user's dead device token, not
+    # an operational fault. It is still recorded and surfaced, but counting it
+    # toward the systemic rate would turn a whole scheduled run red over
+    # something no operator can fix — unlike the 429/5xx outage above.
+    db, _ = pool(4)
+    apns = FakeAPNs(
+        result=monitor.PERMANENT_FAILURE,
+        failure=apns_failure(400, {"reason": "BadDeviceToken"}),
+    )
+
+    result, _ = run_cycle(db, apns=apns)
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert result["watch_errors"] == 4  # reported...
+    assert "watch #1: alert:" in persisted and "400" in persisted
+    assert "BadDeviceToken" not in persisted  # sanitized like every other path
+    assert "BadDeviceToken" in monitor.error_annotation(result)
+    # ...but out of the rate, so the schedule stays green
+    assert "0 of 4 served watch(es) failed this cycle (isolated)" in persisted
+    assert "plus 4 outside the rate" in persisted
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    # a push given up on still advances the hash: retrying it is futile
+    assert all(r["state_hash"] is not None for r in db.tables["watches"])
 
 
 def test_state_hash_write_failure_still_errors_the_watch():
@@ -852,19 +916,20 @@ def test_persisted_row_omits_uuids_and_key_values_the_annotation_keeps():
 
 # --- Phase 2, test-clock fix: fan-out deadline on the injected clock --------
 
-def test_fanout_deadline_uses_the_injected_clock_when_process_started_omitted():
-    # with an injected monotonic and no explicit process_started, the fan-out
-    # deadline must live on the injected clock, not the module's real-time
-    # PROCESS_STARTED anchor: otherwise the cap is an instant on a different
-    # timeline the fake clock never reaches, silently disabling it. Allowance is
-    # left huge so only the deadline can bind.
+def test_fanout_deadline_can_anchor_to_this_runs_own_clock():
+    # process_started=None asks for the anchor a caller on a clock of its own
+    # needs: the deadline must live on the injected clock, not on the module's
+    # real-time PROCESS_STARTED default, or the cap is an instant on a different
+    # timeline the fake clock never reaches and is silently disabled. Allowance
+    # is left huge so only the deadline can bind.
     clock = Clock()  # starts at 0, the same reading run() takes as `started`
     db, _ = pool(4, fail_on=slow_rejections(clock, seconds=40, columns=("last_checked_at",)))
 
     result = monitor.run(
         db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
         **QUIET,
-        monotonic=clock,  # injected; process_started deliberately omitted
+        monotonic=clock,
+        process_started=None,  # anchor to this run's own reading of that clock
         per_id_fallback_budget_seconds=10_000,
         fanout_deadline_seconds=90,
     )
@@ -875,6 +940,30 @@ def test_fanout_deadline_uses_the_injected_clock_when_process_started_omitted():
     assert len(checked) == 3
     assert len(db.calls_of("insert", "run_summaries")) == 1
     assert monitor.exit_code(result) == 1
+
+
+def test_default_fanout_anchor_holds_for_a_wrapped_real_clock(monkeypatch):
+    # the anchor is the caller's to choose, never inferred from whether the
+    # clock object *is* time.monotonic: a caller that wraps or instruments the
+    # real clock is still on the process's own timeline, so it must keep the
+    # process-start anchor that makes the start jitter count against the fan-out
+    # instead of silently getting a fresh deadline from run() entry.
+    real, seen = monitor.FanoutBudget, {}
+
+    def recording(allowance, deadline, monotonic):
+        seen["deadline"] = deadline
+        return real(allowance, deadline, monotonic)
+
+    monkeypatch.setattr(monitor, "FanoutBudget", recording)
+    db, _ = pool(1)
+
+    monitor.run(
+        db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        **QUIET,
+        monotonic=functools.partial(time.monotonic),
+    )
+
+    assert seen["deadline"] == monitor.PROCESS_STARTED + monitor.FANOUT_DEADLINE_SECONDS
 
 
 # --- Phase 2 follow-up: the sanitized row holds for every failure path ------

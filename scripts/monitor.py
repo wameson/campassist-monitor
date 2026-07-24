@@ -34,7 +34,7 @@ from typing import NamedTuple
 
 import httpx
 
-from apns import DELIVERED, RETRYABLE_FAILURE, APNsClient
+from apns import DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE, APNsClient
 from db import SupabaseClient
 
 USER_AGENTS = [
@@ -290,7 +290,7 @@ def poll_with_backoff(
                 break
             sleep(BACKOFF_DELAYS_SECONDS[attempt])
     if errors is not None:
-        errors.append(failure)
+        errors.append(capped_line(failure))
     return None
 
 
@@ -422,6 +422,15 @@ def rejection_reason(response, *, safe: bool) -> str:
         return ""
 
 
+def capped_line(text: str) -> str:
+    """One line, no longer than MAX_ERROR_MESSAGE_CHARS: the bound every message
+    that reaches run_summaries.errors must respect, whatever built it."""
+    text = " ".join(text.split())
+    if len(text) > MAX_ERROR_MESSAGE_CHARS:
+        text = text[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+    return text
+
+
 def summarize_exception(exc: BaseException, *, safe: bool = False) -> str:
     """One-line, length-capped rendering of a contained failure.
 
@@ -446,10 +455,7 @@ def summarize_exception(exc: BaseException, *, safe: bool = False) -> str:
     else:
         reason = rejection_reason(response, safe=safe)
         detail = f"{type(exc).__name__}: {status} {reason}".rstrip()
-    detail = " ".join(detail.split())
-    if len(detail) > MAX_ERROR_MESSAGE_CHARS:
-        detail = detail[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
-    return detail
+    return capped_line(detail)
 
 
 def is_permanent_failure(exc: BaseException) -> bool:
@@ -594,7 +600,7 @@ def run(
     now_fn=lambda: datetime.now(timezone.utc),
     monotonic=time.monotonic,
     time_budget_seconds: float = CYCLE_TIME_BUDGET_SECONDS,
-    process_started: float | None = None,
+    process_started: float | None = PROCESS_STARTED,
     per_id_fallback_budget_seconds: float = PER_ID_FALLBACK_BUDGET_SECONDS,
     fanout_deadline_seconds: float = FANOUT_DEADLINE_SECONDS,
 ) -> dict:
@@ -603,13 +609,15 @@ def run(
     deadline = started + time_budget_seconds
     # The fan-out runs after the poll budget is spent, so it cannot share
     # budget_exhausted() (already true by then) and gets its own cap instead —
-    # anchored to process start, not to run() entry, so the start jitter counts
-    # against it rather than being added on top of it. With an injected clock
-    # (tests) the module-level PROCESS_STARTED is on a different timeline, so
+    # anchored by default to process start, not to run() entry, so the start
+    # jitter counts against it rather than being added on top of it. That
+    # default holds for every caller on the real clock, wrapped or instrumented
+    # or not. A caller on a clock of its own (tests) is on another timeline
+    # PROCESS_STARTED says nothing about, so it passes process_started=None to
     # anchor to this run's own `started` reading instead — same clock domain,
-    # no jitter to account for.
+    # no jitter to account for — or an explicit reading of its own clock.
     if process_started is None:
-        process_started = PROCESS_STARTED if monotonic is time.monotonic else started
+        process_started = started
     fanout_budget = FanoutBudget(
         per_id_fallback_budget_seconds,
         process_started + fanout_deadline_seconds,
@@ -619,7 +627,11 @@ def run(
     def budget_exhausted() -> bool:
         return monotonic() >= deadline
 
+    # `errors` is copied verbatim into both renderings, so only text that is
+    # already safe to publish may go in it; `detail_only` carries the
+    # operator-only half of a notice whose persisted form is an aggregate.
     errors: list[str] = []
+    detail_only: list[str] = []
     now = now_fn()
     today = monitor_today(now)
 
@@ -627,13 +639,16 @@ def run(
     # per watch, rendered into the error text only at the end so the persisted
     # row and the operator log can each get their own rendering; mark_errored is
     # the subset whose failure was pinned to that row *and* looks permanent, so
-    # it should surface on the watch itself; blocked_ids are watches whose
-    # failure stops the cycle from serving them further; cycle_failures are
+    # it should surface on the watch itself; rated_ids is the subset whose
+    # failure describes this cycle's own health, so it counts toward the
+    # systemic rate; blocked_ids are watches whose failure stops the cycle from
+    # serving them further; cycle_failures are
     # failures attributable to no single watch, which are systemic by
     # definition, and are rendered twice like the per-watch ones — sanitized
     # for the persisted row, full for the operator log.
     watch_failures: dict[str, tuple[str, BaseException]] = {}
     mark_errored: set[str] = set()
+    rated_ids: set[str] = set()
     blocked_ids: set[str] = set()
     cycle_failures: list[str] = []
     public_cycle_failures: list[str] = []
@@ -642,15 +657,23 @@ def run(
         return patch_watches(db, watch_ids, data, budget=fanout_budget)
 
     def record_failures(
-        outcome: PatchOutcome, context: str, *, errorable=True, blocking=True
+        outcome: PatchOutcome, context: str, *, errorable=True, blocking=True, rated=True
     ) -> None:
+        """Record one contained failure per watch. `rated=False` reports a
+        failure that says nothing about this cycle's health — a push APNs
+        rejected outright is one user's dead device token, not an operational
+        fault — so it is surfaced to both audiences but kept out of the rate
+        that decides the run's exit status."""
         for watch_id, exc in outcome.failures.items():
             # One watch, one recorded failure — but every failure still gets
-            # its own say on whether the watch is errored, so an earlier
-            # bookkeeping-only failure cannot shadow a later isolated one.
+            # its own say on whether the watch is errored, counted or blocking,
+            # so an earlier bookkeeping-only failure cannot shadow a later
+            # isolated one.
             watch_failures.setdefault(watch_id, (context, exc))
             if errorable and watch_id in outcome.isolated and is_permanent_failure(exc):
                 mark_errored.add(watch_id)
+            if rated:
+                rated_ids.add(watch_id)
             if blocking:
                 blocked_ids.add(watch_id)
 
@@ -687,8 +710,16 @@ def run(
     # batched write, failure case only) instead of re-erroring every cycle.
     invalid = [w for w in active if not CAMPGROUND_ID_RE.fullmatch(str(w["campground_id"]))]
     if invalid:
-        for campground_id in sorted({str(w["campground_id"]) for w in invalid}):
-            errors.append(f"{campground_id!r}: invalid campground_id, skipped")
+        # A rejected campground_id is arbitrary user-supplied text — exactly the
+        # kind of value the world-readable row must not republish — so the row
+        # gets the count and the operator log gets the values.
+        invalid_ids = sorted({str(w["campground_id"]) for w in invalid})
+        errors.append(
+            f"{len(invalid_ids)} invalid campground_id(s) on {len(invalid)} "
+            "watch(es), errored and skipped"
+        )
+        for campground_id in invalid_ids:
+            detail_only.append(capped_line(f"{campground_id!r}: invalid campground_id, skipped"))
         # errorable=False: this write *is* the status='error' write, so there
         # is nothing for the end-of-cycle marking to retry.
         record_failures(
@@ -802,23 +833,44 @@ def run(
                 outcome = apns.send_alert(watch, fresh, db, failures=delivery_failures)
                 if delivery_failures:
                     # A push that did not land is recorded against this watch
-                    # like any other unattributed failure — counted, rendered
+                    # like any other unattributed failure — reported, rendered
                     # once per audience, and never able to error the row. It
                     # does not block the cycle's bookkeeping for the watch: the
-                    # watch was polled, only the delivery failed.
+                    # watch was polled, only the delivery failed. A push APNs
+                    # rejected outright (a dead device token, an unbuildable
+                    # push URL) is that one device's problem rather than this
+                    # cycle's, so it is reported outside the systemic rate.
                     record_failures(
                         unattributed_failure(watch_id, delivery_failures[0]),
                         "alert",
                         blocking=False,
+                        rated=outcome != PERMANENT_FAILURE,
                     )
                 if outcome == RETRYABLE_FAILURE:
                     continue  # keep old hash so the alert is retried next cycle
                 if outcome == DELIVERED:
-                    db.upsert("sent_alerts", alert_rows(watch, fresh, now), on_conflict="watch_id,site_id,date")
                     alerts_sent += len(fresh)
                     delivered = True
+                    try:
+                        db.upsert(
+                            "sent_alerts",
+                            alert_rows(watch, fresh, now),
+                            on_conflict="watch_id,site_id,date",
+                        )
+                    except Exception as exc:  # the push landed, the dedup row did not
+                        # Recorded like any other table-scoped failure, then the
+                        # state_hash write below still runs: with no dedup row
+                        # it is the only thing standing between a `sent_alerts`
+                        # drift and the identical push going out to this user
+                        # every cycle until the drift is fixed.
+                        record_failures(
+                            unattributed_failure(watch_id, exc), "alert", blocking=False
+                        )
         except Exception as exc:  # sent_alerts / APNs: not this watch's row
-            record_failures(unattributed_failure(watch_id, exc), "alert")
+            # Table-scoped, like the delivery failure above: the watch was
+            # polled, so it is still stamped last_checked_at rather than left
+            # looking unchecked.
+            record_failures(unattributed_failure(watch_id, exc), "alert", blocking=False)
             continue
 
         try:  # the one write pinned to this watch's own row
@@ -860,9 +912,10 @@ def run(
         record_failures(outcome, "last-checked")
         checked = [w for w in checked if str(w["id"]) not in outcome.failures]
 
-    # Threshold gate (B): the watch-error rate over the served set.
+    # Threshold gate (B): the watch-error rate over the served set, counting
+    # only the failures that describe the cycle's own health (see `rated`).
     considered = len(served)
-    failed_served = sum(1 for watch_id in watch_failures if watch_id in served_ids)
+    failed_served = sum(1 for watch_id in rated_ids if watch_id in served_ids)
     systemic = is_systemic(failed_served, considered)
 
     # Isolated, permanent failures surface on the watch itself (A) so the user
@@ -908,7 +961,7 @@ def run(
     # the status code and the column/constraint name). `detail_errors` keeps the
     # UUIDs and full reason for the operator-only GitHub Actions annotation.
     public_errors = list(errors)
-    detail_errors = list(errors)
+    detail_errors = errors + detail_only
     # The verdict label is emitted whenever the run has a verdict to state, so a
     # red run whose only failure belonged to no watch still persists its label
     # and its reason instead of a NULL that reads like a clean cycle.
@@ -917,9 +970,15 @@ def run(
             f"{failed_served} of {considered} served watch(es) failed this cycle "
             f"({'systemic' if systemic_run else 'isolated'})"
         )
-        unserved = len(watch_failures) - failed_served
+        unserved = sum(1 for watch_id in watch_failures if watch_id not in served_ids)
         if unserved:
             tally += f", plus {unserved} on watch(es) this cycle did not serve"
+        unrated = sum(
+            1 for watch_id in watch_failures
+            if watch_id in served_ids and watch_id not in rated_ids
+        )
+        if unrated:
+            tally += f", plus {unrated} outside the rate"
         public_errors.append(tally)
         detail_errors.append(tally)
         for ordinal, watch_id in enumerate(sorted(watch_failures)[:MAX_LOGGED_WATCH_ERRORS], start=1):
