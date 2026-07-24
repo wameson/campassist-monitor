@@ -23,12 +23,49 @@ APNS_HOSTS = {
 JWT_TTL_SECONDS = 50 * 60
 BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
 
-# send_alert outcomes: RETRYABLE_FAILURE means the caller should keep the
-# watch's old state_hash so the alert is retried next cycle; DELIVERED and
-# PERMANENT_FAILURE both advance it.
+# send_alert outcomes: RETRYABLE_FAILURE and CONFIG_FAILURE both mean the
+# caller should keep the watch's old state_hash so the alert is retried next
+# cycle (a transient outage / an operator-fixable provider or topic fault);
+# DELIVERED and PERMANENT_FAILURE both advance it.
+#
+# The split within the 4xx space is by *who can fix it*. PERMANENT_FAILURE is a
+# per-device rejection — a dead device token, a token not valid for this topic,
+# a reason code we do not enumerate, or a push URL too malformed to build — that
+# no operator action changes, so it is left out of the run's exit-status rate.
+# CONFIG_FAILURE is a pool-wide provider/config fault — an expired or wrong
+# signing key, or a wrong bundle id — that rotating a credential fixes and that
+# would otherwise silence every push, so it *does* count toward the rate.
 DELIVERED = "delivered"
 PERMANENT_FAILURE = "permanent-failure"
 RETRYABLE_FAILURE = "retryable-failure"
+CONFIG_FAILURE = "config-failure"
+
+# APNs `reason` strings that name a pool-wide provider/config fault rather than
+# one device's dead token (Apple's "Communicating with APNs" reference). Every
+# one of these fails identically for every push until an operator rotates a
+# credential or fixes the bundle id, so they are rated as the cycle's own health.
+CONFIG_FAILURE_REASONS = frozenset({
+    "ExpiredProviderToken",
+    "InvalidProviderToken",
+    "MissingProviderToken",
+    "BadTopic",
+    "TopicDisallowed",
+})
+
+
+def apns_reason(response) -> str:
+    """The APNs `reason` enum from a rejection body (e.g. 'BadDeviceToken'),
+    or '' if the body is missing or unparseable. Only the short enum is read —
+    never a value that could carry device or user data."""
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    if isinstance(body, dict):
+        reason = body.get("reason")
+        if isinstance(reason, str):
+            return reason
+    return ""
 
 
 class APNsClient:
@@ -89,9 +126,12 @@ class APNsClient:
         self, watch: dict, openings: list[dict], db, failures: list[BaseException] | None = None
     ) -> str:
         """Push an availability alert for a watch. Returns a delivery outcome:
-        DELIVERED, PERMANENT_FAILURE (410 Unregistered — token row deleted —
-        other 4xx, no device token, or a user-supplied token so malformed the
-        push URL cannot be built), or RETRYABLE_FAILURE (5xx, 429, or a
+        DELIVERED; PERMANENT_FAILURE (a per-device rejection — 410 Unregistered
+        with the token row deleted, 400 BadDeviceToken / DeviceTokenNotForTopic
+        or any other unenumerated 4xx, no device token, or a user-supplied token
+        so malformed the push URL cannot be built); CONFIG_FAILURE (a pool-wide
+        provider/config fault — 403 Expired/Invalid/MissingProviderToken, 400
+        BadTopic / TopicDisallowed); or RETRYABLE_FAILURE (5xx, 429, or a
         transport-level error).
 
         A push that did not land appends the *exception* behind it to
@@ -143,4 +183,6 @@ class APNsClient:
             )
         if resp.status_code == 429 or resp.status_code >= 500:
             return RETRYABLE_FAILURE
+        if apns_reason(resp) in CONFIG_FAILURE_REASONS:
+            return CONFIG_FAILURE
         return PERMANENT_FAILURE

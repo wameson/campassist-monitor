@@ -710,6 +710,32 @@ def test_error_messages_stay_bounded():
     assert "and 5 more watch error(s)" in result["errors"]
 
 
+def test_composed_error_line_respects_the_cap():
+    # summarize_exception caps its own body, but the callers prepend a prefix
+    # ("watch #N: context: "), so a long PostgREST message could push the whole
+    # persisted line past the bound. The cap must hold for the composed line.
+    long_message = "column watches." + "x" * 400 + " does not exist"
+
+    def fail_on(call):
+        if (
+            call[0] == "patch" and call[1] == "watches"
+            and "last_checked_at" in call[3]
+            and "w0" in str(call[2]["id"])
+        ):
+            return postgrest_error(400, long_message)
+        return None
+
+    db, _ = pool(2, fail_on=fail_on)
+
+    result, _ = run_cycle(db)
+
+    persisted_lines = result["errors"].split("; ")
+    detail_lines = result["errors_detail"].split("; ")
+    assert any(line.startswith("watch #1: last-checked:") for line in persisted_lines)
+    assert all(len(line) <= monitor.MAX_ERROR_MESSAGE_CHARS for line in persisted_lines)
+    assert all(len(line) <= monitor.MAX_ERROR_MESSAGE_CHARS for line in detail_lines)
+
+
 # --- Phase 2, finding 1: only a row-pinned failure errors the watch --------
 
 @pytest.mark.parametrize("op", ["select", "upsert"])
@@ -785,10 +811,66 @@ def test_dedup_write_failure_does_not_republish_the_alert_every_cycle():
 
 
 def test_permanent_apns_rejection_is_reported_outside_the_rate():
-    # a non-410 4xx such as BadDeviceToken is one user's dead device token, not
-    # an operational fault. It is still recorded and surfaced, but counting it
-    # toward the systemic rate would turn a whole scheduled run red over
-    # something no operator can fix — unlike the 429/5xx outage above.
+    # a single non-410 4xx such as BadDeviceToken is one user's dead device
+    # token, not an operational fault. It is still recorded and surfaced, but
+    # counting it toward the systemic rate would turn a whole scheduled run red
+    # over something no operator can fix — and one dead token in an otherwise
+    # healthy pool does not trip the pool-wide backstop either.
+    db, _ = pool(4)
+    apns = FakeAPNs(
+        responder=lambda w: (
+            (monitor.PERMANENT_FAILURE, apns_failure(400, {"reason": "BadDeviceToken"}))
+            if w["id"] == "w0"
+            else (monitor.DELIVERED, None)
+        )
+    )
+
+    result, _ = run_cycle(db, apns=apns)
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert result["watch_errors"] == 1  # reported...
+    assert "watch #1: alert:" in persisted and "400" in persisted
+    assert "BadDeviceToken" not in persisted  # sanitized like every other path
+    assert "BadDeviceToken" in monitor.error_annotation(result)
+    # ...but out of the rate, so the schedule stays green
+    assert "0 of 4 served watch(es) failed this cycle (isolated)" in persisted
+    assert "plus 1 outside the rate" in persisted
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    # a push given up on still advances the hash: retrying it is futile
+    assert all(r["state_hash"] is not None for r in db.tables["watches"])
+
+
+def test_pool_wide_config_fault_exits_nonzero():
+    # every push 403s on an expired provider token: an operator-fixable,
+    # pool-wide fault delivering zero alerts. Unlike a dead device token it is
+    # rated, so a signing-key outage turns the run red instead of green.
+    db, _ = pool(4)
+    apns = FakeAPNs(
+        result=monitor.CONFIG_FAILURE,
+        failure=apns_failure(403, {"reason": "ExpiredProviderToken"}),
+    )
+
+    result, _ = run_cycle(db, apns=apns)
+
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert result["watch_errors"] == 4
+    assert "4 of 4 served watch(es) failed this cycle (systemic)" in persisted
+    assert "403" in persisted
+    assert "ExpiredProviderToken" not in persisted  # sanitized like every path
+    assert "ExpiredProviderToken" in monitor.error_annotation(result)
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+    # a config fault keeps the old hash so the alert retries once the key is
+    # rotated, and never errors a watch (no user's row is broken)
+    rows = db.tables["watches"]
+    assert all(r["state_hash"] is None for r in rows)
+    assert all(r["status"] == "monitoring" for r in rows)
+
+
+def test_pool_wide_apns_wipeout_trips_the_backstop():
+    # even a per-device reason we deliberately leave unrated (BadDeviceToken)
+    # cannot yield a silent green outage when it wipes out nearly every served
+    # push: the pool-wide backstop fires regardless of per-reason rating, so an
+    # unenumerated 4xx that silences the whole pool still exits non-zero.
     db, _ = pool(4)
     apns = FakeAPNs(
         result=monitor.PERMANENT_FAILURE,
@@ -798,16 +880,12 @@ def test_permanent_apns_rejection_is_reported_outside_the_rate():
     result, _ = run_cycle(db, apns=apns)
 
     persisted = db.tables["run_summaries"][-1]["errors"]
-    assert result["watch_errors"] == 4  # reported...
-    assert "watch #1: alert:" in persisted and "400" in persisted
-    assert "BadDeviceToken" not in persisted  # sanitized like every other path
-    assert "BadDeviceToken" in monitor.error_annotation(result)
-    # ...but out of the rate, so the schedule stays green
-    assert "0 of 4 served watch(es) failed this cycle (isolated)" in persisted
+    assert result["watch_errors"] == 4
+    # no failure is rated, yet the backstop makes the run systemic
+    assert "0 of 4 served watch(es) failed this cycle (systemic)" in persisted
     assert "plus 4 outside the rate" in persisted
-    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
-    # a push given up on still advances the hash: retrying it is futile
-    assert all(r["state_hash"] is not None for r in db.tables["watches"])
+    assert "BadDeviceToken" not in persisted  # still sanitized
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
 
 
 def test_state_hash_write_failure_still_errors_the_watch():

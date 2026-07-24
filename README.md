@@ -169,13 +169,28 @@ faked. CI runs the same suite on every PR and push to `main`.
   stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
-  means the device token is dead and its row is deleted. Any other 4xx, a
-  missing token row, or a device token so malformed the push URL can't be
-  built is given up on (no retry) and the watch's hash still advances. A
-  rejection of that last kind is one device's problem rather than the cycle's,
-  so it is recorded and surfaced like any other failure but left **out of the
-  rate** that decides the run's exit status — an APNs outage (5xx/429/transport)
-  still counts and still turns a broad enough failure red.
+  means the device token is dead and its row is deleted. The rest of the 4xx
+  space is split by *who can fix it*:
+  - A **per-device** rejection (400 `BadDeviceToken`/`DeviceTokenNotForTopic`,
+    a reason code we don't enumerate, a missing token row, or a device token so
+    malformed the push URL can't be built) is one device's problem, not the
+    cycle's. It is given up on (no retry, the hash still advances), recorded and
+    surfaced like any other failure, but left **out of the rate** that decides
+    the run's exit status — a single dead token can't turn the schedule red.
+  - A **pool-wide provider/config** fault (403 `ExpiredProviderToken`/
+    `InvalidProviderToken`/`MissingProviderToken`, 400 `BadTopic`/
+    `TopicDisallowed` — an expired or wrong signing key, or a wrong bundle id)
+    would silence *every* push until an operator rotates a credential. It keeps
+    the old `state_hash` so the alert retries once fixed, and it **counts**
+    toward the rate, so a signing-key or bundle-id outage exits non-zero.
+
+  On top of the per-reason split, a **pool-wide backstop** turns the run
+  systemic whenever outright rejections wipe out nearly every served push
+  (`APNS_WIPEOUT_RATE`/`APNS_WIPEOUT_FLOOR` in `scripts/monitor.py`), so a
+  reason code we did not enumerate still can't yield a silent green outage while
+  a handful of genuinely dead tokens in a healthy pool stays green. An APNs
+  outage (5xx/429/transport) still counts and still turns a broad enough
+  failure red.
 
   If a push *is* delivered but its `sent_alerts` dedup row is rejected, the
   watch's `state_hash` is written anyway. Nothing would otherwise stop the
@@ -230,9 +245,12 @@ faked. CI runs the same suite on every PR and push to `main`.
     `scripts/monitor.py` and are the tuning knobs.
 
     The numerator counts only the failures that say something about this
-    cycle's health, so a push APNs rejected outright — a dead device token no
+    cycle's health, so a **per-device** APNs rejection — a dead device token no
     operator can fix — is reported in the row and the annotation but not
-    counted; the tally says how many such failures it left out.
+    counted; the tally says how many such failures it left out. A **pool-wide**
+    provider/config APNs fault *is* counted (see "Alert delivery"), and the
+    pool-wide backstop makes the run systemic regardless of per-reason rating
+    when outright rejections wipe out nearly every served push.
 
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that

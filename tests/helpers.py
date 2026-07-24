@@ -145,18 +145,29 @@ class FakeDB:
 
 
 class FakeAPNs:
-    def __init__(self, result: str = DELIVERED, failure: BaseException | None = None):
+    def __init__(
+        self,
+        result: str = DELIVERED,
+        failure: BaseException | None = None,
+        responder=None,
+    ):
         self.alerts: list[tuple[str, list[dict]]] = []
         self.result = result
         # what a real client records for a push that did not land: the
         # exception behind it, never a message naming the watch
         self.failure = failure
+        # optional responder(watch) -> (result, failure) for per-watch outcomes,
+        # e.g. one dead device token in an otherwise healthy pool
+        self.responder = responder
 
     def send_alert(self, watch, openings, db, failures=None) -> str:
         self.alerts.append((watch["id"], openings))
-        if failures is not None and self.failure is not None:
-            failures.append(self.failure)
-        return self.result
+        result, failure = (
+            self.responder(watch) if self.responder else (self.result, self.failure)
+        )
+        if failures is not None and failure is not None:
+            failures.append(failure)
+        return result
 
 
 class FakeResponse:

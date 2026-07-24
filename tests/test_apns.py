@@ -163,6 +163,30 @@ def test_outcome_classification(signing_key, status, expected):
     assert client.send_alert(make_watch(), OPENINGS, token_db()) == expected
 
 
+@pytest.mark.parametrize(
+    "status, reason, expected",
+    [
+        # per-device rejections: the token or URL, not the provider — unrated
+        (400, "BadDeviceToken", apns.PERMANENT_FAILURE),
+        (400, "DeviceTokenNotForTopic", apns.PERMANENT_FAILURE),
+        (400, "SomethingAppleAddedLater", apns.PERMANENT_FAILURE),  # unenumerated
+        (403, "", apns.PERMANENT_FAILURE),  # no reason body to classify
+        # pool-wide provider/config faults: an operator must rotate a credential
+        # or fix the bundle id — rated, so a signing-key outage exits non-zero
+        (403, "ExpiredProviderToken", apns.CONFIG_FAILURE),
+        (403, "InvalidProviderToken", apns.CONFIG_FAILURE),
+        (403, "MissingProviderToken", apns.CONFIG_FAILURE),
+        (400, "BadTopic", apns.CONFIG_FAILURE),
+        (400, "TopicDisallowed", apns.CONFIG_FAILURE),
+    ],
+)
+def test_reason_classification(signing_key, status, reason, expected):
+    _, pem = signing_key
+    body = {"reason": reason} if reason else None
+    client = make_client(pem, handler=lambda request: httpx.Response(status, json=body))
+    assert client.send_alert(make_watch(), OPENINGS, token_db()) == expected
+
+
 def test_transport_error_is_retryable_and_recorded(signing_key):
     _, pem = signing_key
 

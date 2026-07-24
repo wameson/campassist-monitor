@@ -34,7 +34,7 @@ from typing import NamedTuple
 
 import httpx
 
-from apns import DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE, APNsClient
+from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE, APNsClient
 from db import SupabaseClient
 
 USER_AGENTS = [
@@ -72,6 +72,15 @@ CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 # watch (the run_summaries INSERT, retention pruning) are always systemic.
 SYSTEMIC_ERROR_RATE = 0.25
 SYSTEMIC_ERROR_FLOOR = 2
+# Pool-wide APNs backstop, independent of per-reason rating: a push rejection
+# whose reason code apns.send_alert did not enumerate as a config fault still
+# counts as PERMANENT_FAILURE and stays out of the rate, so an unenumerated
+# pool-wide fault could otherwise deliver zero alerts on a green run. When
+# outright APNs rejections wipe out nearly every served push, the cycle is
+# systemic regardless of reason. The rate is high and the floor keeps a handful
+# of genuinely dead device tokens in a healthy pool green.
+APNS_WIPEOUT_RATE = 0.8
+APNS_WIPEOUT_FLOOR = 2
 # Caps on what a failing cycle may cost: error text stays readable, and a
 # batched write that fails for a large pool is not retried one row at a time
 # (it is systemic anyway — fanning out would spend hundreds of writes).
@@ -431,6 +440,15 @@ def capped_line(text: str) -> str:
     return text
 
 
+def append_both(public: list[str], operator: list[str], line: str) -> None:
+    """Append one identical line to both the world-readable and operator-only
+    error channels at once, so a future edit cannot add it to one and silently
+    forget the other. Only for lines whose text is the same on both channels —
+    the sanitized-vs-full pairs stay written out separately on purpose."""
+    public.append(line)
+    operator.append(line)
+
+
 def summarize_exception(exc: BaseException, *, safe: bool = False) -> str:
     """One-line, length-capped rendering of a contained failure.
 
@@ -652,6 +670,11 @@ def run(
     blocked_ids: set[str] = set()
     cycle_failures: list[str] = []
     public_cycle_failures: list[str] = []
+    # Watches whose push was rejected outright (PERMANENT_FAILURE) this cycle,
+    # for the pool-wide APNs wipeout backstop below — tracked apart from the
+    # per-watch rated flag so an unenumerated reason code still can't hide a
+    # near-total delivery outage behind a green run.
+    apns_rejected_ids: set[str] = set()
 
     def write_watches(watch_ids, data: dict) -> PatchOutcome:
         return patch_watches(db, watch_ids, data, budget=fanout_budget)
@@ -660,10 +683,11 @@ def run(
         outcome: PatchOutcome, context: str, *, errorable=True, blocking=True, rated=True
     ) -> None:
         """Record one contained failure per watch. `rated=False` reports a
-        failure that says nothing about this cycle's health — a push APNs
-        rejected outright is one user's dead device token, not an operational
-        fault — so it is surfaced to both audiences but kept out of the rate
-        that decides the run's exit status."""
+        failure that says nothing about this cycle's health — a per-device APNs
+        rejection (a dead device token) is one user's problem, not an operational
+        fault — so it is surfaced to both audiences but kept out of the rate that
+        decides the run's exit status. A pool-wide provider/config APNs fault
+        stays `rated=True` so a signing-key or bundle-id outage exits non-zero."""
         for watch_id, exc in outcome.failures.items():
             # One watch, one recorded failure — but every failure still gets
             # its own say on whether the watch is errored, counted or blocking,
@@ -681,11 +705,12 @@ def run(
         """A failure belonging to no single watch. `label` alone is already an
         aggregate safe to persist; an exception is rendered for each audience."""
         if exc is None:
-            cycle_failures.append(label)
-            public_cycle_failures.append(label)
+            append_both(public_cycle_failures, cycle_failures, label)
             return
-        cycle_failures.append(f"{label}: {summarize_exception(exc)}")
-        public_cycle_failures.append(f"{label}: {summarize_exception(exc, safe=True)}")
+        cycle_failures.append(capped_line(f"{label}: {summarize_exception(exc)}"))
+        public_cycle_failures.append(
+            capped_line(f"{label}: {summarize_exception(exc, safe=True)}")
+        )
 
     def blocked(watch: dict) -> bool:
         return str(watch["id"]) in blocked_ids
@@ -785,10 +810,12 @@ def run(
         )
     if errored_404:
         for campground_id in sorted({str(w["campground_id"]) for w in errored_404}):
-            errors.append(
+            # campground_id is user-supplied and lands in the world-readable row,
+            # so it goes through capped_line like every other producer there.
+            errors.append(capped_line(
                 f"{campground_id}: not found for {NOT_FOUND_ERROR_THRESHOLD} "
                 "consecutive cycles, watch(es) errored"
-            )
+            ))
         record_failures(
             write_watches(
                 (w["id"] for w in errored_404),
@@ -836,18 +863,24 @@ def run(
                     # like any other unattributed failure — reported, rendered
                     # once per audience, and never able to error the row. It
                     # does not block the cycle's bookkeeping for the watch: the
-                    # watch was polled, only the delivery failed. A push APNs
-                    # rejected outright (a dead device token, an unbuildable
-                    # push URL) is that one device's problem rather than this
-                    # cycle's, so it is reported outside the systemic rate.
+                    # watch was polled, only the delivery failed. A per-device
+                    # rejection (a dead device token, an unbuildable push URL) is
+                    # that one device's problem rather than this cycle's, so it
+                    # is reported outside the systemic rate; a provider/config
+                    # fault (CONFIG_FAILURE) is rated so a pool-wide APNs outage
+                    # still turns the run red.
                     record_failures(
                         unattributed_failure(watch_id, delivery_failures[0]),
                         "alert",
                         blocking=False,
                         rated=outcome != PERMANENT_FAILURE,
                     )
-                if outcome == RETRYABLE_FAILURE:
-                    continue  # keep old hash so the alert is retried next cycle
+                    if outcome == PERMANENT_FAILURE:
+                        apns_rejected_ids.add(watch_id)
+                if outcome in (RETRYABLE_FAILURE, CONFIG_FAILURE):
+                    # keep old hash so the alert is retried next cycle — once the
+                    # outage clears or the operator rotates the bad credential
+                    continue
                 if outcome == DELIVERED:
                     alerts_sent += len(fresh)
                     delivered = True
@@ -916,7 +949,18 @@ def run(
     # only the failures that describe the cycle's own health (see `rated`).
     considered = len(served)
     failed_served = sum(1 for watch_id in rated_ids if watch_id in served_ids)
-    systemic = is_systemic(failed_served, considered)
+    # Pool-wide APNs wipeout backstop (C): a distinct systemic condition, kept
+    # separate from the per-watch rated flag. Even a rejection reason we did not
+    # enumerate as a config fault cannot yield a silent green outage — when
+    # outright rejections wipe out nearly every served push, the run goes red
+    # regardless of per-reason rating. Scoped to the served set like the rate
+    # above, with a floor so a handful of dead device tokens stays green.
+    apns_rejected_served = sum(1 for watch_id in apns_rejected_ids if watch_id in served_ids)
+    apns_wipeout = (
+        apns_rejected_served >= APNS_WIPEOUT_FLOOR
+        and apns_rejected_served > considered * APNS_WIPEOUT_RATE
+    )
+    systemic = is_systemic(failed_served, considered) or apns_wipeout
 
     # Isolated, permanent failures surface on the watch itself (A) so the user
     # sees a broken watch instead of one that silently stops updating. Systemic
@@ -979,19 +1023,20 @@ def run(
         )
         if unrated:
             tally += f", plus {unrated} outside the rate"
-        public_errors.append(tally)
-        detail_errors.append(tally)
+        append_both(public_errors, detail_errors, tally)
         for ordinal, watch_id in enumerate(sorted(watch_failures)[:MAX_LOGGED_WATCH_ERRORS], start=1):
             context, exc = watch_failures[watch_id]
-            public_errors.append(f"watch #{ordinal}: {context}: {summarize_exception(exc, safe=True)}")
-            detail_errors.append(f"watch {watch_id}: {context}: {summarize_exception(exc)}")
+            public_errors.append(
+                capped_line(f"watch #{ordinal}: {context}: {summarize_exception(exc, safe=True)}")
+            )
+            detail_errors.append(
+                capped_line(f"watch {watch_id}: {context}: {summarize_exception(exc)}")
+            )
         undisplayed = len(watch_failures) - MAX_LOGGED_WATCH_ERRORS
         if undisplayed > 0:
-            line = f"and {undisplayed} more watch error(s)"
-            public_errors.append(line)
-            detail_errors.append(line)
+            append_both(public_errors, detail_errors, f"and {undisplayed} more watch error(s)")
     for watch_id, exc in sorted(error_mark_failures.items()):
-        detail_errors.append(f"watch {watch_id}: error-mark: {summarize_exception(exc)}")
+        detail_errors.append(capped_line(f"watch {watch_id}: error-mark: {summarize_exception(exc)}"))
     # Cycle failures reach the persisted row sanitized. Their full rendering
     # travels in `cycle_errors` alone, which the operator annotation joins on —
     # putting it in `detail_errors` too would print every one of them twice.
