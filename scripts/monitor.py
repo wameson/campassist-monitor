@@ -625,25 +625,41 @@ def run(
     # cycle, so the watch moves to status='error' once instead of failing inside
     # containment forever while its user sees a watch that looks healthy. Once
     # errored it leaves the pool, so the write happens once and a steady-state
-    # cycle stays inside the write budget.
+    # cycle stays inside the write budget — unless the condition is pool-wide,
+    # which is the operator's to fix rather than the users' (see below).
     unpollable = [(w, reason) for w in active if (reason := unpollable_reason(w))]
     if unpollable:
+        # The same guard the end-of-cycle error marking applies (A), evaluated
+        # here rather than reused from there: these watches leave the pool
+        # before the served set exists, so by then the whole pool being
+        # unpollable reads as `is_systemic(0, 0)` — False exactly when the
+        # breakage is broadest. A shared cause (a client writing the wrong key
+        # name on every row it creates) is the operator's to fix, so the pool is
+        # left intact and the run goes red instead of erroring every watch.
+        pool_wide = is_systemic(len(unpollable), len(active))
         # The reason names only the field at fault, never what the client wrote,
         # but the world-readable row still gets the count alone — the field name
         # is what tells the operator which client is writing bad rows, and that
         # is an operator's concern.
-        errors.append(
-            f"{len(unpollable)} watch(es) their provider cannot poll, errored and skipped"
-        )
+        if pool_wide:
+            record_cycle_failure(
+                f"{len(unpollable)} of {len(active)} watch(es) their provider "
+                "cannot poll: a shared cause, left monitoring for an operator"
+            )
+        else:
+            errors.append(
+                f"{len(unpollable)} watch(es) their provider cannot poll, errored and skipped"
+            )
+            # errorable=False: this write *is* the status='error' write (as above).
+            record_failures(
+                write_watches((w["id"] for w, _ in unpollable), {"status": "error"}),
+                "error-unpollable",
+                errorable=False,
+                blocking=False,
+            )
+        disposition = "left monitoring" if pool_wide else "errored"
         for reason in sorted({reason for _, reason in unpollable}):
-            detail_only.append(capped_line(f"{reason}: watch(es) errored and skipped"))
-        # errorable=False: this write *is* the status='error' write (as above).
-        record_failures(
-            write_watches((w["id"] for w, _ in unpollable), {"status": "error"}),
-            "error-unpollable",
-            errorable=False,
-            blocking=False,
-        )
+            detail_only.append(capped_line(f"{reason}: watch(es) {disposition} and skipped"))
         unpollable_ids = {w["id"] for w, _ in unpollable}
         active = [w for w in active if w["id"] not in unpollable_ids]
 
@@ -668,11 +684,23 @@ def run(
             )
             break
         name, key = unit
-        availability[unit] = dispatch[unit].poll(
-            http, key, session_ua,
-            sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
-            not_found=not_found.setdefault(name, set()),
-        )
+        try:
+            availability[unit] = dispatch[unit].poll(
+                http, key, session_ua,
+                sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+                not_found=not_found.setdefault(name, set()),
+            )
+        except Exception as exc:  # containment boundary
+            # A provider raising out of poll belongs to no single watch — the
+            # unit is shared by everyone watching that park — and by contract
+            # (Provider.poll) it means a fault no retry clears: a park whose map
+            # fan-out is past the provider's safety cap, or a conformer bug. The
+            # unit is recorded as failed like any other, so the watches on it
+            # keep their old hash rather than reading the gap as "nothing
+            # available", and the failure is recorded against the cycle so the
+            # run goes red instead of leaving that park unserved on a green run.
+            availability[unit] = None
+            record_cycle_failure(f"poll {name}", exc)
         if i < len(plan) - 1 and not budget_exhausted():
             sleep(inter_request_delay(rng))
 

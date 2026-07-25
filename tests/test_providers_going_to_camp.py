@@ -14,6 +14,10 @@ captured in the GoingToCamp research report (Alta Lake, resourceLocationId
                            enum values observed in the wild (3, 5, 7) — the
                            report truncated the real body at "… 35 sites …"
   gtc_child_map_empty.json a well-formed child map serving no resources
+  gtc_child_map_horizon.json the same rows with a FOURTH open night appended,
+                           so a request that overshoots the poll horizon by one
+                           day has a real bookable night to leak (the captured
+                           three-element rows are too short to expose it)
   gtc_child_map_nested.json } hand-built drift: a child map that serves a
   gtc_grandchild_map.json   } resource *and* names a child of its own, whose
                             child in turn links back to it. No captured park
@@ -56,6 +60,7 @@ from providers.going_to_camp import (
     HOST,
     MAX_CHILD_MAPS,
     InvalidProviderRef,
+    ParkTooLarge,
     horizon_date,
     parse_map,
     poll_range,
@@ -162,33 +167,49 @@ def test_the_requested_range_is_clamped_to_the_horizon_not_just_gated_by_it():
     # requested in full: the same clamp recreation.gov applies to its last month
     horizon = horizon_date(TODAY)
     assert horizon == date(2027, 8, 1)
+    # the requested end IS the last night served (parse_map keys element i to
+    # startDate + i days and keeps the one at endDate), so the clamp must land
+    # exactly ON the horizon: a day later and the horizon night's successor —
+    # a genuine bookable night, not a check-out day — would be hashed on
     assert poll_range(date(2027, 7, 25), date(2029, 1, 1), TODAY) == (
-        date(2027, 7, 25), horizon + timedelta(days=1)
+        date(2027, 7, 25), horizon
     )
     # the check-out day of an in-horizon stay is still requested verbatim
     assert poll_range(date(2027, 7, 25), date(2027, 7, 28), TODAY) == (
         date(2027, 7, 25), date(2027, 7, 28)
+    )
+    # a stay ending exactly one day past the horizon is clamped to it too: its
+    # last bookable night IS the horizon, and its check-out day is out of reach
+    assert poll_range(date(2027, 7, 25), horizon + timedelta(days=1), TODAY) == (
+        date(2027, 7, 25), horizon
     )
     # and the poll key the cycle dedupes on carries the clamped range, so a
     # multi-year watch costs the same 2-5 GETs as any other
     [(_, key)] = GTC.poll_plan(
         make_gtc_watch(start_date="2027-07-25", end_date="2029-01-01"), TODAY
     )
-    assert key[2:] == ("2027-07-25", "2027-08-02")
+    assert key[2:] == ("2027-07-25", "2027-08-01")
 
 
 def test_a_watch_straddling_the_horizon_is_served_on_its_in_horizon_nights():
     watch = make_gtc_watch(start_date="2027-07-30", end_date="2029-01-01")
     [key] = GTC.poll_plan(watch, TODAY)
-    http = FakeGTCHTTP(park_responder())
+    # a body one night LONGER than the clamped range: if the request overshot
+    # the horizon by a day, that fourth (open) night would show up below in
+    # every site's dates — and two sites that have nothing in range would
+    # appear at all — so an off-by-one in either direction fails here
+    http = FakeGTCHTTP(park_responder(
+        child=FakeResponse(200, load_fixture("gtc_child_map_horizon"))
+    ))
 
     parsed = GTC.poll(http, key, "UA", sleep=lambda s: None)
     current = GTC.extract_relevant({key: parsed}, watch, TODAY)
 
     # nothing past the horizon was even asked for
+    assert http.requests
     for request in http.requests:
         assert request["params"]["startDate"] == "2027-07-30"
-        assert request["params"]["endDate"] == "2027-08-02"
+        assert request["params"]["endDate"] == "2027-08-01"
     # so no out-of-horizon night can reach the state hash or an alert
     assert current == {
         "-2147483029": {
@@ -313,21 +334,20 @@ def test_poll_follows_a_park_that_nests_deeper_than_one_level():
 
 
 def test_the_fan_out_cap_bounds_the_whole_park_however_deep_it_nests():
-    # a park whose deeper levels together exceed the cap is failed for this
-    # cycle at the moment they are discovered, not polled to the bottom
+    # a park whose deeper levels together exceed the cap is stopped at the
+    # moment they are discovered, not polled to the bottom
     deep = {
         "mapId": NESTING_CHILD_MAP_ID,
         "resourceAvailabilities": {},
         "mapLinkAvailabilities": {str(-i): [7] for i in range(1, MAX_CHILD_MAPS + 1)},
     }
     http = FakeGTCHTTP(park_responder(maps={NESTING_CHILD_MAP_ID: FakeResponse(200, deep)}))
-    errors = []
 
-    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
-    # the root's 4 children plus the 12 this one names is past the cap, so the
-    # traversal stopped there rather than spending a GET on each
+    with pytest.raises(ParkTooLarge):
+        GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
+    # the root's 4 children plus the MAX_CHILD_MAPS this one names is past the
+    # cap, so the traversal stopped there rather than spending a GET on each
     assert [r["map_id"] for r in http.requests] == [ROOT_MAP_ID, NESTING_CHILD_MAP_ID]
-    assert "child maps exceeds" in errors[0]
 
 
 def test_poll_fails_the_unit_rather_than_reporting_a_park_half_polled():
@@ -365,18 +385,30 @@ def test_only_the_root_maps_404_strikes_the_watch():
     assert not_found == set()
 
 
-def test_a_park_that_fans_out_past_the_cap_is_failed_not_polled():
-    root = {
+def over_cap_root():
+    """A root map naming one child more than the safety cap allows."""
+    return {
         "mapId": ROOT_MAP_ID,
         "resourceAvailabilities": {},
         "mapLinkAvailabilities": {str(-i): [7] for i in range(1, MAX_CHILD_MAPS + 2)},
     }
-    http = FakeGTCHTTP(lambda map_id: FakeResponse(200, root))
+
+
+def test_a_park_past_the_safety_cap_raises_rather_than_failing_the_unit_quietly():
+    # MAX_CHILD_MAPS is a safety cap, not a tuning knob: a park past it fails
+    # identically every cycle, so returning None (which means "transient, keep
+    # the old hash and retry") would leave its watches monitoring, unalerted and
+    # looking healthy forever. It is a fault for an operator instead
+    http = FakeGTCHTTP(lambda map_id: FakeResponse(200, over_cap_root()))
     errors = []
-    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
+    with pytest.raises(ParkTooLarge) as caught:
+        GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors)
     # only the root was fetched: one park cannot spend the whole cycle
     assert len(http.requests) == 1
-    assert "child maps exceeds" in errors[0]
+    assert f"safety cap of {MAX_CHILD_MAPS}" in str(caught.value)
+    # the operator gets counts and the validated campground id, and the
+    # world-readable row gets the sanitized rendering: a type name alone
+    assert monitor.summarize_exception(caught.value, safe=True) == "ParkTooLarge"
 
 
 # --- defensive parsing ----------------------------------------------------
@@ -679,6 +711,54 @@ def test_a_watch_with_an_unusable_provider_ref_is_errored_once_and_converges():
     assert not [c for c in db.calls if c[0] == "patch" and "w-bad" in str(c)]
     assert steady["errors"] is None
     assert db.write_count <= 5
+
+
+def test_a_pool_wide_unpollable_condition_goes_red_without_erroring_the_pool():
+    # the shared cause this guards against: a client shipping the wrong key
+    # names writes them on every row it creates. That is the operator's to fix,
+    # and users must never have to recreate their watches over it — so the pool
+    # stays 'monitoring' and the run goes red instead
+    db = FakeDB({"watches": [
+        make_gtc_watch(
+            id=f"w{i}",
+            user_id=f"u{i}",
+            provider_ref={"resourceLocationId": -2147483647, "mapId": -2147483396},
+        )
+        for i in range(4)
+    ]})
+
+    summary = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
+
+    assert [r["status"] for r in db.tables["watches"]] == ["monitoring"] * 4
+    assert not [c for c in db.calls if c[0] == "patch"]
+    # loud: red, with the count on the world-readable row and the field at
+    # fault operator-only, exactly as the isolated case renders it
+    assert monitor.exit_code(summary) == 1
+    assert (
+        "4 of 4 watch(es) their provider cannot poll: a shared cause, "
+        "left monitoring for an operator"
+    ) in summary["errors"]
+    assert "provider_ref.resource_location_id" in summary["errors_detail"]
+    assert "provider_ref" not in summary["errors"]
+
+
+def test_a_park_past_the_fan_out_cap_cannot_masquerade_as_a_healthy_watch():
+    # the whole point of raising: the cycle contains the fault, keeps the old
+    # hash like any failed unit, leaves the watch alone — and still exits red,
+    # rather than reporting one error line a cycle forever on a green run
+    db = FakeDB({"watches": [make_gtc_watch()]})
+    http = FakeGTCHTTP(lambda map_id: FakeResponse(200, over_cap_root()))
+
+    summary = monitor.run(db, FakeAPNs(), http, **QUIET)
+
+    row = db.tables["watches"][0]
+    assert row["status"] == "monitoring"  # not this user's fault to fix
+    assert row["state_hash"] is None      # no false "everything vanished" delta
+    assert monitor.exit_code(summary) == 1
+    assert "poll going_to_camp: ParkTooLarge" in summary["errors"]
+    assert f"safety cap of {MAX_CHILD_MAPS}" in summary["cycle_errors"]
+    # and the cycle still reached its own bookkeeping past the raise
+    assert db.tables["run_summaries"]
 
 
 def test_one_park_is_one_recursion_however_many_watchers():

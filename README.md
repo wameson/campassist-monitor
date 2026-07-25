@@ -65,6 +65,11 @@ whole fan-out is capped (however deeply its maps nest, and a map is never
 fetched twice) and every child request is paced and charged against the cycle's
 own time budget; a park that only half-polls is a failed unit, so the watch
 keeps its old `state_hash` rather than reading the gap as sites vanishing.
+`MAX_CHILD_MAPS` (40) is a safety cap set an order of magnitude above any
+observed park, not a tuning knob, so a park past it is a fault an operator has
+to clear rather than one more failed unit: `poll` raises, the cycle contains it
+as a cycle failure, and the run goes non-zero — a park that can never be served
+must not sit behind a green exit code while its watches look healthy.
 
 A watch whose `provider` this build has no conformer for is left untouched —
 unpolled, still `monitoring`, outside the systemic error rate — and reported as
@@ -182,7 +187,10 @@ faked. CI runs the same suite on every PR and push to `main`.
   passed (`status='expired'`) and errors watches with malformed campground
   ids (`status='error'`, once), whose `provider_ref` their provider cannot
   poll with (also once — a watch that can never poll must not look healthy
-  to its user forever), whose campground has 404ed for 3
+  to its user forever, though a *pool-wide* unpollable condition crosses the
+  systemic threshold and is left `monitoring` for an operator instead: nobody
+  should have to recreate a watch over a client-wide bad key name), whose
+  campground has 404ed for 3
   consecutive cycles (typo or delisted campground; any successful poll
   resets the count), or whose own database writes are permanently rejected
   (see Failure containment) — the app never has to clean these up.

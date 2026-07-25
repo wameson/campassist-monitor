@@ -55,11 +55,14 @@ AVAILABLE = 0
 POLL_HORIZON_MONTHS = 12
 
 # A park's root map fans out to a handful of child maps (4 for the park this
-# was captured against). The cap bounds one park's share of the cycle across
-# the *whole* traversal, however deeply the maps nest: a park that suddenly
-# answers with far more is failed loudly for this cycle rather than allowed to
-# spend the whole time budget by itself.
-MAX_CHILD_MAPS = 12
+# was captured against). This is a SAFETY cap, not a tuning knob: it is set an
+# order of magnitude above any observed park purely so a single park cannot run
+# away with the cycle if the API drifts, and it is not meant to bind in normal
+# operation. Exceeding it is therefore treated as a fault an operator has to
+# clear (ParkTooLarge) rather than as one more failed poll, so it can never
+# leave a park quietly unserved on a green run. The cycle's own time budget
+# still bounds the worst case underneath it.
+MAX_CHILD_MAPS = 40
 
 # Pacing inside one poll unit, matching the 1.2-2.8 s the cycle leaves between
 # units so the recursion cannot burst.
@@ -79,6 +82,23 @@ class InvalidProviderRef(ValueError):
     """This watch's `provider_ref` does not carry the identifiers going_to_camp
     needs. Raised only with a field name, never the offending value: the value
     is client-supplied and the exception is rendered into the operator log."""
+
+
+class ParkTooLarge(RuntimeError):
+    """This park's map fan-out exceeded MAX_CHILD_MAPS, so it cannot be polled
+    at all under the current safety cap.
+
+    Raised rather than returned as a failed unit, because the two mean opposite
+    things to the cycle: a failed unit is transient by contract — keep the old
+    state_hash, retry next run — whereas a park over the cap fails identically
+    every cycle, which would leave its watches 'monitoring', never alerted and
+    looking perfectly healthy on a run that still exits 0. The cycle contains
+    this as a cycle failure instead, so the run goes red until an operator
+    raises the cap or investigates the drift. The message carries counts, the
+    cap and the same validated `campground_id` label the error lines use —
+    nothing a client wrote unchecked — and only the operator channel renders it
+    at all (the world-readable rendering of an exception with no response is its
+    type name alone)."""
 
 
 # --- provider_ref ---------------------------------------------------------
@@ -134,10 +154,16 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     full and no out-of-horizon night can reach the state hash or an alert. Like
     the other conformer, a watch straddling the horizon is served on its
     in-horizon nights alone (recreation.gov clamps its last *month* the same
-    way; this API is asked for days, so the clamp is per-night). The check-out
-    day stays in the request (it is what the booking search is given) and is
-    dropped from the result by `date_in_watch`, exactly as the other conformer
-    drops it from a month it polled anyway."""
+    way; this API is asked for days, so the clamp is per-night).
+
+    The boundary follows from what the response means: `parse_map` reads
+    element *i* of a per-night array as `start` + *i* days and stops after the
+    night keyed at the requested end, so the requested end IS the last night
+    served. Asking for the horizon therefore serves exactly the nights
+    first..horizon and not one past it. An in-horizon stay is not clamped at
+    all, so its check-out day stays in the request (it is what the booking
+    search is given) and is dropped from the result by `date_in_watch`, exactly
+    as the other conformer drops it from a month it polled anyway."""
     last_night = end - timedelta(days=1) if end > start else start
     if last_night < today:
         return None
@@ -145,8 +171,7 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     horizon = horizon_date(today)
     if first > horizon:
         return None
-    last_night = min(last_night, horizon)
-    return first, max(min(end, last_night + timedelta(days=1)), first)
+    return first, max(min(end, horizon), first)
 
 
 # --- fetch and parse ------------------------------------------------------
@@ -316,7 +341,8 @@ def poll_park(
     traversal is bounded three ways: MAX_CHILD_MAPS total maps below the root
     however deep they nest, a map already visited is never fetched twice (so a
     cycle in the map graph terminates), and the cycle's own time budget stops it
-    wherever it has got to.
+    wherever it has got to. Only the first of those three is permanent, so it
+    alone raises ParkTooLarge instead of returning a failed unit.
     """
     label = f"{campground_id}/{start.isoformat()}"
     # Child fetches are labelled apart from the root's: only the root's 404
@@ -336,9 +362,9 @@ def poll_park(
     seen = {root_map_id}
     queue: list[int] = []
 
-    def schedule(map_ids: list[int]) -> bool:
-        """Queue the maps this one names that have not been seen yet. False when
-        the park's whole fan-out exceeds the cap, which fails the unit before
+    def schedule(map_ids: list[int]) -> None:
+        """Queue the maps this one names that have not been seen yet, and stop
+        the park dead if its whole fan-out is past the safety cap — before
         another request is spent on it."""
         for map_id in map_ids:
             if map_id in seen:
@@ -346,16 +372,12 @@ def poll_park(
             seen.add(map_id)
             queue.append(map_id)
         if len(seen) - 1 > MAX_CHILD_MAPS:
-            if errors is not None:
-                errors.append(capped_line(
-                    f"{label}: {len(seen) - 1} child maps exceeds the {MAX_CHILD_MAPS} "
-                    "polled per park, skipped"
-                ))
-            return False
-        return True
+            raise ParkTooLarge(
+                f"{label}: {len(seen) - 1} child maps below one park exceeds the "
+                f"MAX_CHILD_MAPS safety cap of {MAX_CHILD_MAPS}"
+            )
 
-    if not schedule(children):
-        return None
+    schedule(children)
     while queue:
         child_map_id = queue.pop(0)
         if budget_exhausted():
@@ -376,8 +398,7 @@ def poll_park(
         if child is None:
             return None
         child_sites, grandchildren = child
-        if not schedule(grandchildren):
-            return None
+        schedule(grandchildren)
         for resource_id, site in child_sites.items():
             entry = sites.setdefault(resource_id, {
                 "campsite_id": site["campsite_id"],
