@@ -1,11 +1,13 @@
 # campassist-monitor
 
-CampAssist backend: centralized recreation.gov availability monitor.
-A GitHub Actions cron job (every 30 minutes, in this **private** repo) polls the
-recreation.gov availability API for all users' watches — deduplicated to one API
-call per unique (campground, month) per cycle — detects new openings via state
-hashes, and sends APNs push notifications with a direct booking link. Supabase
-(free tier) is the shared database; there is no server.
+CampAssist backend: centralized campsite availability monitor for recreation.gov
+and GoingToCamp (Washington State Parks).
+A GitHub Actions cron job (every 30 minutes, in this **private** repo) polls all
+users' watches through the conformer each one's `provider` names — deduplicated
+to one request per unique poll unit per cycle (see [Providers](#providers)) —
+detects new openings via state hashes, and sends APNs push notifications with a
+direct booking link. Supabase (free tier) is the shared database; there is no
+server.
 
 See the CampAssist `PLAN.md` (Phase 1) for the full design: write budget,
 anti-blocking rules, and the recreation.gov API contract.
@@ -160,8 +162,8 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The test suite is fully offline: Supabase, APNs, and recreation.gov are all
-faked. CI runs the same suite on every PR and push to `main`.
+The test suite is fully offline: Supabase, APNs, and every campground provider
+are all faked. CI runs the same suite on every PR and push to `main`.
 
 ## Operating notes
 
@@ -190,10 +192,10 @@ faked. CI runs the same suite on every PR and push to `main`.
   to its user forever, though a *pool-wide* unpollable condition crosses the
   systemic threshold and is left `monitoring` for an operator instead: nobody
   should have to recreate a watch over a client-wide bad key name), whose
-  campground has 404ed for 3
-  consecutive cycles (typo or delisted campground; any successful poll
-  resets the count), or whose own database writes are permanently rejected
-  (see Failure containment) — the app never has to clean these up.
+  campground has 404ed for 3 consecutive cycles (typo or delisted
+  campground; any successful poll resets the count), or whose own database
+  writes are permanently rejected (see Failure containment) — the app never
+  has to clean these up.
 - **Failure containment:** a failure that belongs to one watch — a rejected
   write, a malformed row — is caught, recorded, and skipped; it never
   aborts the cycle. The other watches are still polled and alerted, and the
@@ -311,8 +313,10 @@ faked. CI runs the same suite on every PR and push to `main`.
     `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
     failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
     2 stays green while 2 of 2 goes red — or that a failure belonging to no
-    watch (the `run_summaries` INSERT, retention pruning, or being unable to
-    write `status='error'`) occurred. Both constants live at the top of
+    watch (the `run_summaries` INSERT, retention pruning, being unable to
+    write `status='error'`, a provider raising out of a poll unit its watches
+    share, or a pool-wide unpollable condition — see [Providers](#providers))
+    occurred. Both constants live at the top of
     `scripts/monitor.py` and are the tuning knobs.
 
     The numerator counts only the failures that say something about this
@@ -326,7 +330,9 @@ faked. CI runs the same suite on every PR and push to `main`.
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that
     expired this cycle, that were errored for an invalid or
-    persistently-404ing campground, that name a provider this build does not
+    persistently-404ing campground, that their provider can never poll
+    (errored, or left `monitoring` when that condition is pool-wide — see
+    Watch lifecycle), that name a provider this build does not
     serve (see [Providers](#providers)), that are wholly beyond the 12-month
     poll horizon (nothing to poll for them yet), and that the poll time budget
     never reached. A cycle that failed every watch it served goes red no
