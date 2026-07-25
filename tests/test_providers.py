@@ -16,6 +16,11 @@ QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 
 REC_GOV = RecreationGovProvider()
 
+# A `provider` value this build has no conformer for — what a newer client
+# writing a row an older monitor cannot serve looks like. Both shipped
+# providers are registered, so the case needs a name from the future.
+UNSERVED_PROVIDER = "some_future_site"
+
 
 # --- registry and routing -------------------------------------------------
 
@@ -23,8 +28,7 @@ def test_registry_is_keyed_by_conformer_name():
     for name, provider in PROVIDERS.items():
         assert provider.name == name
         assert isinstance(provider, Provider)  # the whole seam, not just poll()
-    # only recreation.gov conforms so far; going_to_camp arrives in step 3
-    assert set(PROVIDERS) == {"recreation_gov"}
+    assert set(PROVIDERS) == {"recreation_gov", "going_to_camp"}
     assert DEFAULT_PROVIDER in PROVIDERS
 
 
@@ -39,10 +43,11 @@ def test_provider_name_defaults_to_recreation_gov():
 def test_provider_for_routes_and_refuses_the_unknown():
     assert provider_for(make_watch()).name == "recreation_gov"
     assert provider_for(make_watch(provider="recreation_gov")).name == "recreation_gov"
+    assert provider_for(make_watch(provider="going_to_camp")).name == "going_to_camp"
     # a row this build has no conformer for must never fall back to another
     # provider's poller — callers filter on PROVIDERS first
     with pytest.raises(KeyError):
-        provider_for(make_watch(provider="going_to_camp"))
+        provider_for(make_watch(provider=UNSERVED_PROVIDER))
 
 
 # --- the recreation.gov conformer ----------------------------------------
@@ -133,14 +138,15 @@ def test_booking_url_points_at_the_first_opening():
 # --- routing inside the cycle --------------------------------------------
 
 def test_cycle_never_polls_a_watch_of_another_provider():
-    # a going_to_camp row (step 3) must not be touched by the recreation.gov
-    # provider: not polled, not written, not counted — and not an error on the
-    # watch either, since a newer client may write rows this build cannot serve
+    # a row on a provider this build has no conformer for must not be touched
+    # by the recreation.gov provider: not polled, not written, not counted —
+    # and not an error on the watch either, since a newer client may write rows
+    # this build cannot serve
     db = FakeDB({
         "watches": [
             make_watch(id="w-rec", campground_id="232447"),
-            make_watch(id="w-gtc", user_id="u2", campground_id="999999",
-                       provider="going_to_camp", provider_ref={"resource_location_id": -1}),
+            make_watch(id="w-future", user_id="u2", campground_id="999999",
+                       provider=UNSERVED_PROVIDER, provider_ref={"resource_location_id": -1}),
         ],
         "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
     })
@@ -153,9 +159,9 @@ def test_cycle_never_polls_a_watch_of_another_provider():
     assert {r["campground_id"] for r in http.requests} == {"232447"}
     assert [w for w, _ in apns.alerts] == ["w-rec"]
     rows = {r["id"]: r for r in db.tables["watches"]}
-    assert rows["w-gtc"]["status"] == "monitoring"
-    assert rows["w-gtc"]["state_hash"] is None
-    assert rows["w-gtc"]["last_checked_at"] is None
+    assert rows["w-future"]["status"] == "monitoring"
+    assert rows["w-future"]["state_hash"] is None
+    assert rows["w-future"]["last_checked_at"] is None
     assert summary["watches_checked"] == 1
     assert "provider this build does not serve" in summary["errors"]
     # unserveable rows are the operator's signal to ship the conformer, not a
@@ -194,12 +200,15 @@ def test_provider_ref_never_reaches_a_request_url():
 # --- dispatch is anchored to the provider, not to campground_id -----------
 
 class StubProvider:
-    """A second conformer, registered only for the test (the real one arrives
-    in step 3), so a mixed-provider cycle can be exercised at all.
+    """A second conformer standing in for going_to_camp for the duration of a
+    test, so the mixed-provider cycle is exercised on dispatch alone rather
+    than on either real provider's request shape.
 
     Its poll keys deliberately have the exact shape recreation.gov's do, so two
     watches naming the same `campground_id` produce colliding PollKeys — the
     case where a dispatch keyed by campground_id would poll the wrong site.
+    (The real conformer's keys cannot collide, which is why the stub is what
+    proves the anchoring.)
     """
 
     name = "going_to_camp"

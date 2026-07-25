@@ -9,6 +9,7 @@ skips watches whose provider is not registered here.
 from __future__ import annotations
 
 from .base import PollKey, Provider
+from .going_to_camp import GoingToCampProvider
 from .recreation_gov import RecreationGovProvider
 
 # Matches the `watches.provider` default: a row that predates the column, or a
@@ -17,6 +18,7 @@ DEFAULT_PROVIDER = "recreation_gov"
 
 PROVIDERS: dict[str, Provider] = {
     RecreationGovProvider.name: RecreationGovProvider(),
+    GoingToCampProvider.name: GoingToCampProvider(),
 }
 
 
@@ -39,6 +41,7 @@ def provider_for(watch: dict) -> Provider:
 __all__ = [
     "DEFAULT_PROVIDER",
     "PROVIDERS",
+    "GoingToCampProvider",
     "PollKey",
     "Provider",
     "RecreationGovProvider",

@@ -43,11 +43,38 @@ is recorded against the conformer that asked for it, and the 404-strike
 bookkeeping is kept per provider, so two providers that happen to name the same
 `campground_id` are polled — and struck — entirely separately.
 
-`recreation_gov` (`scripts/providers/recreation_gov.py`) is currently the only
-conformer; its poll unit is one (campground, month) request. A watch whose
-`provider` this build has no conformer for is left untouched — unpolled, still
-`monitoring`, outside the systemic error rate — and reported as a count in the
-run summary, so an older monitor cannot mis-serve a row a newer client wrote.
+Two conformers ship today:
+
+| `provider` | Module | Poll unit | `provider_ref` |
+|---|---|---|---|
+| `recreation_gov` | `scripts/providers/recreation_gov.py` | one (campground, month) request | unused — `campground_id` is the whole identity |
+| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll` | `{"resource_location_id": …, "map_id": …}`, both required |
+
+GoingToCamp (Washington State Parks, on the Aspira platform) is map-scoped and
+recursive: a park's root map answers with pointers to its child maps and no
+sites of its own, so `poll` recurses one level and merges the result before the
+cycle ever sees it. A site is a `resourceId` with a per-night `availability`
+enum in which only `0` is confirmed to mean bookable, so every other value —
+including one this build has never seen — parses as taken. The booking deep
+link is the park's booking search pre-filled with the watch's dates (the SPA
+takes no site preselect), not a per-site page.
+
+Because the recursion costs more requests than a single month call, one park's
+fan-out is capped and every child request is paced and charged against the
+cycle's own time budget; a park that only half-polls is a failed unit, so the
+watch keeps its old `state_hash` rather than reading the gap as sites vanishing.
+
+A watch whose `provider` this build has no conformer for is left untouched —
+unpolled, still `monitoring`, outside the systemic error rate — and reported as
+a count in the run summary, so an older monitor cannot mis-serve a row a newer
+client wrote.
+
+Whatever a provider's own identifiers are, `watches.campground_id` stays the
+watch's campground identity for the cycle's 404-strike lifecycle and
+`campgrounds_polled` telemetry, and must match `[A-Za-z0-9_-]+` — a watch whose
+id has any other character is errored before it is ever polled. A
+`going_to_camp` row therefore needs a stable id in that alphabet (the tests use
+`gtc_<resourceLocationId>`); the backend never parses it.
 
 To add a provider: write the conformer in its own module under
 `scripts/providers/`, then register it in `scripts/providers/__init__.py`.

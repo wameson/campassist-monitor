@@ -1,0 +1,8 @@
+{
+  "mapId": -2147483334,
+  "mapAvailabilities": [7],
+  "siteAvailabilities": {
+    "-2147483029": [{"availability": 0, "remainingQuota": null}]
+  },
+  "childMaps": {"-2147483639": [7]}
+}
