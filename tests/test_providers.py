@@ -189,3 +189,123 @@ def test_provider_ref_never_reaches_a_request_url():
         make_watch(provider_ref=hostile), openings
     )
     assert booking.startswith("https://www.recreation.gov/") and "evil.invalid" not in booking
+
+
+# --- dispatch is anchored to the provider, not to campground_id -----------
+
+class StubProvider:
+    """A second conformer, registered only for the test (the real one arrives
+    in step 3), so a mixed-provider cycle can be exercised at all.
+
+    Its poll keys deliberately have the exact shape recreation.gov's do, so two
+    watches naming the same `campground_id` produce colliding PollKeys — the
+    case where a dispatch keyed by campground_id would poll the wrong site.
+    """
+
+    name = "going_to_camp"
+
+    def __init__(self):
+        self.polled: list = []
+        self.parsed: dict | None = {
+            "g100": {"campsite_id": "g100", "site": "GTC-1", "dates": ["2026-08-10"]},
+        }
+        self.not_found_ids: set[str] = set()
+
+    def _key(self, watch) -> tuple:
+        return (str(watch["campground_id"]), date(2026, 8, 1))
+
+    def poll_plan(self, watch, today):
+        return [self._key(watch)]
+
+    def poll(self, http, key, user_agent, *, sleep=None, errors=None,
+             budget_exhausted=None, not_found=None):
+        self.polled.append(key)
+        campground_id = key[0]
+        if campground_id in self.not_found_ids:
+            if not_found is not None:
+                not_found.add(campground_id)
+            if errors is not None:
+                errors.append(f"{campground_id}: HTTP 404")
+            return None
+        return self.parsed
+
+    def extract_relevant(self, availability, watch, today):
+        # only this provider's own slice of the cycle's results is visible
+        assert set(availability) <= {self._key(watch)}
+        parsed = availability.get(self._key(watch))
+        return None if parsed is None else dict(parsed)
+
+    def booking_url(self, watch, openings):
+        return "https://gtc.invalid/book"
+
+
+@pytest.fixture
+def stub_provider(monkeypatch):
+    provider = StubProvider()
+    monkeypatch.setitem(PROVIDERS, provider.name, provider)
+    return provider
+
+
+def two_provider_db(**rec_overrides):
+    """One recreation.gov watch and one going_to_camp watch on the SAME
+    campground_id — the collision a campground-keyed dispatch would mis-route."""
+    return FakeDB({
+        "watches": [
+            make_watch(id="w-rec", provider="recreation_gov", **rec_overrides),
+            make_watch(id="w-gtc", user_id="u2", provider="going_to_camp"),
+        ],
+        "device_tokens": [
+            {"user_id": "u1", "apns_token": "tok1", "environment": "production"},
+            {"user_id": "u2", "apns_token": "tok2", "environment": "production"},
+        ],
+    })
+
+
+def test_colliding_campground_id_still_reaches_each_watchs_own_provider(stub_provider):
+    db = two_provider_db()
+    apns = FakeAPNs()
+    http = FakeHTTP(lambda cg: FakeResponse(200, availability_payload(
+        {"100": {"2026-08-10": "Available"}}
+    )))
+
+    monitor.run(db, apns, http, **QUIET)
+
+    # both conformers were asked for their own key, despite the identical one
+    assert stub_provider.polled == [("232447", date(2026, 8, 1))]
+    assert [r["campground_id"] for r in http.requests] == ["232447"]
+    # and each watch alerted on its own provider's normalized state, so neither
+    # read the other's poll result
+    alerts = dict(apns.alerts)
+    assert [o["site"] for o in alerts["w-rec"]] == ["S100"]
+    assert [o["site"] for o in alerts["w-gtc"]] == ["GTC-1"]
+
+
+def test_one_providers_404_never_strikes_another_providers_watch(stub_provider):
+    # the going_to_camp campground 404s while the identically-named
+    # recreation.gov one polls fine
+    stub_provider.not_found_ids = {"232447"}
+    db = two_provider_db()
+    http = FakeHTTP(lambda cg: FakeResponse(200, availability_payload(
+        {"100": {"2026-08-10": "Available"}}
+    )))
+
+    monitor.run(db, FakeAPNs(), http, **QUIET)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert rows["w-gtc"]["consecutive_not_found"] == 1
+    assert rows["w-rec"]["consecutive_not_found"] == 0
+    assert rows["w-rec"]["status"] == "monitoring"
+
+
+def test_a_recreation_gov_404_never_strikes_a_going_to_camp_watch(stub_provider):
+    # the mirror image: recreation.gov 404s, the going_to_camp watch on the
+    # same campground_id polls fine and keeps its clean strike count
+    db = two_provider_db(consecutive_not_found=1)
+    http = FakeHTTP(lambda cg: FakeResponse(404))
+
+    monitor.run(db, FakeAPNs(), http, **QUIET)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert rows["w-rec"]["consecutive_not_found"] == 2
+    assert rows["w-gtc"]["consecutive_not_found"] == 0
+    assert rows["w-gtc"]["status"] == "monitoring"

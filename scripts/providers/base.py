@@ -23,8 +23,10 @@ from typing import Protocol, runtime_checkable
 # rest of the key is the provider's own subdivision of a campground's work
 # (recreation.gov: the first-of-month date of one month-availability request).
 # The cycle deduplicates the poll plan across all users on the whole key, and
-# keys must stay unique across providers — which holds because a campground_id
-# belongs to exactly one provider.
+# a key only has to be unique within its own provider: the cycle tags every
+# planned key with the name of the conformer that produced it, so a
+# campground_id two providers happen to share still dispatches to each of them
+# separately (see monitor.PollUnit).
 PollKey = tuple[str, object]
 
 # Polite-polling parameters every provider shares, so a second provider cannot
@@ -70,7 +72,8 @@ class Provider(Protocol):
         world-readable run summary; `budget_exhausted()` cuts retries short
         once the cycle's time budget is spent; `not_found` receives the
         campground_id when the provider learns the campground does not exist,
-        which drives the cycle's 404-strike lifecycle.
+        which drives the cycle's 404-strike lifecycle (the cycle keeps one such
+        set per provider, so a 404 only ever strikes this provider's watches).
         """
         ...
 
@@ -81,8 +84,9 @@ class Provider(Protocol):
         provider shares — {site_id: {"campsite_id", "site", "dates": [iso…]}} —
         or None when any of the watch's poll units failed this cycle.
 
-        `availability` is the whole cycle's {PollKey: parsed-or-None} map; a
-        provider reads only the keys its own poll_plan produced.
+        `availability` is this provider's own {PollKey: parsed-or-None} slice
+        of the cycle's results; a provider reads only the keys its own
+        poll_plan produced.
         """
         ...
 

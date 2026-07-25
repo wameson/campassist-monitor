@@ -38,6 +38,11 @@ plan dedupe across users, pacing and backoff budgets, `state_hash` delta
 detection, alert dedup and cooldown, failure containment, exit status,
 `run_summaries`, retention — is provider-neutral and lives in `monitor.py`.
 
+Dispatch follows the `provider` column and nothing else: each planned poll unit
+is recorded against the conformer that asked for it, and the 404-strike
+bookkeeping is kept per provider, so two providers that happen to name the same
+`campground_id` are polled — and struck — entirely separately.
+
 `recreation_gov` (`scripts/providers/recreation_gov.py`) is currently the only
 conformer; its poll unit is one (campground, month) request. A watch whose
 `provider` this build has no conformer for is left untouched — unpolled, still

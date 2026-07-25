@@ -47,7 +47,7 @@ from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE
 # common.py only so a provider can cap against the very same constant.
 from common import MAX_ERROR_MESSAGE_CHARS, as_date, capped_line
 from db import SupabaseClient
-from providers import PROVIDERS, PollKey, provider_for, provider_name
+from providers import PROVIDERS, PollKey, Provider, provider_for, provider_name
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -156,18 +156,41 @@ def monitor_today(now: datetime) -> date:
 
 # --- poll plan ------------------------------------------------------------
 
-def dedupe_poll_plan(watches: list[dict], today: date) -> list[PollKey]:
-    """One entry per unique poll unit across ALL users: the many watches that
+# One planned unit of work: the name of the provider that must serve it, plus
+# that provider's own PollKey. The cycle keys every poll-phase structure on
+# this pair rather than on the PollKey alone, so routing is anchored to the
+# watch's `provider` column and never to its client-writable campground_id —
+# two providers naming the same campground stay separate units, each polled,
+# struck and read back through its own conformer.
+PollUnit = tuple[str, PollKey]
+
+
+def poll_dispatch(watches: list[dict], today: date) -> dict[PollUnit, Provider]:
+    """Every poll unit this cycle needs, each mapped to the conformer that must
+    serve it. One entry per unique unit across ALL users: the many watches that
     share a campground and a month collapse into the single request their
-    provider has to make. Each watch's units come from its own provider, so a
-    mixed-provider pool plans in one pass; every watch must already be routable
-    (see `provider_for`)."""
-    plan: set[PollKey] = set()
+    provider has to make. Each watch's units and the conformer recorded for them
+    both come from `provider_for(watch)`, so a mixed-provider pool plans in one
+    pass and a colliding campground_id cannot reach the wrong site; every watch
+    must already be routable (see `provider_for`)."""
+    dispatch: dict[PollUnit, Provider] = {}
     for watch in watches:
-        plan.update(provider_for(watch).poll_plan(watch, today))
-    # Sorted for a deterministic pre-shuffle order across providers, whose
-    # keys need not share a comparable type beyond the campground_id.
-    return sorted(plan, key=lambda key: (key[0], str(key[1])))
+        provider = provider_for(watch)
+        for key in provider.poll_plan(watch, today):
+            dispatch[(provider.name, key)] = provider
+    return dispatch
+
+
+def sorted_poll_units(units) -> list[PollUnit]:
+    """Deterministic pre-shuffle order across providers, whose keys need not
+    share a comparable type beyond the campground_id."""
+    return sorted(units, key=lambda unit: (unit[1][0], str(unit[1][1]), unit[0]))
+
+
+def dedupe_poll_plan(watches: list[dict], today: date) -> list[PollKey]:
+    """The cycle's deduplicated poll plan as bare PollKeys, in pre-shuffle
+    order (see `poll_dispatch`, which also records who serves each one)."""
+    return [key for _, key in sorted_poll_units(poll_dispatch(watches, today))]
 
 
 # --- delta detection ------------------------------------------------------
@@ -555,6 +578,11 @@ def run(
             f"{len(unroutable)} watch(es) on a provider this build does not "
             "serve, skipped"
         )
+        # Which provider is missing is what tells the operator whether the
+        # conformer is simply not shipped yet, so it goes to the operator-only
+        # channel — the count alone leaves the signal unactionable.
+        for name in sorted({provider_name(w) for w in unroutable}):
+            detail_only.append(capped_line(f"{name}: no conformer in this build, skipped"))
         active = [w for w in active if provider_name(w) in PROVIDERS]
 
     # Backend-owned lifecycle: watches with malformed campground ids can
@@ -583,30 +611,44 @@ def run(
         invalid_watch_ids = {w["id"] for w in invalid}
         active = [w for w in active if w["id"] not in invalid_watch_ids]
 
-    plan = dedupe_poll_plan(active, today)
+    # Each planned unit carries the conformer `provider_for` chose for the
+    # watches that asked for it, so dispatch can never be decided by the
+    # client-writable campground_id. The pacing below still runs one shared,
+    # shuffled queue across providers rather than a burst per site.
+    dispatch = poll_dispatch(active, today)
+    plan = sorted_poll_units(dispatch)
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
-    # A campground belongs to exactly one provider (PollKey[0] is the watch's
-    # own campground_id), so this is enough to dispatch every planned key —
-    # and the pacing below stays one shared, shuffled queue across providers
-    # rather than a burst per site.
-    provider_of_campground = {str(w["campground_id"]): provider_for(w) for w in active}
 
-    not_found: set[str] = set()
-    availability: dict[PollKey, dict | None] = {}
-    for i, key in enumerate(plan):
+    # A campground_id is only unique within its own provider, so the 404-strike
+    # inputs are scoped per provider: one site's 404 must never strike a watch
+    # on another site that happens to name the same id.
+    not_found: dict[str, set[str]] = {}
+    availability: dict[PollUnit, dict | None] = {}
+    for i, unit in enumerate(plan):
         if budget_exhausted():
             errors.append(
                 f"time budget exhausted: skipped {len(plan) - i} remaining poll(s)"
             )
             break
-        availability[key] = provider_of_campground[key[0]].poll(
+        name, key = unit
+        availability[unit] = dispatch[unit].poll(
             http, key, session_ua,
             sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
-            not_found=not_found,
+            not_found=not_found.setdefault(name, set()),
         )
         if i < len(plan) - 1 and not budget_exhausted():
             sleep(inter_request_delay(rng))
+
+    # Split the results back into the per-provider {PollKey: parsed-or-None}
+    # map each conformer's extract_relevant reads — a provider is only ever
+    # handed the units it planned itself.
+    polled: dict[str, dict[PollKey, dict | None]] = {}
+    polled_ok: dict[str, set[str]] = {}
+    for (name, key), parsed in availability.items():
+        polled.setdefault(name, {})[key] = parsed
+        if parsed is not None:
+            polled_ok.setdefault(name, set()).add(key[0])
 
     # Backend-owned lifecycle: a syntactically valid campground id that
     # keeps 404ing (typo or delisted campground) errors its watches after
@@ -614,16 +656,16 @@ def run(
     # forever; any successful poll resets the strike count. All writes here
     # happen only in the failure/recovery cases, so a healthy no-change
     # cycle stays within the write budget.
-    polled_ok = {key[0] for key, parsed in availability.items() if parsed is not None}
     strike_updates: dict[int, set] = {}
     errored_404 = []
     for watch in active:
+        name = provider_name(watch)
         campground_id = str(watch["campground_id"])
         strikes = int(watch.get("consecutive_not_found") or 0)
-        if campground_id in polled_ok:
+        if campground_id in polled_ok.get(name, ()):
             if strikes:
                 strike_updates.setdefault(0, set()).add(watch["id"])
-        elif campground_id in not_found:
+        elif campground_id in not_found.get(name, ()):
             strikes += 1
             if strikes >= NOT_FOUND_ERROR_THRESHOLD:
                 errored_404.append(watch)
@@ -673,7 +715,8 @@ def run(
             continue  # already failed a lifecycle write that blocks serving it
         watch_id = str(watch["id"])
         try:
-            current = provider_for(watch).extract_relevant(availability, watch, today)
+            provider = provider_for(watch)
+            current = provider.extract_relevant(polled.get(provider.name, {}), watch, today)
             if current is None:
                 continue  # poll failed for this watch's months; keep old hash
             new_hash = state_hash(current)
@@ -761,10 +804,11 @@ def run(
     attempted = set(availability)
     served, checked = [], []
     for w in active:
-        needed = provider_for(w).poll_plan(w, today)
+        provider = provider_for(w)
+        needed = provider.poll_plan(w, today)
         if not needed:
             continue  # wholly beyond the poll horizon: nothing to serve yet
-        if not all(key in attempted for key in needed):
+        if not all((provider.name, key) in attempted for key in needed):
             continue  # never reached: the poll time budget ran out first
         served.append(w)
         if not blocked(w):
@@ -874,7 +918,7 @@ def run(
 
     summary = {
         "watches_checked": len(checked),
-        "campgrounds_polled": len({key[0] for key in availability}),
+        "campgrounds_polled": len({key[0] for _, key in availability}),
         "alerts_sent": alerts_sent,
         "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(public_errors) or None,
