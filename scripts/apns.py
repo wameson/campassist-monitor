@@ -16,12 +16,13 @@ import time
 import httpx
 import jwt
 
+from providers import provider_for
+
 APNS_HOSTS = {
     "production": "api.push.apple.com",
     "sandbox": "api.sandbox.push.apple.com",
 }
 JWT_TTL_SECONDS = 50 * 60
-BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
 
 # send_alert outcomes: RETRYABLE_FAILURE and CONFIG_FAILURE both mean the
 # caller should keep the watch's old state_hash so the alert is retried next
@@ -143,7 +144,6 @@ class APNsClient:
         if not rows:
             return PERMANENT_FAILURE
         token_row = rows[0]
-        first = openings[0]
         payload = {
             "aps": {
                 "alert": {
@@ -157,7 +157,10 @@ class APNsClient:
                 "sound": "default",
                 "badge": 1,
             },
-            "booking_url": BOOKING_URL_TEMPLATE.format(campsite_id=first["campsite_id"]),
+            # The deep link is the watch's provider's to build: each site has
+            # its own booking URL shape, and the host is a constant in the
+            # provider module (never derived from provider_ref).
+            "booking_url": provider_for(watch).booking_url(watch, openings),
             "watch_id": watch["id"],
         }
         try:
