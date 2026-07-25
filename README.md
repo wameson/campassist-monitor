@@ -86,6 +86,11 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   with the next number, using idempotent DDL (so existing DBs get the same change).
   Keep the two in sync — every additive change to `schema.sql` needs a matching
   migration.
+- **Outstanding:** `0002_watches_provider.sql` adds `watches.provider` (the campground
+  provider discriminator) and `watches.provider_ref` (provider-specific identifiers).
+  Apply it **by hand** in the SQL editor like the others. It is **backfill-free**: the
+  column defaults (`'recreation_gov'`, `'{}'::jsonb`) migrate every existing row as part
+  of the `ALTER`, so there is no `UPDATE` to run and recreation.gov watches are unchanged.
 
 ## Local development
 

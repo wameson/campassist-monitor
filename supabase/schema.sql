@@ -11,6 +11,10 @@
 CREATE TABLE watches (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL DEFAULT auth.uid(),
+    provider     TEXT NOT NULL DEFAULT 'recreation_gov' -- which campground provider this watch polls
+                 CHECK (provider IN ('recreation_gov','going_to_camp')),
+    provider_ref JSONB NOT NULL DEFAULT '{}'::jsonb,     -- provider-specific identifiers, e.g. going_to_camp
+                                                         -- {"host":…,"resource_location_id":…,"map_id":…}
     campground_id    TEXT NOT NULL,
     campground_name  TEXT NOT NULL,
     campground_state TEXT,
