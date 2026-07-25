@@ -1,0 +1,14 @@
+{
+  "mapId": -2147483639,
+  "mapAvailabilities": [7],
+  "resourceAvailabilities": {
+    "-2147483024": [
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 1, "remainingQuota": null}
+    ]
+  },
+  "mapLinkAvailabilities": {
+    "-2147483300": [7]
+  }
+}

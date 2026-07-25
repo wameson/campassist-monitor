@@ -4,8 +4,9 @@ FakeDB implements the same interface as db.SupabaseClient against
 in-memory tables, supporting the PostgREST filter subset the monitor
 uses (eq, in, lt), and can be given a `fail_on` hook that raises for
 chosen calls the way a real PostgREST rejection would. FakeHTTP stands
-in for the recreation.gov client. No test touches the network or real
-secrets.
+in for the recreation.gov client and FakeGTCHTTP for the GoingToCamp one
+(which addresses maps by query parameter rather than by path). No test
+touches the network or real secrets.
 """
 
 from __future__ import annotations
@@ -196,6 +197,26 @@ class FakeHTTP:
         return self.responder(campground_id)
 
 
+class FakeGTCHTTP:
+    """GoingToCamp stand-in; responder(map_id) -> FakeResponse.
+
+    Unlike recreation.gov, which names the campground in the URL path, every
+    GoingToCamp availability call goes to the same URL and picks its map with
+    the `mapId` query parameter — so that is what the responder is keyed on.
+    """
+
+    def __init__(self, responder):
+        self.responder = responder
+        self.requests: list[dict] = []
+
+    def get(self, url, params=None, headers=None):
+        map_id = (params or {}).get("mapId")
+        self.requests.append(
+            {"url": url, "map_id": map_id, "params": params, "headers": headers}
+        )
+        return self.responder(map_id)
+
+
 def make_watch(**overrides) -> dict:
     watch = {
         "id": "w1",
@@ -213,6 +234,28 @@ def make_watch(**overrides) -> dict:
         "last_checked_at": None,
         "last_found_at": None,
     }
+    watch.update(overrides)
+    return watch
+
+
+def make_gtc_watch(**overrides) -> dict:
+    """A going_to_camp watch on the park and dates the fixtures were captured
+    from: Alta Lake (resourceLocationId -2147483647, rootMapId -2147483396),
+    2026-08-14 to 2026-08-16 — the exact request in the research report, so the
+    fixtures' three-element per-night arrays are the ones it really answers
+    with (nights 8/14 and 8/15, plus the check-out day 8/16)."""
+    watch = make_watch(
+        campground_id="gtc_-2147483647",
+        campground_name="Alta Lake",
+        campground_state="WA",
+        start_date="2026-08-14",
+        end_date="2026-08-16",
+        provider="going_to_camp",
+        provider_ref={
+            "resource_location_id": -2147483647,
+            "map_id": -2147483396,
+        },
+    )
     watch.update(overrides)
     return watch
 

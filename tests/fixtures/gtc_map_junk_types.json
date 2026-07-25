@@ -1,0 +1,23 @@
+{
+  "mapId": -2147483334,
+  "mapAvailabilities": "who knows",
+  "resourceAvailabilities": {
+    "-2147483029": [
+      {"availability": "0", "remainingQuota": null},
+      {"availability": true},
+      {"availability": null},
+      "not an object",
+      42,
+      null,
+      {"remainingQuota": null},
+      {"availability": 0}
+    ],
+    "-2147483028": {"availability": 0},
+    "-2147483027": null,
+    "-2147483026": []
+  },
+  "mapLinkAvailabilities": {
+    "-2147483639": [7],
+    "not-an-id": [7]
+  }
+}

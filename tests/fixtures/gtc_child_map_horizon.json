@@ -1,0 +1,37 @@
+{
+  "mapId": -2147483334,
+  "mapAvailabilities": [7],
+  "resourceAvailabilities": {
+    "-2147483029": [
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null}
+    ],
+    "-2147483028": [
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 1, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null}
+    ],
+    "-2147483027": [
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null}
+    ],
+    "-2147483026": [
+      {"availability": 3, "remainingQuota": null},
+      {"availability": 5, "remainingQuota": null},
+      {"availability": 7, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null}
+    ],
+    "-2147483025": [
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 3, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null},
+      {"availability": 0, "remainingQuota": null}
+    ]
+  },
+  "mapLinkAvailabilities": {}
+}

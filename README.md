@@ -1,11 +1,13 @@
 # campassist-monitor
 
-CampAssist backend: centralized recreation.gov availability monitor.
-A GitHub Actions cron job (every 30 minutes, in this **private** repo) polls the
-recreation.gov availability API for all users' watches — deduplicated to one API
-call per unique (campground, month) per cycle — detects new openings via state
-hashes, and sends APNs push notifications with a direct booking link. Supabase
-(free tier) is the shared database; there is no server.
+CampAssist backend: centralized campsite availability monitor for recreation.gov
+and GoingToCamp (Washington State Parks).
+A GitHub Actions cron job (every 30 minutes, in this **private** repo) polls all
+users' watches through the conformer each one's `provider` names — deduplicated
+to one request per unique poll unit per cycle (see [Providers](#providers)) —
+detects new openings via state hashes, and sends APNs push notifications with a
+direct booking link. Supabase (free tier) is the shared database; there is no
+server.
 
 See the CampAssist `PLAN.md` (Phase 1) for the full design: write budget,
 anti-blocking rules, and the recreation.gov API contract.
@@ -43,11 +45,45 @@ is recorded against the conformer that asked for it, and the 404-strike
 bookkeeping is kept per provider, so two providers that happen to name the same
 `campground_id` are polled — and struck — entirely separately.
 
-`recreation_gov` (`scripts/providers/recreation_gov.py`) is currently the only
-conformer; its poll unit is one (campground, month) request. A watch whose
-`provider` this build has no conformer for is left untouched — unpolled, still
-`monitoring`, outside the systemic error rate — and reported as a count in the
-run summary, so an older monitor cannot mis-serve a row a newer client wrote.
+Two conformers ship today:
+
+| `provider` | Module | Poll unit | `provider_ref` |
+|---|---|---|---|
+| `recreation_gov` | `scripts/providers/recreation_gov.py` | one (campground, month) request | unused — `campground_id` is the whole identity |
+| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll` | `{"resource_location_id": …, "map_id": …}`, both required (a watch without them is errored once, see Watch lifecycle) |
+
+GoingToCamp (Washington State Parks, on the Aspira platform) is map-scoped and
+recursive: a park's root map answers with pointers to its child maps and no
+sites of its own, so `poll` follows those maps (to the bottom, should one ever
+nest deeper than the one level the live API needs) and merges the result before
+the cycle ever sees it. A site is a `resourceId` with a per-night `availability`
+enum in which only `0` is confirmed to mean bookable, so every other value —
+including one this build has never seen — parses as taken. The booking deep
+link is the park's booking search pre-filled with the watch's dates (the SPA
+takes no site preselect), not a per-site page.
+
+Because the recursion costs more requests than a single month call, one park's
+whole fan-out is capped (however deeply its maps nest, and a map is never
+fetched twice) and every child request is paced and charged against the cycle's
+own time budget; a park that only half-polls is a failed unit, so the watch
+keeps its old `state_hash` rather than reading the gap as sites vanishing.
+`MAX_CHILD_MAPS` (40) is a safety cap set an order of magnitude above any
+observed park, not a tuning knob, so a park past it is a fault an operator has
+to clear rather than one more failed unit: `poll` raises, the cycle contains it
+as a cycle failure, and the run goes non-zero — a park that can never be served
+must not sit behind a green exit code while its watches look healthy.
+
+A watch whose `provider` this build has no conformer for is left untouched —
+unpolled, still `monitoring`, outside the systemic error rate — and reported as
+a count in the run summary, so an older monitor cannot mis-serve a row a newer
+client wrote.
+
+Whatever a provider's own identifiers are, `watches.campground_id` stays the
+watch's campground identity for the cycle's 404-strike lifecycle and
+`campgrounds_polled` telemetry, and must match `[A-Za-z0-9_-]+` — a watch whose
+id has any other character is errored before it is ever polled. A
+`going_to_camp` row therefore needs a stable id in that alphabet (the tests use
+`gtc_<resourceLocationId>`); the backend never parses it.
 
 To add a provider: write the conformer in its own module under
 `scripts/providers/`, then register it in `scripts/providers/__init__.py`.
@@ -126,8 +162,8 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The test suite is fully offline: Supabase, APNs, and recreation.gov are all
-faked. CI runs the same suite on every PR and push to `main`.
+The test suite is fully offline: Supabase, APNs, and every campground provider
+are all faked. CI runs the same suite on every PR and push to `main`.
 
 ## Operating notes
 
@@ -143,17 +179,23 @@ faked. CI runs the same suite on every PR and push to `main`.
   Skipped campgrounds are simply retried next cycle; skipped watches keep
   their old `last_checked_at`, and the run summary counts only what was
   actually polled.
-- **Poll horizon:** each watch's months are clamped to today through
-  today + 12 months; "today" uses a fixed UTC-8 offset so same-night
-  openings at US campgrounds stay alertable during US evening hours after
-  UTC midnight. A watch entirely beyond the horizon is polled once the
-  horizon reaches it.
+- **Poll horizon:** every provider clamps what it requests for a watch to
+  today through today + 12 months; "today" uses a fixed UTC-8 offset so
+  same-night openings at US campgrounds stay alertable during US evening
+  hours after UTC midnight. A watch entirely beyond the horizon is polled
+  once the horizon reaches it, and one straddling it is served — hashed and
+  alerted on — for its in-horizon nights alone.
 - **Watch lifecycle:** the backend expires watches whose end date has
   passed (`status='expired'`) and errors watches with malformed campground
-  ids (`status='error'`, once), whose campground has 404ed for 3
-  consecutive cycles (typo or delisted campground; any successful poll
-  resets the count), or whose own database writes are permanently rejected
-  (see Failure containment) — the app never has to clean these up.
+  ids (`status='error'`, once), whose `provider_ref` their provider cannot
+  poll with (also once — a watch that can never poll must not look healthy
+  to its user forever, though a *pool-wide* unpollable condition crosses the
+  systemic threshold and is left `monitoring` for an operator instead: nobody
+  should have to recreate a watch over a client-wide bad key name), whose
+  campground has 404ed for 3 consecutive cycles (typo or delisted
+  campground; any successful poll resets the count), or whose own database
+  writes are permanently rejected (see Failure containment) — the app never
+  has to clean these up.
 - **Failure containment:** a failure that belongs to one watch — a rejected
   write, a malformed row — is caught, recorded, and skipped; it never
   aborts the cycle. The other watches are still polled and alerted, and the
@@ -271,8 +313,10 @@ faked. CI runs the same suite on every PR and push to `main`.
     `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
     failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
     2 stays green while 2 of 2 goes red — or that a failure belonging to no
-    watch (the `run_summaries` INSERT, retention pruning, or being unable to
-    write `status='error'`) occurred. Both constants live at the top of
+    watch (the `run_summaries` INSERT, retention pruning, being unable to
+    write `status='error'`, a provider raising out of a poll unit its watches
+    share, or a pool-wide unpollable condition — see [Providers](#providers))
+    occurred. Both constants live at the top of
     `scripts/monitor.py` and are the tuning knobs.
 
     The numerator counts only the failures that say something about this
@@ -286,7 +330,9 @@ faked. CI runs the same suite on every PR and push to `main`.
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that
     expired this cycle, that were errored for an invalid or
-    persistently-404ing campground, that name a provider this build does not
+    persistently-404ing campground, that their provider can never poll
+    (errored, or left `monitoring` when that condition is pool-wide — see
+    Watch lifecycle), that name a provider this build does not
     serve (see [Providers](#providers)), that are wholly beyond the 12-month
     poll horizon (nothing to poll for them yet), and that the poll time budget
     never reached. A cycle that failed every watch it served goes red no

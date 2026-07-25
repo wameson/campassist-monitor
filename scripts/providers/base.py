@@ -41,7 +41,11 @@ class Provider(Protocol):
     """One campground site, behind the four things the cycle asks of it.
 
     Conformers are stateless and shared across watches (see PROVIDERS in
-    providers/__init__.py), so nothing here may cache per-watch state.
+    providers/__init__.py), so nothing here may cache per-watch state. A
+    conformer whose watches carry client-written configuration of its own may
+    also implement the optional `unpollable_reason(watch)` hook, which lets the
+    cycle error a permanently unpollable watch once instead of failing it every
+    cycle (see providers.unpollable_reason).
     """
 
     #: matches the `watches.provider` value this conformer serves
@@ -67,6 +71,14 @@ class Provider(Protocol):
         """Fetch and parse one poll unit, or None if it failed this cycle (the
         cycle then keeps the affected watches' old state_hash and retries next
         run rather than treating the gap as "no availability").
+
+        Returning None is for a failure a retry could clear. Raising is
+        reserved for the opposite: a fault on this unit that will recur
+        identically every cycle and needs an operator (going_to_camp's
+        ParkTooLarge). The cycle contains it as a *cycle* failure, so the unit
+        still behaves as failed for the watches on it — old state_hash kept,
+        nothing alerted — but the run goes red instead of leaving a park
+        permanently unserved behind a green exit code.
 
         `errors` collects one already-capped line per failure for the
         world-readable run summary; `budget_exhausted()` cuts retries short
