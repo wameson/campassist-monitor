@@ -42,13 +42,21 @@ def _matches(row: dict, params: dict | None) -> bool:
 FAKE_SERVICE_KEY = "fake-service-role-key"
 
 
-def postgrest_error(status: int = 400, message: str = "column watches.x does not exist"):
+def postgrest_error(
+    status: int = 400,
+    message: str = "column watches.x does not exist",
+    *,
+    details=None,
+    hint=None,
+):
     """An httpx.HTTPStatusError shaped like a PostgREST rejection, i.e. what
     db.SupabaseClient's raise_for_status() raises on a bad write — raised by
     httpx itself, so the exception's own message is the generic status line and
     doc link a real client produces, and `message` is reachable only through the
     response body. The request carries service-key headers like the real one, so
-    a rendering that leaked them would show up in the tests."""
+    a rendering that leaked them would show up in the tests. `details`/`hint`
+    stand in for the fields PostgREST populates on a constraint violation, where
+    `details` echoes the offending key values."""
     request = httpx.Request(
         "PATCH",
         "https://project.supabase.invalid/rest/v1/watches?id=in.%28w0,w1%29",
@@ -57,7 +65,7 @@ def postgrest_error(status: int = 400, message: str = "column watches.x does not
     response = httpx.Response(
         status,
         request=request,
-        json={"code": "42703", "message": message, "details": None, "hint": None},
+        json={"code": "42703", "message": message, "details": details, "hint": hint},
     )
     try:
         response.raise_for_status()
@@ -137,13 +145,29 @@ class FakeDB:
 
 
 class FakeAPNs:
-    def __init__(self, result: str = DELIVERED):
+    def __init__(
+        self,
+        result: str = DELIVERED,
+        failure: BaseException | None = None,
+        responder=None,
+    ):
         self.alerts: list[tuple[str, list[dict]]] = []
         self.result = result
+        # what a real client records for a push that did not land: the
+        # exception behind it, never a message naming the watch
+        self.failure = failure
+        # optional responder(watch) -> (result, failure) for per-watch outcomes,
+        # e.g. one dead device token in an otherwise healthy pool
+        self.responder = responder
 
-    def send_alert(self, watch, openings, db, errors=None) -> str:
+    def send_alert(self, watch, openings, db, failures=None) -> str:
         self.alerts.append((watch["id"], openings))
-        return self.result
+        result, failure = (
+            self.responder(watch) if self.responder else (self.result, self.failure)
+        )
+        if failures is not None and failure is not None:
+            failures.append(failure)
+        return result
 
 
 class FakeResponse:

@@ -152,19 +152,51 @@ faked. CI runs the same suite on every PR and push to `main`.
   and the pruning matters more than isolating one row.
 
   A watch moves to `status='error'` only when the failure was **pinned to
-  that row** — a single-watch write, a per-id fallback write, or its own
-  per-watch processing — and looks permanent. A batch failure nobody
-  attributed to a specific row is recorded and counted but never errors a
-  watch: users must not have to recreate a watch over a failure that was
-  never shown to be theirs. A transient failure likewise leaves the watch
-  `monitoring` to retry next cycle. Strike-count (`consecutive_not_found`)
-  writes are pure bookkeeping: a rejected one is recorded, but the watch is
-  still delta-checked, alerted, and stamped `last_checked_at`.
+  that row** — a single-watch write to `watches`, a per-id fallback write, or
+  the delta/`state_hash` write for that one watch — and looks permanent. A
+  batch failure nobody attributed to a specific row is recorded and counted
+  but never errors a watch: users must not have to recreate a watch over a
+  failure that was never shown to be theirs. The same holds for the
+  table-scoped work done while serving a watch — the `sent_alerts` cooldown
+  lookup and dedup upsert, and the APNs send: a `sent_alerts` schema drift or
+  an APNs client error is recorded and counted against that watch but never
+  errors it, because it is not evidence that this user's watch row is broken.
+  The watch was still polled, so it is also still stamped `last_checked_at`
+  rather than left looking unchecked to its user.
+  A transient failure likewise leaves the watch `monitoring` to retry next
+  cycle. Strike-count (`consecutive_not_found`) writes are pure bookkeeping: a
+  rejected one is recorded, but the watch is still delta-checked, alerted, and
+  stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
-  means the device token is dead and its row is deleted. Any other 4xx, a
-  missing token row, or a device token so malformed the push URL can't be
-  built is given up on (no retry) and the watch's hash still advances.
+  means the device token is dead and its row is deleted. The rest of the 4xx
+  space is split by *who can fix it*:
+  - A **per-device** rejection (400 `BadDeviceToken`/`DeviceTokenNotForTopic`,
+    a reason code we don't enumerate, a missing token row, or a device token so
+    malformed the push URL can't be built) is one device's problem, not the
+    cycle's. It is given up on (no retry, the hash still advances), recorded and
+    surfaced like any other failure, but left **out of the rate** that decides
+    the run's exit status — a single dead token can't turn the schedule red.
+  - A **pool-wide provider/config** fault (403 `ExpiredProviderToken`/
+    `InvalidProviderToken`/`MissingProviderToken`, 400 `BadTopic`/
+    `TopicDisallowed` — an expired or wrong signing key, or a wrong bundle id)
+    would silence *every* push until an operator rotates a credential. It keeps
+    the old `state_hash` so the alert retries once fixed, and it **counts**
+    toward the rate, so a signing-key or bundle-id outage exits non-zero.
+
+  On top of the per-reason split, a **pool-wide backstop** turns the run
+  systemic whenever outright rejections wipe out nearly every served push
+  (`APNS_WIPEOUT_RATE`/`APNS_WIPEOUT_FLOOR` in `scripts/monitor.py`), so a
+  reason code we did not enumerate still can't yield a silent green outage while
+  a handful of genuinely dead tokens in a healthy pool stays green. An APNs
+  outage (5xx/429/transport) still counts and still turns a broad enough
+  failure red.
+
+  If a push *is* delivered but its `sent_alerts` dedup row is rejected, the
+  watch's `state_hash` is written anyway. Nothing would otherwise stop the
+  identical push going out again every cycle until the drift is fixed: the
+  dedup rows that would suppress it are exactly the ones that failed to write.
+  The trade is an occasional missed re-alert instead of a repeating push.
 - **Errors and run status:** polling and alert errors (recreation.gov
   failures, unrecognized responses, APNs delivery problems) and contained
   per-watch failures are all recorded in the `run_summaries.errors` column
@@ -173,6 +205,32 @@ faked. CI runs the same suite on every PR and push to `main`.
   the server's own reason — for a rejected write, the PostgREST body naming
   the column or constraint at fault, rather than the generic HTTP status line
   and request URL, so a schema drift says which column is missing.
+
+  Two renderings of the same failures go to two audiences. `run_summaries` is
+  **world-readable** (its RLS policy is `USING (true)`, so every app client can
+  read it), so the persisted `errors` string is **sanitized**: watch UUIDs
+  become per-run ordinals (`watch #1`) and the PostgREST `details`/`hint` — a
+  constraint violation's `details` echoes the offending key values — are
+  dropped, keeping the status code and the column/constraint name. A failure
+  with no response to read (a transport error, a malformed row's `ValueError`)
+  is persisted as its exception type alone, since its message is whatever the
+  raiser put there and can quote the value that upset it. A user-supplied value
+  is never republished either: a malformed `campground_id` is persisted as a
+  count of the ids and watches it errored, and the values themselves go only to
+  the operator log. This holds for every
+  failure path, undelivered APNs pushes included: the client hands back the
+  exception and never names the watch, so the row it belongs to is decided —
+  and ordinalized — here. The operator-only GitHub Actions
+  `::warning::`/`::error::` annotation keeps the full detail (watch UUIDs and
+  the complete reason), each failure appearing once. Neither ever carries the
+  service-role key. The persisted `(isolated)`/`(systemic)` verdict label is
+  chosen after folding in every failure known before the row is written
+  (including retention-prune failures, which now run before the summary
+  INSERT), so it always matches the run's exit code — and a red run whose only
+  failure belonged to no watch persists that label and the failure's sanitized
+  text rather than a NULL that would read like a clean cycle. (A summary INSERT
+  that itself fails is the one unrepresentable case: there is then no row.)
+
   The **exit status is decided by error rate**, so
   a broken watch does not cry wolf but broad breakage cannot hide:
   - *isolated* — the run exits 0 and the schedule stays **green**, because
@@ -185,6 +243,14 @@ faked. CI runs the same suite on every PR and push to `main`.
     watch (the `run_summaries` INSERT, retention pruning, or being unable to
     write `status='error'`) occurred. Both constants live at the top of
     `scripts/monitor.py` and are the tuning knobs.
+
+    The numerator counts only the failures that say something about this
+    cycle's health, so a **per-device** APNs rejection — a dead device token no
+    operator can fix — is reported in the row and the annotation but not
+    counted; the tally says how many such failures it left out. A **pool-wide**
+    provider/config APNs fault *is* counted (see "Alert delivery"), and the
+    pool-wide backstop makes the run systemic regardless of per-reason rating
+    when outright rejections wipe out nearly every served push.
 
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that

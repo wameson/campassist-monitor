@@ -165,6 +165,15 @@ def test_invalid_campground_id_errored(bad_id):
     assert {r["campground_id"] for r in http.requests} == {"222"}
     assert [w for w, _ in apns.alerts] == ["w-ok"]
     assert "invalid campground_id" in summary["errors"]
+    # the rejected value is arbitrary user-supplied text and run_summaries is
+    # world-readable, so the persisted row carries the count and the
+    # operator-only channel carries the value
+    persisted = db.tables["run_summaries"][-1]["errors"]
+    assert persisted == summary["errors"]
+    if bad_id:
+        assert bad_id not in persisted
+    assert repr(bad_id) in summary["errors_detail"]
+    assert all(len(line) <= monitor.MAX_ERROR_MESSAGE_CHARS for line in persisted.split("; "))
     assert summary["watches_checked"] == 1
     bad = next(w for w in db.tables["watches"] if w["id"] == "w-bad")
     assert bad["status"] == "error"  # out of the monitoring pool for good
@@ -176,6 +185,27 @@ def test_invalid_campground_id_errored(bad_id):
     assert summary["errors"] is None or "invalid campground_id" not in summary["errors"]
     assert summary["watches_checked"] == 1
     assert {r["campground_id"] for r in http.requests} == {"222"}
+
+
+def test_hostile_campground_id_is_bounded_in_both_channels():
+    # campground_id is unconstrained TEXT, so a rejected one can be arbitrarily
+    # long. Neither channel may be flooded with it, and the world-readable row
+    # must not republish it at all.
+    hostile = "look-at-me " * 400
+    db = FakeDB({"watches": [make_watch(id="w-bad", campground_id=hostile)]})
+
+    summary = monitor.run(
+        db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(200, {})),
+        rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW,
+    )
+
+    assert "look-at-me" not in summary["errors"]
+    assert "1 invalid campground_id(s) on 1 watch(es)" in summary["errors"]
+    assert all(
+        len(line) <= monitor.MAX_ERROR_MESSAGE_CHARS
+        for line in summary["errors_detail"].split("; ")
+    )
+    assert "look-at-me" in summary["errors_detail"]  # still actionable
 
 
 def test_unrecognized_200_body_is_failed_month():
