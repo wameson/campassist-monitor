@@ -38,6 +38,29 @@ def provider_for(watch: dict) -> Provider:
     return PROVIDERS[provider_name(watch)]
 
 
+def unpollable_reason(watch: dict) -> str | None:
+    """Why this watch's provider can never poll it — whatever the site's state —
+    or None when it is pollable, which is the answer for most watches.
+
+    An *optional* conformer hook, for a provider whose watches carry
+    client-written configuration of its own: going_to_camp needs two identifiers
+    out of `watches.provider_ref`, and a row without them is not a transient
+    fault but a permanently unpollable watch, so the cycle errors it once (the
+    same lifecycle a malformed `campground_id` gets) instead of failing it
+    forever while the user sees nothing wrong. A provider with no such
+    configuration — recreation.gov, whose `campground_id` is the whole identity —
+    simply does not implement the hook.
+
+    A conformer implementing it must not raise (the lifecycle pass runs outside
+    the cycle's per-watch containment) and must return a short reason naming only
+    the field at fault, never the client-supplied value, because the cycle
+    reports it. Only watches on a registered provider may be passed in (see
+    `provider_for`).
+    """
+    reason = getattr(provider_for(watch), "unpollable_reason", None)
+    return reason(watch) if reason is not None else None
+
+
 __all__ = [
     "DEFAULT_PROVIDER",
     "PROVIDERS",
@@ -47,4 +70,5 @@ __all__ = [
     "RecreationGovProvider",
     "provider_for",
     "provider_name",
+    "unpollable_reason",
 ]

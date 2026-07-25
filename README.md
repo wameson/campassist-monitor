@@ -48,21 +48,23 @@ Two conformers ship today:
 | `provider` | Module | Poll unit | `provider_ref` |
 |---|---|---|---|
 | `recreation_gov` | `scripts/providers/recreation_gov.py` | one (campground, month) request | unused — `campground_id` is the whole identity |
-| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll` | `{"resource_location_id": …, "map_id": …}`, both required |
+| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll` | `{"resource_location_id": …, "map_id": …}`, both required (a watch without them is errored once, see Watch lifecycle) |
 
 GoingToCamp (Washington State Parks, on the Aspira platform) is map-scoped and
 recursive: a park's root map answers with pointers to its child maps and no
-sites of its own, so `poll` recurses one level and merges the result before the
-cycle ever sees it. A site is a `resourceId` with a per-night `availability`
+sites of its own, so `poll` follows those maps (to the bottom, should one ever
+nest deeper than the one level the live API needs) and merges the result before
+the cycle ever sees it. A site is a `resourceId` with a per-night `availability`
 enum in which only `0` is confirmed to mean bookable, so every other value —
 including one this build has never seen — parses as taken. The booking deep
 link is the park's booking search pre-filled with the watch's dates (the SPA
 takes no site preselect), not a per-site page.
 
 Because the recursion costs more requests than a single month call, one park's
-fan-out is capped and every child request is paced and charged against the
-cycle's own time budget; a park that only half-polls is a failed unit, so the
-watch keeps its old `state_hash` rather than reading the gap as sites vanishing.
+whole fan-out is capped (however deeply its maps nest, and a map is never
+fetched twice) and every child request is paced and charged against the cycle's
+own time budget; a park that only half-polls is a failed unit, so the watch
+keeps its old `state_hash` rather than reading the gap as sites vanishing.
 
 A watch whose `provider` this build has no conformer for is left untouched —
 unpolled, still `monitoring`, outside the systemic error rate — and reported as
@@ -170,14 +172,17 @@ faked. CI runs the same suite on every PR and push to `main`.
   Skipped campgrounds are simply retried next cycle; skipped watches keep
   their old `last_checked_at`, and the run summary counts only what was
   actually polled.
-- **Poll horizon:** each watch's months are clamped to today through
-  today + 12 months; "today" uses a fixed UTC-8 offset so same-night
-  openings at US campgrounds stay alertable during US evening hours after
-  UTC midnight. A watch entirely beyond the horizon is polled once the
-  horizon reaches it.
+- **Poll horizon:** every provider clamps what it requests for a watch to
+  today through today + 12 months; "today" uses a fixed UTC-8 offset so
+  same-night openings at US campgrounds stay alertable during US evening
+  hours after UTC midnight. A watch entirely beyond the horizon is polled
+  once the horizon reaches it, and one straddling it is served — hashed and
+  alerted on — for its in-horizon nights alone.
 - **Watch lifecycle:** the backend expires watches whose end date has
   passed (`status='expired'`) and errors watches with malformed campground
-  ids (`status='error'`, once), whose campground has 404ed for 3
+  ids (`status='error'`, once), whose `provider_ref` their provider cannot
+  poll with (also once — a watch that can never poll must not look healthy
+  to its user forever), whose campground has 404ed for 3
   consecutive cycles (typo or delisted campground; any successful poll
   resets the count), or whose own database writes are permanently rejected
   (see Failure containment) — the app never has to clean these up.

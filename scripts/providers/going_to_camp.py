@@ -55,9 +55,10 @@ AVAILABLE = 0
 POLL_HORIZON_MONTHS = 12
 
 # A park's root map fans out to a handful of child maps (4 for the park this
-# was captured against). The cap bounds one park's share of the cycle: a park
-# that suddenly answers with far more is failed loudly for this cycle rather
-# than allowed to spend the whole time budget by itself.
+# was captured against). The cap bounds one park's share of the cycle across
+# the *whole* traversal, however deeply the maps nest: a park that suddenly
+# answers with far more is failed loudly for this cycle rather than allowed to
+# spend the whole time budget by itself.
 MAX_CHILD_MAPS = 12
 
 # Pacing inside one poll unit, matching the 1.2-2.8 s the cycle leaves between
@@ -67,6 +68,11 @@ CHILD_MAP_DELAY_SECONDS = 1.5
 # A bounded integer literal — long enough for the platform's negative 32-bit
 # ids, short enough that a client cannot post a megabyte "identifier".
 IDENTIFIER_RE = re.compile(r"-?\d{1,19}")
+# The same bound by magnitude, for an identifier that arrives as a jsonb
+# number rather than as a string: Postgres jsonb numbers are
+# arbitrary-precision, so without it a client could turn every query string
+# this provider sends into a multi-kilobyte one.
+IDENTIFIER_MAX = 10 ** 19
 
 
 class InvalidProviderRef(ValueError):
@@ -81,15 +87,21 @@ def _identifier(ref: dict, field: str) -> int:
     """One numeric identifier out of the client-written provider_ref.
 
     Identifiers only: the result is used as a query-string value and nothing
-    else, so no part of it can ever steer a request at another host."""
+    else, so no part of it can ever steer a request at another host. Both input
+    forms — a jsonb number and a numeric string — are bounded to the same
+    magnitude, so neither can grow the query string this provider sends."""
     value = ref.get(field)
     if isinstance(value, bool) or value is None:
         raise InvalidProviderRef(f"provider_ref.{field} is missing")
     if isinstance(value, int):
-        return value
-    if isinstance(value, str) and IDENTIFIER_RE.fullmatch(value.strip()):
-        return int(value)
-    raise InvalidProviderRef(f"provider_ref.{field} is not an integer identifier")
+        number = value
+    elif isinstance(value, str) and IDENTIFIER_RE.fullmatch(value.strip()):
+        number = int(value)
+    else:
+        raise InvalidProviderRef(f"provider_ref.{field} is not an integer identifier")
+    if abs(number) >= IDENTIFIER_MAX:
+        raise InvalidProviderRef(f"provider_ref.{field} is too large for an identifier")
+    return number
 
 
 def provider_ref_ids(watch: dict) -> tuple[int, int]:
@@ -117,17 +129,24 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     """The date range to ask the API for, or None when there is nothing to poll
     — a stay whose last night has passed, or one still beyond the horizon.
 
-    The range is the stay itself, clamped forward to today. The check-out day
-    stays in the request (it is what the booking search is given) and is
+    The range is the stay itself, clamped forward to today and back to the
+    horizon, so a stay running years past the horizon is never requested in
+    full and no out-of-horizon night can reach the state hash or an alert. Like
+    the other conformer, a watch straddling the horizon is served on its
+    in-horizon nights alone (recreation.gov clamps its last *month* the same
+    way; this API is asked for days, so the clamp is per-night). The check-out
+    day stays in the request (it is what the booking search is given) and is
     dropped from the result by `date_in_watch`, exactly as the other conformer
     drops it from a month it polled anyway."""
     last_night = end - timedelta(days=1) if end > start else start
     if last_night < today:
         return None
     first = max(start, today)
-    if first > horizon_date(today):
+    horizon = horizon_date(today)
+    if first > horizon:
         return None
-    return first, max(end, first)
+    last_night = min(last_night, horizon)
+    return first, max(min(end, last_night + timedelta(days=1)), first)
 
 
 # --- fetch and parse ------------------------------------------------------
@@ -285,13 +304,26 @@ def poll_park(
     budget_exhausted=lambda: False,
     not_found: set[str] | None = None,
 ) -> dict[str, dict] | None:
-    """One park's whole date range: the root map, then each child map it names.
+    """One park's whole date range: the root map, then every map reachable from
+    it. One level down is all the captured park needs, but a park that nests
+    deeper is followed to the bottom rather than having its deeper sites quietly
+    dropped — a merged result missing sites is the false delta this whole
+    function is shaped to avoid.
 
-    Returns the merged per-site state, or None if any part of the recursion
+    Returns the merged per-site state, or None if any part of the traversal
     failed — a park polled only halfway would read as sites that vanished, so a
-    partial result is a failed unit and the cycle keeps the old state_hash.
+    partial result is a failed unit and the cycle keeps the old state_hash. The
+    traversal is bounded three ways: MAX_CHILD_MAPS total maps below the root
+    however deep they nest, a map already visited is never fetched twice (so a
+    cycle in the map graph terminates), and the cycle's own time budget stops it
+    wherever it has got to.
     """
     label = f"{campground_id}/{start.isoformat()}"
+    # Child fetches are labelled apart from the root's: only the root's 404
+    # strikes the watch, so an operator reading run_summaries must be able to
+    # tell the two failures apart. Both halves stay free of client-written
+    # values (campground_id is validated against monitor.CAMPGROUND_ID_RE).
+    child_label = f"{label} child map"
     root = fetch_map(
         http, resource_location_id, root_map_id, start, end, user_agent,
         label=label, sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
@@ -301,15 +333,31 @@ def poll_park(
         return None
     sites, children = root
 
-    if len(children) > MAX_CHILD_MAPS:
-        if errors is not None:
-            errors.append(capped_line(
-                f"{label}: {len(children)} child maps exceeds the {MAX_CHILD_MAPS} "
-                "polled per park, skipped"
-            ))
-        return None
+    seen = {root_map_id}
+    queue: list[int] = []
 
-    for child_map_id in children:
+    def schedule(map_ids: list[int]) -> bool:
+        """Queue the maps this one names that have not been seen yet. False when
+        the park's whole fan-out exceeds the cap, which fails the unit before
+        another request is spent on it."""
+        for map_id in map_ids:
+            if map_id in seen:
+                continue  # already polled or queued: a cycle in the map graph
+            seen.add(map_id)
+            queue.append(map_id)
+        if len(seen) - 1 > MAX_CHILD_MAPS:
+            if errors is not None:
+                errors.append(capped_line(
+                    f"{label}: {len(seen) - 1} child maps exceeds the {MAX_CHILD_MAPS} "
+                    "polled per park, skipped"
+                ))
+            return False
+        return True
+
+    if not schedule(children):
+        return None
+    while queue:
+        child_map_id = queue.pop(0)
         if budget_exhausted():
             if errors is not None:
                 errors.append(capped_line(
@@ -319,7 +367,7 @@ def poll_park(
         sleep(CHILD_MAP_DELAY_SECONDS)
         child = fetch_map(
             http, resource_location_id, child_map_id, start, end, user_agent,
-            label=label, sleep=sleep, errors=errors,
+            label=child_label, sleep=sleep, errors=errors,
             budget_exhausted=budget_exhausted,
             # a missing child map is drift inside a park that answered, so it
             # never strikes the watches with a not-found
@@ -327,7 +375,9 @@ def poll_park(
         )
         if child is None:
             return None
-        child_sites, _ = child  # one level of recursion is all the API needs
+        child_sites, grandchildren = child
+        if not schedule(grandchildren):
+            return None
         for resource_id, site in child_sites.items():
             entry = sites.setdefault(resource_id, {
                 "campsite_id": site["campsite_id"],
@@ -344,6 +394,21 @@ class GoingToCampProvider:
     """GoingToCamp behind the Provider protocol (see providers/base.py)."""
 
     name = "going_to_camp"
+
+    def unpollable_reason(self, watch: dict) -> str | None:
+        """Why this watch can never be polled, or None (the optional conformer
+        hook `providers.unpollable_reason` describes).
+
+        A `provider_ref` this provider cannot read the two identifiers out of is
+        not a transient fault: it fails identically every cycle, so the cycle
+        errors the watch once rather than leaving the user a watch that looks
+        healthy and never alerts. The reason names only the field at fault —
+        the value is client-written and the cycle publishes this string."""
+        try:
+            provider_ref_ids(watch)
+        except InvalidProviderRef as exc:
+            return str(exc)
+        return None
 
     def poll_plan(self, watch: dict, today: date) -> list[PollKey]:
         """One key per watch: this provider's poll unit is the whole park over
@@ -395,7 +460,11 @@ class GoingToCampProvider:
         hash and retry next run). Past nights and the check-out day are
         excluded: they are unbookable, so they count toward neither the hash
         nor an alert."""
-        provider_ref_ids(watch)  # unusable ref -> this watch's own failure
+        # The cycle's lifecycle pass errors an unusable ref before it gets here
+        # (see `unpollable_reason`); this stays the contained backstop, since
+        # extract_relevant is the one entry point that runs inside per-watch
+        # containment and can therefore report it as this watch's own failure.
+        provider_ref_ids(watch)
         keys = self.poll_plan(watch, today)
         if not keys:
             return None

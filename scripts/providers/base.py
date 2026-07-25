@@ -41,7 +41,11 @@ class Provider(Protocol):
     """One campground site, behind the four things the cycle asks of it.
 
     Conformers are stateless and shared across watches (see PROVIDERS in
-    providers/__init__.py), so nothing here may cache per-watch state.
+    providers/__init__.py), so nothing here may cache per-watch state. A
+    conformer whose watches carry client-written configuration of its own may
+    also implement the optional `unpollable_reason(watch)` hook, which lets the
+    cycle error a permanently unpollable watch once instead of failing it every
+    cycle (see providers.unpollable_reason).
     """
 
     #: matches the `watches.provider` value this conformer serves

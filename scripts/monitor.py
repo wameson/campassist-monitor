@@ -2,10 +2,11 @@
 
 Cycle: jittered start → read active watches → expire past-date watches →
 route each watch to the provider its `provider` column names → error watches
-with invalid campground ids or persistently-404ing campgrounds → dedupe the
-poll plan across all users → poll each provider politely (one browser UA per
-run, shuffled order, 1.2–2.8 s gaps, exponential backoff, all under a
-per-cycle time budget) → delta-detect per watch via state_hash → APNs alert
+with invalid campground ids, with provider config their provider cannot poll,
+or with persistently-404ing campgrounds → dedupe the poll plan across all users
+→ poll each provider politely (one browser UA per run, shuffled order, 1.2–2.8 s
+gaps, exponential backoff, all under a per-cycle time budget) → delta-detect
+per watch via state_hash → APNs alert
 with (site, date) dedup + 6 h cooldown → batched last_checked_at write → one
 run_summaries row → 30-day retention pruning.
 
@@ -47,7 +48,14 @@ from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE
 # common.py only so a provider can cap against the very same constant.
 from common import MAX_ERROR_MESSAGE_CHARS, as_date, capped_line
 from db import SupabaseClient
-from providers import PROVIDERS, PollKey, Provider, provider_for, provider_name
+from providers import (
+    PROVIDERS,
+    PollKey,
+    Provider,
+    provider_for,
+    provider_name,
+    unpollable_reason,
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -610,6 +618,34 @@ def run(
         )
         invalid_watch_ids = {w["id"] for w in invalid}
         active = [w for w in active if w["id"] not in invalid_watch_ids]
+
+    # Backend-owned lifecycle: the same treatment for a watch its own provider
+    # says it can never poll — client-written provider config the conformer
+    # cannot read (see providers.unpollable_reason). That fails identically every
+    # cycle, so the watch moves to status='error' once instead of failing inside
+    # containment forever while its user sees a watch that looks healthy. Once
+    # errored it leaves the pool, so the write happens once and a steady-state
+    # cycle stays inside the write budget.
+    unpollable = [(w, reason) for w in active if (reason := unpollable_reason(w))]
+    if unpollable:
+        # The reason names only the field at fault, never what the client wrote,
+        # but the world-readable row still gets the count alone — the field name
+        # is what tells the operator which client is writing bad rows, and that
+        # is an operator's concern.
+        errors.append(
+            f"{len(unpollable)} watch(es) their provider cannot poll, errored and skipped"
+        )
+        for reason in sorted({reason for _, reason in unpollable}):
+            detail_only.append(capped_line(f"{reason}: watch(es) errored and skipped"))
+        # errorable=False: this write *is* the status='error' write (as above).
+        record_failures(
+            write_watches((w["id"] for w, _ in unpollable), {"status": "error"}),
+            "error-unpollable",
+            errorable=False,
+            blocking=False,
+        )
+        unpollable_ids = {w["id"] for w, _ in unpollable}
+        active = [w for w in active if w["id"] not in unpollable_ids]
 
     # Each planned unit carries the conformer `provider_for` chose for the
     # watches that asked for it, so dispatch can never be decided by the

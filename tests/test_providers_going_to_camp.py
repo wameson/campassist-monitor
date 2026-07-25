@@ -14,6 +14,12 @@ captured in the GoingToCamp research report (Alta Lake, resourceLocationId
                            enum values observed in the wild (3, 5, 7) — the
                            report truncated the real body at "… 35 sites …"
   gtc_child_map_empty.json a well-formed child map serving no resources
+  gtc_child_map_nested.json } hand-built drift: a child map that serves a
+  gtc_grandchild_map.json   } resource *and* names a child of its own, whose
+                            child in turn links back to it. No captured park
+                            nests this deep; the pair exists so the traversal
+                            is proven to follow the extra level instead of
+                            dropping its sites, and to terminate on the cycle
   gtc_map_junk_types.json  } degraded bodies, hand-built: nothing in the
   gtc_map_renamed_fields.json } captures was malformed
 
@@ -22,7 +28,7 @@ No test touches the network.
 
 import json
 import random
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,14 +41,22 @@ from helpers import (
     FakeGTCHTTP,
     FakeResponse,
     make_gtc_watch,
+    make_watch,
 )
-from providers import PROVIDERS, GoingToCampProvider, Provider, provider_for
+from providers import (
+    PROVIDERS,
+    GoingToCampProvider,
+    Provider,
+    provider_for,
+    unpollable_reason,
+)
 from providers.going_to_camp import (
     AVAILABILITY_URL,
     BOOKING_URL,
     HOST,
     MAX_CHILD_MAPS,
     InvalidProviderRef,
+    horizon_date,
     parse_map,
     poll_range,
 )
@@ -56,7 +70,9 @@ FIXTURES = Path(__file__).parent / "fixtures"
 ROOT_MAP_ID = -2147483396
 RESOURCE_LOCATION_ID = -2147483647
 DAILY_CHILD_MAP_ID = -2147483334
-CHILD_MAP_IDS = [-2147483639, -2147483638, -2147483465, DAILY_CHILD_MAP_ID]
+NESTING_CHILD_MAP_ID = -2147483639
+GRANDCHILD_MAP_ID = -2147483300
+CHILD_MAP_IDS = [NESTING_CHILD_MAP_ID, -2147483638, -2147483465, DAILY_CHILD_MAP_ID]
 
 # The stay make_gtc_watch describes: nights 8/14 and 8/15, check-out 8/16.
 START, END = date(2026, 8, 14), date(2026, 8, 16)
@@ -67,15 +83,17 @@ def load_fixture(name):
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-def park_responder(child=None, root=None):
+def park_responder(child=None, root=None, maps=None):
     """A FakeGTCHTTP responder serving the captured park: the root map, then
     the daily child map, with every other child map empty. `child` and `root`
-    override those two responses."""
+    override those two responses; `maps` overrides any map by id."""
     root_body = load_fixture("gtc_root_map")
     daily = child if child is not None else FakeResponse(200, load_fixture("gtc_child_map_daily"))
     empty = load_fixture("gtc_child_map_empty")
 
     def responder(map_id):
+        if maps is not None and map_id in maps:
+            return maps[map_id]
         if map_id == ROOT_MAP_ID and root is not None:
             return root
         if map_id == ROOT_MAP_ID:
@@ -137,6 +155,58 @@ def test_poll_range_boundaries():
     # has no bookable night left
     assert poll_range(date(2026, 7, 30), date(2026, 8, 1), TODAY) is None
     assert poll_range(date(2026, 7, 30), date(2026, 8, 2), TODAY) == (TODAY, date(2026, 8, 2))
+
+
+def test_the_requested_range_is_clamped_to_the_horizon_not_just_gated_by_it():
+    # a stay that starts inside the horizon and runs years past it must not be
+    # requested in full: the same clamp recreation.gov applies to its last month
+    horizon = horizon_date(TODAY)
+    assert horizon == date(2027, 8, 1)
+    assert poll_range(date(2027, 7, 25), date(2029, 1, 1), TODAY) == (
+        date(2027, 7, 25), horizon + timedelta(days=1)
+    )
+    # the check-out day of an in-horizon stay is still requested verbatim
+    assert poll_range(date(2027, 7, 25), date(2027, 7, 28), TODAY) == (
+        date(2027, 7, 25), date(2027, 7, 28)
+    )
+    # and the poll key the cycle dedupes on carries the clamped range, so a
+    # multi-year watch costs the same 2-5 GETs as any other
+    [(_, key)] = GTC.poll_plan(
+        make_gtc_watch(start_date="2027-07-25", end_date="2029-01-01"), TODAY
+    )
+    assert key[2:] == ("2027-07-25", "2027-08-02")
+
+
+def test_a_watch_straddling_the_horizon_is_served_on_its_in_horizon_nights():
+    watch = make_gtc_watch(start_date="2027-07-30", end_date="2029-01-01")
+    [key] = GTC.poll_plan(watch, TODAY)
+    http = FakeGTCHTTP(park_responder())
+
+    parsed = GTC.poll(http, key, "UA", sleep=lambda s: None)
+    current = GTC.extract_relevant({key: parsed}, watch, TODAY)
+
+    # nothing past the horizon was even asked for
+    for request in http.requests:
+        assert request["params"]["startDate"] == "2027-07-30"
+        assert request["params"]["endDate"] == "2027-08-02"
+    # so no out-of-horizon night can reach the state hash or an alert
+    assert current == {
+        "-2147483029": {
+            "campsite_id": "-2147483029",
+            "site": "-2147483029",
+            "dates": ["2027-08-01"],
+        },
+        "-2147483027": {
+            "campsite_id": "-2147483027",
+            "site": "-2147483027",
+            "dates": ["2027-07-30", "2027-07-31", "2027-08-01"],
+        },
+        "-2147483025": {
+            "campsite_id": "-2147483025",
+            "site": "-2147483025",
+            "dates": ["2027-07-30", "2027-08-01"],
+        },
+    }
 
 
 # --- polling: root -> child recursion ------------------------------------
@@ -217,17 +287,65 @@ def test_availability_zero_is_open_and_every_other_value_is_not():
     assert parsed["-2147483027"]["site"] == "-2147483027"
 
 
+def test_poll_follows_a_park_that_nests_deeper_than_one_level():
+    # one level down is all the live API needs, but a park that nests deeper
+    # must not have its deeper sites silently dropped from a "successful"
+    # merged result — that is the false delta the failed-unit rule exists for
+    maps = {
+        NESTING_CHILD_MAP_ID: FakeResponse(200, load_fixture("gtc_child_map_nested")),
+        GRANDCHILD_MAP_ID: FakeResponse(200, load_fixture("gtc_grandchild_map")),
+    }
+    http = FakeGTCHTTP(park_responder(maps=maps))
+
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
+
+    fetched = [r["map_id"] for r in http.requests]
+    assert fetched == [ROOT_MAP_ID] + CHILD_MAP_IDS + [GRANDCHILD_MAP_ID]
+    # the grandchild's own site is in the merged result, not missing from it
+    assert "-2147483023" in parsed
+    assert parsed["-2147483023"]["availabilities"] == {
+        "2026-08-14": True, "2026-08-15": False, "2026-08-16": True,
+    }
+    assert parsed["-2147483024"]["availabilities"]["2026-08-14"] is True
+    # the grandchild links back to its own parent: a cycle in the map graph
+    # terminates instead of being polled forever
+    assert fetched.count(NESTING_CHILD_MAP_ID) == 1
+
+
+def test_the_fan_out_cap_bounds_the_whole_park_however_deep_it_nests():
+    # a park whose deeper levels together exceed the cap is failed for this
+    # cycle at the moment they are discovered, not polled to the bottom
+    deep = {
+        "mapId": NESTING_CHILD_MAP_ID,
+        "resourceAvailabilities": {},
+        "mapLinkAvailabilities": {str(-i): [7] for i in range(1, MAX_CHILD_MAPS + 1)},
+    }
+    http = FakeGTCHTTP(park_responder(maps={NESTING_CHILD_MAP_ID: FakeResponse(200, deep)}))
+    errors = []
+
+    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
+    # the root's 4 children plus the 12 this one names is past the cap, so the
+    # traversal stopped there rather than spending a GET on each
+    assert [r["map_id"] for r in http.requests] == [ROOT_MAP_ID, NESTING_CHILD_MAP_ID]
+    assert "child maps exceeds" in errors[0]
+
+
 def test_poll_fails_the_unit_rather_than_reporting_a_park_half_polled():
     # one child map failing means the merged result would be missing sites, so
-    # the whole unit fails and the cycle keeps the old state_hash
+    # the whole unit fails and the cycle keeps the old state_hash — and the line
+    # says it was a child map, which is the failure that does NOT strike the
+    # watch (see the 404 test below)
     http = FakeGTCHTTP(park_responder(child=FakeResponse(500)))
     errors = []
     assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
-    assert errors == ["gtc_-2147483647/2026-08-14: HTTP 500"]
+    assert errors == ["gtc_-2147483647/2026-08-14 child map: HTTP 500"]
 
-    # the root map failing stops the recursion before it starts
+    # the root map failing stops the recursion before it starts, and reads
+    # differently from the child failure above
     http = FakeGTCHTTP(park_responder(root=FakeResponse(503)))
-    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None) is None
+    errors = []
+    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
+    assert errors == ["gtc_-2147483647/2026-08-14: HTTP 503"]
     assert [r["map_id"] for r in http.requests] == [ROOT_MAP_ID] * 4  # 3 retries
 
 
@@ -311,9 +429,15 @@ def test_poll_treats_an_undecodable_body_as_a_failed_unit():
     http = FakeGTCHTTP(park_responder(child=FakeResponse(200, ValueError("no json"))))
     errors = []
     assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
-    assert errors == ["gtc_-2147483647/2026-08-14: invalid JSON"]
+    assert errors == ["gtc_-2147483647/2026-08-14 child map: invalid JSON"]
 
     http = FakeGTCHTTP(park_responder(child=FakeResponse(200, {"nope": 1})))
+    errors = []
+    assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
+    assert errors == ["gtc_-2147483647/2026-08-14 child map: unrecognized response body"]
+
+    # the root's own undecodable body is labelled as the root's
+    http = FakeGTCHTTP(park_responder(root=FakeResponse(200, {"nope": 1})))
     errors = []
     assert GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors) is None
     assert errors == ["gtc_-2147483647/2026-08-14: unrecognized response body"]
@@ -411,6 +535,12 @@ def test_a_malformed_provider_ref_is_this_watchs_own_error_not_a_crash():
         {"resource_location_id": -1, "map_id": True},       # a bool is not an id
         {"resource_location_id": -1, "map_id": "; DROP"},
         {"resource_location_id": -1, "map_id": "1" * 40},   # unbounded literal
+        # jsonb numbers are arbitrary-precision, so the number form is bounded
+        # by magnitude exactly as the string form is by length — neither may
+        # grow the query string this provider sends to the park
+        {"resource_location_id": -1, "map_id": 10 ** 19},
+        {"resource_location_id": -1, "map_id": -(10 ** 5000)},
+        {"resource_location_id": 10 ** 19, "map_id": -1},
         {"resource_location_id": -1, "map_id": 1.5},
         {"resource_location_id": -1, "map_id": {"a": 1}},
     ):
@@ -422,11 +552,32 @@ def test_a_malformed_provider_ref_is_this_watchs_own_error_not_a_crash():
         with pytest.raises(InvalidProviderRef):
             GTC.extract_relevant({}, watch, TODAY)
 
-    # a string identifier (what a JSON client may well write) is accepted
+    # a string identifier (what a JSON client may well write) is accepted, and
+    # so is the largest identifier the string form has always allowed
     numeric_strings = make_gtc_watch(provider_ref={
         "resource_location_id": "-2147483647", "map_id": "-2147483396",
     })
     assert GTC.poll_plan(numeric_strings, TODAY) == [POLL_KEY]
+    at_the_bound = make_gtc_watch(provider_ref={
+        "resource_location_id": 10 ** 19 - 1, "map_id": ROOT_MAP_ID,
+    })
+    assert GTC.poll_plan(at_the_bound, TODAY) != []
+
+
+def test_an_unusable_ref_is_reported_as_permanently_unpollable():
+    # the cycle asks the conformer whether a watch can ever be polled, so a
+    # ref it cannot read is a lifecycle matter rather than a failure to repeat
+    # every cycle; the reason names the field and nothing the client wrote
+    assert unpollable_reason(make_gtc_watch()) is None
+    assert unpollable_reason(make_gtc_watch(provider_ref={})) == (
+        "provider_ref.resource_location_id is missing"
+    )
+    assert unpollable_reason(
+        make_gtc_watch(provider_ref={"resource_location_id": -1, "map_id": "s3cret"})
+    ) == "provider_ref.map_id is not an integer identifier"
+    # a provider with no client-written config of its own does not implement the
+    # hook, and its watches are never permanently unpollable
+    assert unpollable_reason(make_watch()) is None
 
 
 def test_the_error_for_a_bad_ref_never_republishes_the_offending_value():
@@ -484,6 +635,50 @@ def test_the_cycle_serves_a_going_to_camp_watch_end_to_end():
     assert summary["campgrounds_polled"] == 1  # one park, however many maps
     assert summary["errors"] is None
     assert monitor.exit_code(summary) == 0
+
+
+def test_a_watch_with_an_unusable_provider_ref_is_errored_once_and_converges():
+    # a going_to_camp row without the identifiers can never poll, so it gets the
+    # same one-off status='error' a malformed campground_id gets — otherwise it
+    # sits 'monitoring' forever, never alerting, while its user sees nothing
+    # wrong and every cycle republishes the same error line
+    db = FakeDB({
+        "watches": [
+            make_gtc_watch(
+                id="w-bad",
+                provider_ref={"resource_location_id": -2147483647, "map_id": "s3cret"},
+            ),
+            make_gtc_watch(id="w-ok", user_id="u2"),
+        ],
+        "device_tokens": [{"user_id": "u2", "apns_token": "tok", "environment": "production"}],
+    })
+    apns = FakeAPNs()
+
+    summary = monitor.run(db, apns, FakeGTCHTTP(park_responder()), **QUIET)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert rows["w-bad"]["status"] == "error"
+    # the healthy watch alongside it is still polled and alerted
+    assert rows["w-ok"]["status"] == "monitoring"
+    assert [watch_id for watch_id, _ in apns.alerts] == ["w-ok"]
+    # the world-readable row gets the count alone; the field at fault is
+    # operator-only, and neither channel republishes what the client wrote
+    assert summary["errors"] == (
+        "1 watch(es) their provider cannot poll, errored and skipped"
+    )
+    assert "provider_ref.map_id" in summary["errors_detail"]
+    assert "s3cret" not in summary["errors_detail"]
+    # one bad row is not this cycle's health: the run stays green
+    assert monitor.exit_code(summary) == 0
+
+    # and it converges: errored, it leaves the pool, so the next cycle neither
+    # writes it again nor reports it again
+    db.calls.clear()
+    steady = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
+
+    assert not [c for c in db.calls if c[0] == "patch" and "w-bad" in str(c)]
+    assert steady["errors"] is None
+    assert db.write_count <= 5
 
 
 def test_one_park_is_one_recursion_however_many_watchers():
