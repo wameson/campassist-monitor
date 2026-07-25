@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 
 import monitor
 from helpers import NOW, FakeAPNs, FakeDB, FakeHTTP, FakeResponse, availability_payload, make_watch
+from providers import recreation_gov
 
 TODAY = NOW.date()
 
@@ -100,9 +101,9 @@ def test_horizon_clamped_watch_detects_in_horizon_openings():
 
 def test_months_exclude_checkout_day():
     # stay ending on the 1st: last night is Aug 31, September is never polled
-    assert monitor.months_for_watch(date(2026, 8, 28), date(2026, 9, 1), TODAY) == [date(2026, 8, 1)]
+    assert recreation_gov.months_for_watch(date(2026, 8, 28), date(2026, 9, 1), TODAY) == [date(2026, 8, 1)]
     # single-date convention (start == end) still polls its month
-    assert monitor.months_for_watch(date(2026, 9, 1), date(2026, 9, 1), TODAY) == [date(2026, 9, 1)]
+    assert recreation_gov.months_for_watch(date(2026, 9, 1), date(2026, 9, 1), TODAY) == [date(2026, 9, 1)]
 
 
 def test_in_progress_watch_ignores_past_dates():

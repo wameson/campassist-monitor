@@ -1,12 +1,19 @@
 """CampAssist availability monitor — one cycle per GitHub Actions run.
 
 Cycle: jittered start → read active watches → expire past-date watches →
-error watches with invalid campground ids or persistently-404ing campgrounds →
-dedupe poll plan by (campground_id, month) → poll recreation.gov politely
-(one browser UA per run, shuffled order, 1.2–2.8 s gaps, exponential
-backoff, all under a per-cycle time budget) → delta-detect per watch via
-state_hash → APNs alert with (site, date) dedup + 6 h cooldown → batched
-last_checked_at write → one run_summaries row → 30-day retention pruning.
+route each watch to the provider its `provider` column names → error watches
+with invalid campground ids or persistently-404ing campgrounds → dedupe the
+poll plan across all users → poll each provider politely (one browser UA per
+run, shuffled order, 1.2–2.8 s gaps, exponential backoff, all under a
+per-cycle time budget) → delta-detect per watch via state_hash → APNs alert
+with (site, date) dedup + 6 h cooldown → batched last_checked_at write → one
+run_summaries row → 30-day retention pruning.
+
+Everything site-specific — the request host, the parsing, the normalization to
+the shared availability shape, the booking link — lives behind the `Provider`
+protocol in providers/, never here. This module is provider-neutral: it plans,
+paces, hashes, alerts, contains failures and does its bookkeeping the same way
+whatever site a watch polls.
 
 Write budget (see PLAN.md): a cycle with no availability changes performs
 at most 5 DB writes regardless of watch count.
@@ -35,7 +42,12 @@ from typing import NamedTuple
 import httpx
 
 from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE, APNsClient
+# MAX_ERROR_MESSAGE_CHARS travels with capped_line: it is this module's
+# published bound on every line reaching run_summaries.errors, and sits in
+# common.py only so a provider can cap against the very same constant.
+from common import MAX_ERROR_MESSAGE_CHARS, as_date, capped_line
 from db import SupabaseClient
+from providers import PROVIDERS, PollKey, Provider, provider_for, provider_name
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -43,11 +55,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
 ]
 
-AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground/{campground_id}/month"
-
 START_JITTER_MAX_SECONDS = 240.0
 INTER_REQUEST_DELAY_RANGE = (1.2, 2.8)
-BACKOFF_DELAYS_SECONDS = [2, 4, 8]
 # Keeps jitter (≤240 s) + polling + one in-flight request (≤20 s) + the
 # bookkeeping writes inside the workflow's 15-minute timeout even under
 # sustained 403/429 blocking.
@@ -56,10 +65,8 @@ CYCLE_TIME_BUDGET_SECONDS = 480.0
 # openings at US campgrounds stay alertable during US evening hours after
 # UTC midnight.
 WESTMOST_US_OFFSET = timezone(timedelta(hours=-8))
-RETRYABLE_STATUS = {403, 429}
 ALERT_COOLDOWN_HOURS = 6
 RETENTION_DAYS = 30
-POLL_HORIZON_MONTHS = 12
 NOT_FOUND_ERROR_THRESHOLD = 3
 CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -81,10 +88,10 @@ SYSTEMIC_ERROR_FLOOR = 2
 # of genuinely dead device tokens in a healthy pool green.
 APNS_WIPEOUT_RATE = 0.8
 APNS_WIPEOUT_FLOOR = 2
-# Caps on what a failing cycle may cost: error text stays readable, and a
-# batched write that fails for a large pool is not retried one row at a time
-# (it is systemic anyway — fanning out would spend hundreds of writes).
-MAX_ERROR_MESSAGE_CHARS = 200
+# Caps on what a failing cycle may cost: error text stays readable (the
+# per-line bound is MAX_ERROR_MESSAGE_CHARS, imported above), and a batched
+# write that fails for a large pool is not retried one row at a time (it is
+# systemic anyway — fanning out would spend hundreds of writes).
 MAX_LOGGED_WATCH_ERRORS = 10
 PER_ID_FALLBACK_MAX = 50
 # The per-id fan-out must never cost the run its summary row and its pruning,
@@ -125,17 +132,11 @@ def start_delay(rng: random.Random) -> float:
 
 
 def inter_request_delay(rng: random.Random) -> float:
-    """Humanized gap between recreation.gov requests."""
+    """Humanized gap between provider requests."""
     return rng.uniform(*INTER_REQUEST_DELAY_RANGE)
 
 
 # --- dates ----------------------------------------------------------------
-
-def as_date(value) -> date:
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value)[:10])
-
 
 def parse_timestamp(value: str) -> datetime:
     ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -153,154 +154,43 @@ def monitor_today(now: datetime) -> date:
     return now.astimezone(WESTMOST_US_OFFSET).date()
 
 
-def horizon_month(today: date) -> date:
-    """First-of-month containing today + POLL_HORIZON_MONTHS: the last
-    month the poll plan may include."""
-    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
-    return date(today.year + years, month0 + 1, 1)
-
-
-def months_for_watch(start: date, end: date, today: date) -> list[date]:
-    """First-of-month dates covering the stay's remaining nights — one API
-    call each. The check-out day's month is not polled, and months entirely
-    in the past or beyond the polling horizon (today + POLL_HORIZON_MONTHS)
-    are skipped; a watch wholly beyond the horizon yields no months until
-    the horizon reaches it."""
-    last_night = end - timedelta(days=1) if end > start else start
-    last_month = min(last_night, horizon_month(today))
-    months = []
-    cur = max(start, today).replace(day=1)
-    while cur <= last_month:
-        months.append(cur)
-        cur = (cur + timedelta(days=32)).replace(day=1)
-    return months
-
-
-def date_in_watch(d: date, start: date, end: date) -> bool:
-    """Nights of the stay: check-out day availability is irrelevant."""
-    if end > start:
-        return start <= d < end
-    return d == start
-
-
 # --- poll plan ------------------------------------------------------------
 
-def dedupe_poll_plan(watches: list[dict], today: date) -> list[tuple[str, date]]:
-    """One (campground_id, month) entry per unique pair across ALL users."""
-    plan = set()
+# One planned unit of work: the name of the provider that must serve it, plus
+# that provider's own PollKey. The cycle keys every poll-phase structure on
+# this pair rather than on the PollKey alone, so routing is anchored to the
+# watch's `provider` column and never to its client-writable campground_id —
+# two providers naming the same campground stay separate units, each polled,
+# struck and read back through its own conformer.
+PollUnit = tuple[str, PollKey]
+
+
+def poll_dispatch(watches: list[dict], today: date) -> dict[PollUnit, Provider]:
+    """Every poll unit this cycle needs, each mapped to the conformer that must
+    serve it. One entry per unique unit across ALL users: the many watches that
+    share a campground and a month collapse into the single request their
+    provider has to make. Each watch's units and the conformer recorded for them
+    both come from `provider_for(watch)`, so a mixed-provider pool plans in one
+    pass and a colliding campground_id cannot reach the wrong site; every watch
+    must already be routable (see `provider_for`)."""
+    dispatch: dict[PollUnit, Provider] = {}
     for watch in watches:
-        start = as_date(watch["start_date"])
-        end = as_date(watch["end_date"])
-        for month in months_for_watch(start, end, today):
-            plan.add((str(watch["campground_id"]), month))
-    return sorted(plan)
+        provider = provider_for(watch)
+        for key in provider.poll_plan(watch, today):
+            dispatch[(provider.name, key)] = provider
+    return dispatch
 
 
-# --- recreation.gov -------------------------------------------------------
-
-def parse_availability(raw) -> dict[str, dict] | None:
-    """Defensively parse a recreation.gov month-availability response.
-
-    Missing or renamed fields inside campsites degrade to a partial parse —
-    never a crash. Returns {campsite_id: {"campsite_id", "site",
-    "availabilities": {date: status}}}. A body with no recognizable
-    'campsites' dict returns None (unrecognized response shape — not
-    authoritative), as does a non-empty campsites dict in which no entry
-    carries a recognizable availabilities dict (the entry shape itself has
-    changed); a well-formed empty campsites dict — or campsites whose
-    availabilities dicts are genuinely empty — parses as authoritative.
-    """
-    if not isinstance(raw, dict):
-        return None
-    campsites = raw.get("campsites")
-    if not isinstance(campsites, dict):
-        return None
-    recognized = False
-    sites: dict[str, dict] = {}
-    for cs_key, cs in campsites.items():
-        if not isinstance(cs, dict):
-            continue
-        availabilities = cs.get("availabilities")
-        dates: dict[str, str] = {}
-        if isinstance(availabilities, dict):
-            recognized = True
-            for date_str, status in availabilities.items():
-                if not isinstance(status, str):
-                    continue
-                try:
-                    d = as_date(date_str)
-                except (ValueError, TypeError):
-                    continue
-                dates[d.isoformat()] = status
-        campsite_id = cs.get("campsite_id", cs_key)
-        site = cs.get("site")
-        sites[str(cs_key)] = {
-            "campsite_id": str(campsite_id),
-            "site": site if isinstance(site, str) else str(cs_key),
-            "availabilities": dates,
-        }
-    if campsites and not recognized:
-        return None
-    return sites
+def sorted_poll_units(units) -> list[PollUnit]:
+    """Deterministic pre-shuffle order across providers, whose keys need not
+    share a comparable type beyond the campground_id."""
+    return sorted(units, key=lambda unit: (unit[1][0], str(unit[1][1]), unit[0]))
 
 
-def poll_with_backoff(
-    http: httpx.Client,
-    campground_id: str,
-    month: date,
-    user_agent: str,
-    *,
-    sleep=time.sleep,
-    errors: list[str] | None = None,
-    budget_exhausted=lambda: False,
-    not_found: set[str] | None = None,
-) -> dict[str, dict] | None:
-    """GET one campground-month with exponential backoff on 403/429/5xx.
-
-    Retries after 2 s, 4 s, 8 s, then gives up for this cycle (returns
-    None) so the rest of the run continues. A 200 whose body is invalid
-    JSON or has no recognizable campsites dict is a non-retryable failure:
-    the month counts as failed rather than as empty availability. A 404
-    additionally records the campground into `not_found` so the caller can
-    error watches whose campground keeps missing. Once budget_exhausted()
-    reports the cycle's time budget is spent, remaining retries and their
-    backoff sleeps are skipped.
-    """
-    url = AVAILABILITY_URL.format(campground_id=campground_id)
-    params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
-    headers = {"User-Agent": user_agent, "Accept": "application/json"}
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.get(url, params=params, headers=headers)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{campground_id}/{month.isoformat()}: {exc!r}"
-        if status == 200:
-            try:
-                body = resp.json()
-            except ValueError:
-                failure = f"{campground_id}/{month.isoformat()}: invalid JSON"
-                break
-            parsed = parse_availability(body)
-            if parsed is not None:
-                return parsed
-            failure = f"{campground_id}/{month.isoformat()}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{campground_id}/{month.isoformat()}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None:
-                    not_found.add(campground_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+def dedupe_poll_plan(watches: list[dict], today: date) -> list[PollKey]:
+    """The cycle's deduplicated poll plan as bare PollKeys, in pre-shuffle
+    order (see `poll_dispatch`, which also records who serves each one)."""
+    return [key for _, key in sorted_poll_units(poll_dispatch(watches, today))]
 
 
 # --- delta detection ------------------------------------------------------
@@ -311,53 +201,6 @@ def canonical_json(obj) -> str:
 
 def state_hash(obj) -> str:
     return hashlib.sha256(canonical_json(obj).encode()).hexdigest()
-
-
-def extract_relevant(availability: dict, watch: dict, today: date) -> dict[str, dict] | None:
-    """Current open-site state relevant to one watch, or None if any of
-    the watch's months failed to poll this cycle (keep old hash, retry
-    next run rather than hashing partial data). Past nights are excluded:
-    they are unbookable, so they count toward neither the hash nor alerts.
-    A watch wholly beyond the polling horizon has no pollable months yet,
-    so it also returns None; a watch straddling the horizon is hashed on
-    its in-horizon months alone."""
-    start = as_date(watch["start_date"])
-    end = as_date(watch["end_date"])
-    wanted = {str(s) for s in (watch.get("site_ids") or [])}
-
-    months = months_for_watch(start, end, today)
-    if not months:
-        return None
-
-    merged: dict[str, dict] = {}
-    for month in months:
-        parsed = availability.get((str(watch["campground_id"]), month))
-        if parsed is None:
-            return None
-        for cs_id, cs in parsed.items():
-            entry = merged.setdefault(
-                cs_id, {"campsite_id": cs["campsite_id"], "site": cs["site"], "dates": {}}
-            )
-            entry["dates"].update(cs["availabilities"])
-
-    current: dict[str, dict] = {}
-    for cs_id, cs in merged.items():
-        if wanted and not ({cs_id, cs["campsite_id"], cs["site"]} & wanted):
-            continue
-        open_dates = sorted(
-            d
-            for d, status in cs["dates"].items()
-            if status == "Available"
-            and as_date(d) >= today
-            and date_in_watch(as_date(d), start, end)
-        )
-        if open_dates:
-            current[cs_id] = {
-                "campsite_id": cs["campsite_id"],
-                "site": cs["site"],
-                "dates": open_dates,
-            }
-    return current
 
 
 def available_sites(current: dict[str, dict]) -> list[dict]:
@@ -429,15 +272,6 @@ def rejection_reason(response, *, safe: bool) -> str:
         return response.text or ""
     except Exception:
         return ""
-
-
-def capped_line(text: str) -> str:
-    """One line, no longer than MAX_ERROR_MESSAGE_CHARS: the bound every message
-    that reaches run_summaries.errors must respect, whatever built it."""
-    text = " ".join(text.split())
-    if len(text) > MAX_ERROR_MESSAGE_CHARS:
-        text = text[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
-    return text
 
 
 def append_both(public: list[str], operator: list[str], line: str) -> None:
@@ -730,6 +564,27 @@ def run(
         )
     active = [w for w in watches if w["id"] not in expired_ids]
 
+    # Provider routing. Expiry above is provider-neutral and still applies to
+    # every watch; from here down the work is delegated to the conformer named
+    # by the watch's `provider` column, so a watch is only ever polled by the
+    # site it actually belongs to. A provider this build does not serve is not
+    # an error on the watch — a newer client may write rows an older monitor
+    # has no conformer for — so those watches are left untouched (still
+    # 'monitoring', unpolled, outside the served set and so outside the
+    # systemic rate) and reported to both audiences as a count.
+    unroutable = [w for w in active if provider_name(w) not in PROVIDERS]
+    if unroutable:
+        errors.append(
+            f"{len(unroutable)} watch(es) on a provider this build does not "
+            "serve, skipped"
+        )
+        # Which provider is missing is what tells the operator whether the
+        # conformer is simply not shipped yet, so it goes to the operator-only
+        # channel — the count alone leaves the signal unactionable.
+        for name in sorted({provider_name(w) for w in unroutable}):
+            detail_only.append(capped_line(f"{name}: no conformer in this build, skipped"))
+        active = [w for w in active if provider_name(w) in PROVIDERS]
+
     # Backend-owned lifecycle: watches with malformed campground ids can
     # never poll successfully, so they move to status='error' once (one
     # batched write, failure case only) instead of re-erroring every cycle.
@@ -756,25 +611,44 @@ def run(
         invalid_watch_ids = {w["id"] for w in invalid}
         active = [w for w in active if w["id"] not in invalid_watch_ids]
 
-    plan = dedupe_poll_plan(active, today)
+    # Each planned unit carries the conformer `provider_for` chose for the
+    # watches that asked for it, so dispatch can never be decided by the
+    # client-writable campground_id. The pacing below still runs one shared,
+    # shuffled queue across providers rather than a burst per site.
+    dispatch = poll_dispatch(active, today)
+    plan = sorted_poll_units(dispatch)
     rng.shuffle(plan)
     session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
 
-    not_found: set[str] = set()
-    availability: dict[tuple[str, date], dict | None] = {}
-    for i, (campground_id, month) in enumerate(plan):
+    # A campground_id is only unique within its own provider, so the 404-strike
+    # inputs are scoped per provider: one site's 404 must never strike a watch
+    # on another site that happens to name the same id.
+    not_found: dict[str, set[str]] = {}
+    availability: dict[PollUnit, dict | None] = {}
+    for i, unit in enumerate(plan):
         if budget_exhausted():
             errors.append(
                 f"time budget exhausted: skipped {len(plan) - i} remaining poll(s)"
             )
             break
-        availability[(campground_id, month)] = poll_with_backoff(
-            http, campground_id, month, session_ua,
+        name, key = unit
+        availability[unit] = dispatch[unit].poll(
+            http, key, session_ua,
             sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
-            not_found=not_found,
+            not_found=not_found.setdefault(name, set()),
         )
         if i < len(plan) - 1 and not budget_exhausted():
             sleep(inter_request_delay(rng))
+
+    # Split the results back into the per-provider {PollKey: parsed-or-None}
+    # map each conformer's extract_relevant reads — a provider is only ever
+    # handed the units it planned itself.
+    polled: dict[str, dict[PollKey, dict | None]] = {}
+    polled_ok: dict[str, set[str]] = {}
+    for (name, key), parsed in availability.items():
+        polled.setdefault(name, {})[key] = parsed
+        if parsed is not None:
+            polled_ok.setdefault(name, set()).add(key[0])
 
     # Backend-owned lifecycle: a syntactically valid campground id that
     # keeps 404ing (typo or delisted campground) errors its watches after
@@ -782,16 +656,16 @@ def run(
     # forever; any successful poll resets the strike count. All writes here
     # happen only in the failure/recovery cases, so a healthy no-change
     # cycle stays within the write budget.
-    polled_ok = {cg for (cg, _), parsed in availability.items() if parsed is not None}
     strike_updates: dict[int, set] = {}
     errored_404 = []
     for watch in active:
+        name = provider_name(watch)
         campground_id = str(watch["campground_id"])
         strikes = int(watch.get("consecutive_not_found") or 0)
-        if campground_id in polled_ok:
+        if campground_id in polled_ok.get(name, ()):
             if strikes:
                 strike_updates.setdefault(0, set()).add(watch["id"])
-        elif campground_id in not_found:
+        elif campground_id in not_found.get(name, ()):
             strikes += 1
             if strikes >= NOT_FOUND_ERROR_THRESHOLD:
                 errored_404.append(watch)
@@ -841,9 +715,10 @@ def run(
             continue  # already failed a lifecycle write that blocks serving it
         watch_id = str(watch["id"])
         try:
-            current = extract_relevant(availability, watch, today)
+            provider = provider_for(watch)
+            current = provider.extract_relevant(polled.get(provider.name, {}), watch, today)
             if current is None:
-                continue  # poll failed for this watch's months; keep old hash
+                continue  # poll failed for this watch's units; keep old hash
             new_hash = state_hash(current)
             if new_hash == watch.get("state_hash"):
                 continue
@@ -929,12 +804,11 @@ def run(
     attempted = set(availability)
     served, checked = [], []
     for w in active:
-        needed = months_for_watch(
-            as_date(w["start_date"]), as_date(w["end_date"]), today
-        )
+        provider = provider_for(w)
+        needed = provider.poll_plan(w, today)
         if not needed:
             continue  # wholly beyond the poll horizon: nothing to serve yet
-        if not all((str(w["campground_id"]), month) in attempted for month in needed):
+        if not all((provider.name, key) in attempted for key in needed):
             continue  # never reached: the poll time budget ran out first
         served.append(w)
         if not blocked(w):
@@ -1044,7 +918,7 @@ def run(
 
     summary = {
         "watches_checked": len(checked),
-        "campgrounds_polled": len({cg for cg, _ in availability}),
+        "campgrounds_polled": len({key[0] for _, key in availability}),
         "alerts_sent": alerts_sent,
         "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(public_errors) or None,

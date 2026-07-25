@@ -14,15 +14,46 @@ anti-blocking rules, and the recreation.gov API contract.
 
 | Path | Purpose |
 |---|---|
-| `scripts/monitor.py` | One monitoring cycle: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), per-watch failure containment + threshold-gated exit status, retention pruning, run summary |
+| `scripts/monitor.py` | One monitoring cycle, provider-neutral: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), per-watch failure containment + threshold-gated exit status, retention pruning, run summary |
+| `scripts/providers/` | One conformer per `watches.provider` value — the poll/parse/normalize/booking-link strategy (see [Providers](#providers)) |
 | `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
+| `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
 | `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
 | `supabase/migrations/` | Ordered, idempotent SQL applied **by hand** to keep **existing** DBs in sync (see [Database migrations](#database-migrations)) |
 | `.github/workflows/monitor.yml` | 30-minute cron + manual `workflow_dispatch` |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
 | `tests/` | Offline pytest suite — fakes and fixtures only, no network or secrets |
+
+## Providers
+
+Each watch names the campground site it polls in its `provider` column, and the
+cycle routes it to the matching conformer of the `Provider` protocol
+(`scripts/providers/base.py`). A provider owns the four site-specific things:
+which poll units a watch needs, how to fetch and parse one, how to normalize
+the result to the shared `{site_id: {"campsite_id", "site", "dates": […]}}`
+shape, and the booking deep link the push opens. Everything else — the poll
+plan dedupe across users, pacing and backoff budgets, `state_hash` delta
+detection, alert dedup and cooldown, failure containment, exit status,
+`run_summaries`, retention — is provider-neutral and lives in `monitor.py`.
+
+Dispatch follows the `provider` column and nothing else: each planned poll unit
+is recorded against the conformer that asked for it, and the 404-strike
+bookkeeping is kept per provider, so two providers that happen to name the same
+`campground_id` are polled — and struck — entirely separately.
+
+`recreation_gov` (`scripts/providers/recreation_gov.py`) is currently the only
+conformer; its poll unit is one (campground, month) request. A watch whose
+`provider` this build has no conformer for is left untouched — unpolled, still
+`monitoring`, outside the systemic error rate — and reported as a count in the
+run summary, so an older monitor cannot mis-serve a row a newer client wrote.
+
+To add a provider: write the conformer in its own module under
+`scripts/providers/`, then register it in `scripts/providers/__init__.py`.
+**Its request host must be a constant in that module.** `watches.provider_ref`
+is client-writable and carries identifiers only — never derive a host, URL, or
+path from it (SSRF).
 
 ## Setup
 
@@ -197,7 +228,7 @@ faked. CI runs the same suite on every PR and push to `main`.
   identical push going out again every cycle until the drift is fixed: the
   dedup rows that would suppress it are exactly the ones that failed to write.
   The trade is an occasional missed re-alert instead of a repeating push.
-- **Errors and run status:** polling and alert errors (recreation.gov
+- **Errors and run status:** polling and alert errors (provider request
   failures, unrecognized responses, APNs delivery problems) and contained
   per-watch failures are all recorded in the `run_summaries.errors` column
   (a count plus a bounded sample of messages) and surfaced as a
@@ -255,8 +286,9 @@ faked. CI runs the same suite on every PR and push to `main`.
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that
     expired this cycle, that were errored for an invalid or
-    persistently-404ing campground, that are wholly beyond the 12-month poll
-    horizon (nothing to poll for them yet), and that the poll time budget
+    persistently-404ing campground, that name a provider this build does not
+    serve (see [Providers](#providers)), that are wholly beyond the 12-month
+    poll horizon (nothing to poll for them yet), and that the poll time budget
     never reached. A cycle that failed every watch it served goes red no
     matter how much of the pool left — or never entered — for unrelated
     reasons.

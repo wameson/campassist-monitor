@@ -9,6 +9,7 @@ import pytest
 
 import monitor
 from helpers import NOW, FakeAPNs, FakeDB, FakeHTTP, FakeResponse, availability_payload, make_watch
+from providers import recreation_gov
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -21,7 +22,7 @@ def test_backoff():
     # 429 forever -> retries after 2s, 4s, 8s, then gives up for the cycle
     http = FakeHTTP(lambda cg: FakeResponse(429))
     sleeps, errors = [], []
-    result = monitor.poll_with_backoff(
+    result = recreation_gov.poll_with_backoff(
         http, "111", date(2026, 8, 1), "UA", sleep=sleeps.append, errors=errors
     )
     assert result is None
@@ -33,13 +34,13 @@ def test_backoff():
     responses = iter([FakeResponse(503), FakeResponse(200, availability_payload({}))])
     http = FakeHTTP(lambda cg: next(responses))
     sleeps = []
-    result = monitor.poll_with_backoff(http, "111", date(2026, 8, 1), "UA", sleep=sleeps.append)
+    result = recreation_gov.poll_with_backoff(http, "111", date(2026, 8, 1), "UA", sleep=sleeps.append)
     assert result == {} and sleeps == [2]
 
     # non-retryable status -> single attempt, no sleeps
     http = FakeHTTP(lambda cg: FakeResponse(404))
     sleeps = []
-    assert monitor.poll_with_backoff(http, "111", date(2026, 8, 1), "UA", sleep=sleeps.append) is None
+    assert recreation_gov.poll_with_backoff(http, "111", date(2026, 8, 1), "UA", sleep=sleeps.append) is None
     assert sleeps == [] and len(http.requests) == 1
 
     # one campground blocked does not abort the run: the other watch still alerts
@@ -90,7 +91,7 @@ def test_backoff_stops_when_budget_exhausted():
         sleeps.append(s)
         clock.sleep(s)
 
-    result = monitor.poll_with_backoff(
+    result = recreation_gov.poll_with_backoff(
         http, "111", date(2026, 8, 1), "UA",
         sleep=sleep, errors=errors,
         budget_exhausted=lambda: clock.monotonic() >= 5,
@@ -245,7 +246,7 @@ def test_degraded_entry_shape_is_failed_month():
         },
         "count": 2,
     }
-    assert monitor.parse_availability(payload) is None
+    assert recreation_gov.parse_availability(payload) is None
 
     db = FakeDB({"watches": [make_watch(state_hash="old-hash")]})
     http = FakeHTTP(lambda cg: FakeResponse(200, payload))
@@ -268,7 +269,7 @@ def test_empty_availabilities_dicts_are_authoritative():
         },
         "count": 1,
     }
-    parsed = monitor.parse_availability(payload)
+    parsed = recreation_gov.parse_availability(payload)
     assert parsed == {
         "100": {"campsite_id": "100", "site": "042", "availabilities": {}}
     }
@@ -353,7 +354,7 @@ def test_wellformed_empty_body_is_authoritative():
 def test_parser_defensive(fixture):
     # every fixture with a recognizable campsites dict parses without
     # raising and yields a dict
-    result = monitor.parse_availability(load_fixture(f"availability_{fixture}"))
+    result = recreation_gov.parse_availability(load_fixture(f"availability_{fixture}"))
     assert isinstance(result, dict)
     for entry in result.values():
         assert set(entry) == {"campsite_id", "site", "availabilities"}
@@ -363,31 +364,31 @@ def test_parser_defensive(fixture):
 def test_parser_unrecognized_body(fixture):
     # no recognizable campsites dict -> None (not authoritative), while a
     # well-formed empty campsites dict is an authoritative empty parse
-    assert monitor.parse_availability(load_fixture(f"availability_{fixture}")) is None
-    assert monitor.parse_availability({"campsites": {}}) == {}
+    assert recreation_gov.parse_availability(load_fixture(f"availability_{fixture}")) is None
+    assert recreation_gov.parse_availability({"campsites": {}}) == {}
 
 
 def test_parser_fixture_contents():
-    normal = monitor.parse_availability(load_fixture("availability_normal"))
+    normal = recreation_gov.parse_availability(load_fixture("availability_normal"))
     assert normal["100"]["site"] == "042"
     assert normal["100"]["availabilities"]["2026-08-10"] == "Available"
     assert normal["101"]["availabilities"] == {"2026-08-10": "Reserved", "2026-08-11": "Available"}
 
     # campsites key missing entirely -> unrecognized shape, no crash
-    assert monitor.parse_availability(load_fixture("availability_missing_campsites")) is None
+    assert recreation_gov.parse_availability(load_fixture("availability_missing_campsites")) is None
 
     # renamed fields degrade to a partial parse: the intact campsite survives,
     # the renamed one falls back to its key with no dates
-    renamed = monitor.parse_availability(load_fixture("availability_renamed_fields"))
+    renamed = recreation_gov.parse_availability(load_fixture("availability_renamed_fields"))
     assert renamed["201"]["availabilities"] == {"2026-08-10": "Available"}
     assert renamed["200"] == {"campsite_id": "200", "site": "200", "availabilities": {}}
 
     # junk value types are skipped field-by-field
-    junk = monitor.parse_availability(load_fixture("availability_junk_types"))
+    junk = recreation_gov.parse_availability(load_fixture("availability_junk_types"))
     assert set(junk) == {"300", "303"}  # non-dict campsites dropped
     assert junk["300"]["availabilities"] == {"2026-08-10": "Available"}  # bad dates/statuses dropped
     assert junk["300"]["campsite_id"] == "300" and junk["300"]["site"] == "300"
     assert junk["303"]["availabilities"] == {}  # availabilities-as-list ignored
 
     # whole body not a dict -> unrecognized shape
-    assert monitor.parse_availability(load_fixture("availability_not_a_dict")) is None
+    assert recreation_gov.parse_availability(load_fixture("availability_not_a_dict")) is None
