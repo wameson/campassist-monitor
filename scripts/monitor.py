@@ -718,7 +718,7 @@ def run(
             provider = provider_for(watch)
             current = provider.extract_relevant(polled.get(provider.name, {}), watch, today)
             if current is None:
-                continue  # poll failed for this watch's months; keep old hash
+                continue  # poll failed for this watch's units; keep old hash
             new_hash = state_hash(current)
             if new_hash == watch.get("state_hash"):
                 continue

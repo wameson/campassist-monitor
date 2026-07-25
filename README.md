@@ -286,8 +286,9 @@ faked. CI runs the same suite on every PR and push to `main`.
     The served set is the rate's denominator *and* the scope of its
     numerator, so the ratio can never exceed 1. It excludes watches that
     expired this cycle, that were errored for an invalid or
-    persistently-404ing campground, that are wholly beyond the 12-month poll
-    horizon (nothing to poll for them yet), and that the poll time budget
+    persistently-404ing campground, that name a provider this build does not
+    serve (see [Providers](#providers)), that are wholly beyond the 12-month
+    poll horizon (nothing to poll for them yet), and that the poll time budget
     never reached. A cycle that failed every watch it served goes red no
     matter how much of the pool left — or never entered — for unrelated
     reasons.
