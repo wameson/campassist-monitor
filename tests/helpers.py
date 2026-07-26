@@ -11,15 +11,25 @@ touches the network or real secrets.
 
 from __future__ import annotations
 
+import json as jsonlib
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
 from apns import DELIVERED
+from providers.going_to_camp import ATTRIBUTES_URL, EQUIPMENT_URL, RESOURCES_URL
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 TABLES = ("watches", "device_tokens", "sent_alerts", "run_summaries")
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str):
+    """One captured response body from tests/fixtures/."""
+    return jsonlib.loads((FIXTURES / f"{name}.json").read_text())
 
 
 def _matches(row: dict, params: dict | None) -> bool:
@@ -203,18 +213,50 @@ class FakeGTCHTTP:
     Unlike recreation.gov, which names the campground in the URL path, every
     GoingToCamp availability call goes to the same URL and picks its map with
     the `mapId` query parameter — so that is what the responder is keyed on.
+
+    A successful poll also reads the park's resource catalog and the two
+    vocabulary tables it decodes through, which is where the real site labels
+    come from. Those go by URL rather than by map, and default to the captured
+    fixtures so a poll behaves like the live API; `responses` overrides any of
+    them (a `FakeResponse`, or None to make that URL unreachable). The fee
+    endpoint is POST-only and reached only by an explicit `responses` entry,
+    so no test can post to it by accident.
     """
 
-    def __init__(self, responder):
+    def __init__(self, responder, responses: dict | None = None):
         self.responder = responder
+        self.responses = {
+            RESOURCES_URL: FakeResponse(200, load_fixture("gtc_resources")),
+            ATTRIBUTES_URL: FakeResponse(200, load_fixture("gtc_attribute_filterable")),
+            EQUIPMENT_URL: FakeResponse(200, load_fixture("gtc_equipment")),
+        }
+        self.responses.update(responses or {})
         self.requests: list[dict] = []
 
+    def _record(self, method, url, params, headers, body=None) -> None:
+        self.requests.append({
+            "method": method,
+            "url": url,
+            "map_id": (params or {}).get("mapId"),
+            "params": params,
+            "headers": headers,
+            "json": body,
+        })
+
     def get(self, url, params=None, headers=None):
-        map_id = (params or {}).get("mapId")
-        self.requests.append(
-            {"url": url, "map_id": map_id, "params": params, "headers": headers}
-        )
-        return self.responder(map_id)
+        self._record("GET", url, params, headers)
+        if url in self.responses:
+            canned = self.responses[url]
+            if canned is None:
+                return FakeResponse(404)
+            return canned
+        return self.responder((params or {}).get("mapId"))
+
+    def post(self, url, params=None, headers=None, json=None):
+        self._record("POST", url, params, headers, json)
+        if url not in self.responses:
+            raise AssertionError(f"unexpected POST to {url}")
+        return self.responses[url] or FakeResponse(404)
 
 
 def make_watch(**overrides) -> dict:

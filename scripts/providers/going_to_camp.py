@@ -12,11 +12,22 @@ A site is a `resourceId` and its per-night value carries an `availability`
 enum; `0` is the only value confirmed to mean bookable, so every other value —
 including one this build has never seen — is parsed as NOT available.
 
-Security: the request host is the HOST constant below, shared by
-AVAILABILITY_URL and BOOKING_URL. `watches.provider_ref` is client-writable, so
-only the two numeric identifiers this provider needs are read out of it
-(`resource_location_id`, `map_id`), and they only ever travel as query-string
-values. No host, URL, path or scheme is ever derived from it (SSRF).
+A second, park-scoped endpoint describes those resources: `RESOURCES_URL`
+carries each site's real label, its "ADA Only" flag, its capacity and its
+allowed equipment (see the per-site metadata section below). The availability
+API names sites by `resourceId` alone, so this is where "Site 42" comes from.
+
+Request posture: keyless GETs, plus the one read-only pricing POST this API
+offers no GET for (`FEE_DETAILS_URL`, captain-approved) — and never a browser.
+The SPA behind this host is Azure-WAF captcha-gated; `/api/*` is not, and
+staying on `/api/*` with a browser UA and the pacing below is what keeps it
+that way.
+
+Security: the request host is the HOST constant below, shared by every URL in
+this module. `watches.provider_ref` is client-writable, so only the two numeric
+identifiers this provider needs are read out of it (`resource_location_id`,
+`map_id`), and they only ever travel as query-string values. No host, URL, path
+or scheme is ever derived from it (SSRF).
 """
 
 from __future__ import annotations
@@ -24,6 +35,8 @@ from __future__ import annotations
 import re
 import time
 from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+from typing import NamedTuple
 from urllib.parse import urlencode
 
 import httpx
@@ -36,6 +49,14 @@ from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
 HOST = "washington.goingtocamp.com"
 AVAILABILITY_URL = f"https://{HOST}/api/availability/map"
 BOOKING_URL = f"https://{HOST}/create-booking/results"
+# The park's resource catalog: one keyless GET per park, per process.
+RESOURCES_URL = f"https://{HOST}/api/resourcelocation/resources"
+# The two vocabulary tables the catalog's enum indices decode through.
+ATTRIBUTES_URL = f"https://{HOST}/api/attribute/filterable"
+EQUIPMENT_URL = f"https://{HOST}/api/equipment"
+# Per-night price. POST-only — a plain GET answers 405 — which is why this one
+# request departs from the GET-only posture (README "Providers").
+FEE_DETAILS_URL = f"https://{HOST}/api/resource/feeDetails"
 
 # Fixed booking-flow parameters: the "one non-group site, party of one" search
 # every watch makes today. CampAssist has no party-size or equipment field, so
@@ -67,6 +88,53 @@ MAX_CHILD_MAPS = 40
 # Pacing inside one poll unit, matching the 1.2-2.8 s the cycle leaves between
 # units so the recursion cannot burst.
 CHILD_MAP_DELAY_SECONDS = 1.5
+
+# --- the resource catalog's vocabulary ------------------------------------
+#
+# Attribute *definition* ids, from GET /api/attribute/filterable. They are
+# magic negative ints, so `test_the_pinned_attribute_ids_still_mean_what_they
+# _say` holds each one against the captured vocabulary: a renumbering upstream
+# surfaces as a red test rather than as a field that silently stops decoding.
+ADA_ONLY_DEF = -32759  # enum 0 = Yes, 1 = No
+SERVICE_TYPE_DEF = -32768  # the hookup enum, decoded below
+
+# Which Service Type values carry which utility. Deliberately two sets, not
+# one: enum 5 (Electric Hook-ups, no water) is only 74 sites statewide, so an
+# implementation that folds water into electric is right 98.8% of the time and
+# silently wrong on exactly the sites a water filter would be asked about.
+#
+# These are enum indices of one known definition, so they are read directly —
+# unlike a Yes/No attribute, whose index says nothing without the vocabulary
+# (0 is "Yes" on ADA Only and "Not Available" on Pad Location). The same test
+# holds these values to the captured vocabulary, so the shortcut cannot drift
+# silently either.
+ELECTRIC_SERVICE_TYPES = frozenset({5, 6, 7})
+WATER_SERVICE_TYPES = frozenset({6, 7})
+
+# The Yes/No labels of a boolean-shaped enum, read off the vocabulary rather
+# than cast from the index: enum 0 is "Yes" on ADA Only and "Not Available" on
+# Pad Location, so the index alone means nothing.
+ENUM_YES = "Yes"
+ENUM_NO = "No"
+
+# The one culture this build reads. Every localizedValues array observed is
+# en-US only; a body that ever carries more is served its en-US entry.
+CULTURE = "en-US"
+
+# Equipment sub-category names, from GET /api/equipment: "1 Tent", "2 Tents",
+# "1 Van/Camper", "1 RV/Trailer up to 30'", and the group category's bare
+# "Tents"/"Trailers". Matched by name because the ids collide across
+# namespaces — sub-equipment -32759 is an RV/Trailer, attribute definition
+# -32759 is ADA Only — so only the resolved name is safe to reason about.
+_TENT_COUNT_RE = re.compile(r"\A(\d+) Tents?\Z")
+_TENT_RE = re.compile(r"\bTents?\b")
+_RV_RE = re.compile(r"\bRV\b|\bTrailers?\b|Van/Camper")
+
+# feeDetails' `feeType`: 1 is Nightly and the only one that is a per-night
+# price. 7 (PerPersonCapacityCategory, group camps) prices a party, not a
+# night, and everything else in the platform's enum is unobserved here — both
+# read as "no nightly price", never as a guess.
+FEE_TYPE_NIGHTLY = 1
 
 # A bounded integer literal — long enough for the platform's negative 32-bit
 # ids, short enough that a client cannot post a megabyte "identifier".
@@ -189,9 +257,11 @@ def parse_map(raw, start: date, end: date) -> tuple[dict[str, dict], list[int]] 
     skipped, and a non-empty `resourceAvailabilities` in which *no* value is an
     array means the entry shape itself has changed — unrecognized, not empty.
 
-    Per-site labels are not served by any endpoint this build can reach, so
-    `site` degrades to the resourceId, the same way the other conformer falls
-    back to the campsite id when a site name is missing.
+    The availability body names no site, so `site` starts as the resourceId —
+    the same way the other conformer falls back to the campsite id when a site
+    name is missing. `poll_park` then overwrites it with the real label from
+    the park catalog (`apply_site_labels`), leaving the fallback in place for
+    any resource that catalog does not describe.
     """
     if not isinstance(raw, dict):
         return None
@@ -406,7 +476,486 @@ def poll_park(
                 "availabilities": {},
             })
             entry["availabilities"].update(site["availabilities"])
+
+    if sites:
+        apply_site_labels(
+            sites, http, resource_location_id, user_agent,
+            label=f"{label} site metadata", sleep=sleep, errors=errors,
+            budget_exhausted=budget_exhausted,
+        )
     return sites
+
+
+def apply_site_labels(
+    sites: dict[str, dict],
+    http,
+    resource_location_id: int,
+    user_agent: str,
+    *,
+    label: str,
+    sleep=time.sleep,
+    errors: list[str] | None = None,
+    budget_exhausted=lambda: False,
+) -> None:
+    """Replace each site's `resourceId` placeholder with its real label from
+    the park catalog, in place.
+
+    Cosmetic by design, so it can never fail the unit: a park whose catalog
+    this cycle could not read, or a resource the catalog does not describe,
+    keeps the `resourceId` fallback and is still polled, hashed and alerted
+    on. The one cost of that fallback is that the label is part of the shared
+    availability shape and therefore of `state_hash`, so a cycle where the
+    catalog fetch flips outcome reads as a delta; alert dedup keys on
+    `campsite_id`, which never changes, so it costs one `watches` write and
+    cannot produce a duplicate push.
+    """
+    described = site_metadata(
+        http, resource_location_id, user_agent, label=label,
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+    )
+    for resource_id, site in sites.items():
+        entry = described.get(resource_id)
+        if entry is not None and entry.label:
+            site["site"] = entry.label
+
+
+# --- per-site metadata ----------------------------------------------------
+#
+# The availability API names a site by `resourceId` and nothing else. One
+# further keyless GET per park — RESOURCES_URL — describes every one of them:
+# the real label ("84"), the platform's own "ADA Only" flag, capacity, and the
+# equipment the site takes. Its enum indices are meaningless on their own, so
+# they decode through two tiny vocabulary tables (ATTRIBUTES_URL, EQUIPMENT_URL)
+# fetched once per process. All three are paced but unretried (`_fetch_json`):
+# a cosmetic read that a retry-and-backoff could spend fifteen seconds on is a
+# read that starves the availability polls it is supposed to decorate.
+#
+# Everything here degrades to "the platform did not say" rather than to "no".
+# A field this build cannot read is None, never False: a later filter built on
+# these fields must fail open, because a silently-suppressed opening is a
+# failure the user cannot see, while an un-suppressed one is merely noise.
+
+
+class Vocabulary(NamedTuple):
+    """The two keyless lookup tables the catalog's indices decode through.
+
+    `attributes` is {attribute definition id: {enum value: label}} and
+    `equipment` is {sub-equipment category id: name}. Either may be empty when
+    its fetch failed — that is a decode this build cannot make, so the fields
+    that depend on it read as unknown.
+    """
+
+    attributes: dict[int, dict[int, str]]
+    equipment: dict[int, str]
+
+    def enum_label(self, definition_id: int, value: int) -> str | None:
+        return self.attributes.get(definition_id, {}).get(value)
+
+
+EMPTY_VOCABULARY = Vocabulary({}, {})
+
+
+class SiteMetadata(NamedTuple):
+    """One site as the catalog describes it. Every field is optional: a
+    provider that omits one is normal here, not an error (coverage runs from
+    100% for the label down to 0% at a handful of tiny parks)."""
+
+    label: str | None
+    ada_only: bool | None
+    min_capacity: int | None
+    max_capacity: int | None
+    #: the decoded Service Type label, e.g. "Electrical Water Hook-up"
+    service_type: str | None
+    electric: bool | None
+    water: bool | None
+    #: the resolved equipment names, in the order the catalog listed them
+    equipment: tuple[str, ...]
+    allows_tent: bool | None
+    allows_rv: bool | None
+    #: the largest "N Tents" the site takes, when it names one
+    max_tents: int | None
+
+
+def _localized(entries, field: str) -> str | None:
+    """The en-US `field` of a localizedValues array, or None."""
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("cultureName") != CULTURE:
+            continue
+        value = entry.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _int(value) -> int | None:
+    """A JSON number as an int, or None. `bool` is not an integer here."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _enum_value(defined, definition_id: int) -> int | None:
+    """The single enum index one attribute definition carries on this site, or
+    None when it is absent, multi-valued or not an integer."""
+    if not isinstance(defined, list):
+        return None
+    for attribute in defined:
+        if not isinstance(attribute, dict):
+            continue
+        if attribute.get("attributeDefinitionId") != definition_id:
+            continue
+        values = attribute.get("values")
+        if not isinstance(values, list) or len(values) != 1:
+            return None
+        return _int(values[0])
+    return None
+
+
+def _yes_no(vocabulary: Vocabulary, definition_id: int, defined) -> bool | None:
+    """A Yes/No attribute as a bool, resolved through the vocabulary.
+
+    The index is never cast: enum 0 reads "Yes" on ADA Only and "Not Available"
+    on Pad Location, so a definition this build could not fetch a vocabulary for
+    answers None — unknown — and not False."""
+    value = _enum_value(defined, definition_id)
+    if value is None:
+        return None
+    label = vocabulary.enum_label(definition_id, value)
+    if label == ENUM_YES:
+        return True
+    if label == ENUM_NO:
+        return False
+    return None
+
+
+def _equipment(vocabulary: Vocabulary, allowed) -> tuple[str, ...]:
+    """The site's allowed equipment, resolved to names through the vocabulary.
+    An id the vocabulary does not name is dropped: an unnamed id says nothing
+    about tents or RVs."""
+    if not isinstance(allowed, list):
+        return ()
+    names = []
+    for entry in allowed:
+        if not isinstance(entry, dict):
+            continue
+        name = vocabulary.equipment.get(_int(entry.get("subEquipmentCategoryId")))
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _describe(raw: dict, vocabulary: Vocabulary) -> SiteMetadata:
+    """One catalog record, defensively. Any field the record does not carry —
+    or carries in a shape this build does not recognize — comes out None."""
+    defined = raw.get("definedAttributes")
+    service_type = _enum_value(defined, SERVICE_TYPE_DEF)
+    equipment = _equipment(vocabulary, raw.get("allowedEquipment"))
+    tent_counts = [
+        int(match.group(1))
+        for match in (_TENT_COUNT_RE.match(name) for name in equipment)
+        if match
+    ]
+    return SiteMetadata(
+        label=_localized(raw.get("localizedValues"), "name"),
+        ada_only=_yes_no(vocabulary, ADA_ONLY_DEF, defined),
+        min_capacity=_int(raw.get("minCapacity")),
+        max_capacity=_int(raw.get("maxCapacity")),
+        service_type=(
+            None if service_type is None
+            else vocabulary.enum_label(SERVICE_TYPE_DEF, service_type)
+        ),
+        electric=None if service_type is None else service_type in ELECTRIC_SERVICE_TYPES,
+        water=None if service_type is None else service_type in WATER_SERVICE_TYPES,
+        equipment=equipment,
+        allows_tent=None if not equipment else any(_TENT_RE.search(n) for n in equipment),
+        allows_rv=None if not equipment else any(_RV_RE.search(n) for n in equipment),
+        max_tents=max(tent_counts) if tent_counts else None,
+    )
+
+
+def parse_resources(raw, vocabulary: Vocabulary) -> dict[str, SiteMetadata] | None:
+    """Parse a RESOURCES_URL body — `{resourceId: record}` — into
+    {resource id: SiteMetadata}, or None when the shape is unrecognized.
+
+    A record that is not an object is skipped; a non-empty body in which *no*
+    value is an object means the entry shape itself has changed, which is
+    unrecognized rather than empty — the same rule `parse_map` follows.
+    """
+    if not isinstance(raw, dict):
+        return None
+    described: dict[str, SiteMetadata] = {}
+    for resource_key, record in raw.items():
+        if not isinstance(record, dict):
+            continue
+        described[str(resource_key)] = _describe(record, vocabulary)
+    if raw and not described:
+        return None
+    return described
+
+
+def parse_attribute_vocabulary(raw) -> dict[int, dict[int, str]]:
+    """{definition id: {enum value: label}} from an ATTRIBUTES_URL body.
+    An unreadable body yields {}, which reads downstream as "cannot decode"."""
+    if not isinstance(raw, dict):
+        return {}
+    vocabulary: dict[int, dict[int, str]] = {}
+    for definition in raw.values():
+        if not isinstance(definition, dict):
+            continue
+        definition_id = _int(definition.get("attributeDefinitionId"))
+        if definition_id is None:
+            continue
+        values = definition.get("values")
+        labels: dict[int, str] = {}
+        for value in values if isinstance(values, list) else ():
+            if not isinstance(value, dict):
+                continue
+            enum_value = _int(value.get("enumValue"))
+            label = _localized(value.get("localizedValues"), "displayName")
+            if enum_value is not None and label:
+                labels[enum_value] = label
+        if labels:
+            vocabulary[definition_id] = labels
+    return vocabulary
+
+
+def parse_equipment_vocabulary(raw) -> dict[int, str]:
+    """{sub-equipment category id: name} from an EQUIPMENT_URL body.
+
+    Flattened across the top-level categories ("Equipment", "Group"): a
+    resource names only the sub-category, and the two do not collide.
+    """
+    if not isinstance(raw, list):
+        return {}
+    names: dict[int, str] = {}
+    for category in raw:
+        if not isinstance(category, dict):
+            continue
+        subs = category.get("subEquipmentCategories")
+        for sub in subs if isinstance(subs, list) else ():
+            if not isinstance(sub, dict):
+                continue
+            sub_id = _int(sub.get("subEquipmentCategoryId"))
+            name = _localized(sub.get("localizedValues"), "name")
+            if sub_id is not None and name:
+                names.setdefault(sub_id, name)
+    return names
+
+
+def _fetch_json(
+    http,
+    url: str,
+    params: dict | None,
+    user_agent: str,
+    *,
+    label: str,
+    sleep,
+    errors: list[str] | None,
+    budget_exhausted,
+    post_body=None,
+):
+    """One paced request to a URL constant in this module, returning the
+    decoded body or None.
+
+    **One attempt, no backoff** — deliberately unlike the 2/4/8 s `fetch_map`
+    spends on availability. Everything read through here is cosmetic to the
+    poll, so a dead endpoint must not spend the cycle time the availability
+    polls need: a failure here fails open to no label rather than retrying into
+    the budget. Availability keeps its retries because a transient blip there
+    costs a real unit.
+
+    A 200 whose body is neither an object nor an array is a failure like any
+    other rather than a value: handing it back would make an unusable body
+    indistinguishable from a failed request, and cost the operator the one line
+    every other unreadable shape reports.
+
+    `post_body` is what makes this the module's only non-GET: FEE_DETAILS_URL
+    answers `405` to a GET and `415` without a JSON content type, so a price
+    read has to be a POST with a JSON body. It stays a read — the body is `[]`,
+    nothing is created and no cart, cookie or token is involved.
+    """
+    headers = {"User-Agent": user_agent, "Accept": "application/json"}
+    if budget_exhausted():
+        failure = f"{label}: time budget exhausted"
+    else:
+        sleep(CHILD_MAP_DELAY_SECONDS)  # paced like the child-map recursion
+        try:
+            if post_body is None:
+                resp = http.get(url, params=params, headers=headers)
+            else:
+                resp = http.post(url, params=params, headers=headers, json=post_body)
+            status = resp.status_code
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            status = None
+            failure = f"{label}: {exc!r}"
+        if status == 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                failure = f"{label}: invalid JSON"
+            else:
+                if isinstance(body, (dict, list)):
+                    return body
+                failure = f"{label}: unexpected response body"
+        elif status is not None:
+            failure = f"{label}: HTTP {status}"
+    if errors is not None:
+        errors.append(capped_line(failure))
+    return None
+
+
+# Two process-lifetime caches. The monitor is a cron script, so one process is
+# one cycle: this is a per-cycle cache of park-scoped catalogs and a
+# park-independent vocabulary — never per-watch state, which the Provider
+# protocol forbids. A failed fetch is cached as "nothing known" so one broken
+# park cannot spend a request on every poll unit that names it; the next cycle
+# is a new process and tries again.
+_VOCABULARY: Vocabulary | None = None
+_SITE_METADATA: dict[int, dict[str, SiteMetadata]] = {}
+
+
+def clear_metadata_cache() -> None:
+    """Empty both process caches. For tests; the cycle never needs it."""
+    global _VOCABULARY
+    _VOCABULARY = None
+    _SITE_METADATA.clear()
+
+
+def vocabulary(
+    http,
+    user_agent: str,
+    *,
+    sleep=time.sleep,
+    errors: list[str] | None = None,
+    budget_exhausted=lambda: False,
+) -> Vocabulary:
+    """The decoding tables, fetched at most once per process. Whichever half
+    failed comes back empty rather than absent, so a caller never has to
+    distinguish "not fetched" from "fetched and unreadable" — both mean the
+    fields that depend on it are unknown."""
+    global _VOCABULARY
+    if _VOCABULARY is None:
+        common = dict(sleep=sleep, errors=errors, budget_exhausted=budget_exhausted)
+        _VOCABULARY = Vocabulary(
+            parse_attribute_vocabulary(_fetch_json(
+                http, ATTRIBUTES_URL, None, user_agent,
+                label="going_to_camp attribute vocabulary", **common,
+            )),
+            parse_equipment_vocabulary(_fetch_json(
+                http, EQUIPMENT_URL, None, user_agent,
+                label="going_to_camp equipment vocabulary", **common,
+            )),
+        )
+    return _VOCABULARY
+
+
+def site_metadata(
+    http,
+    resource_location_id: int,
+    user_agent: str,
+    *,
+    label: str,
+    sleep=time.sleep,
+    errors: list[str] | None = None,
+    budget_exhausted=lambda: False,
+) -> dict[str, SiteMetadata]:
+    """One park's catalog, fetched at most once per process, or {} when this
+    cycle could not read it.
+
+    Only `resource_location_id` — already bounded by `_identifier` on the way
+    out of the client-written provider_ref — reaches the query string, and the
+    URL is the module constant (SSRF).
+    """
+    cached = _SITE_METADATA.get(resource_location_id)
+    if cached is not None:
+        return cached
+    known = vocabulary(
+        http, user_agent, sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+    )
+    body = _fetch_json(
+        http, RESOURCES_URL, {"resourceLocationId": resource_location_id}, user_agent,
+        label=label, sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+    )
+    described = parse_resources(body, known) if body is not None else None
+    if described is None and body is not None and errors is not None:
+        errors.append(capped_line(f"{label}: unrecognized response body"))
+    _SITE_METADATA[resource_location_id] = described or {}
+    return _SITE_METADATA[resource_location_id]
+
+
+# --- per-night price ------------------------------------------------------
+
+def parse_fee_details(raw) -> Decimal | None:
+    """The nightly rate in a FEE_DETAILS_URL body, or None.
+
+    None covers every shape that is not a per-night dollar amount: an empty
+    `resourceFeeDetails`, a body this build does not recognize, and — the one
+    worth naming — a `feeType` that is not Nightly. Group camps answer
+    `feeType 7`, a price per `billablePartySize` people; rendering that as a
+    nightly rate would be wrong, so no price is the honest answer.
+
+    `feeTotal` arrives as a raw JSON decimal (`46.00000`), so it comes back as
+    a `Decimal` for a caller to format — never as a string to match on.
+    """
+    if not isinstance(raw, dict):
+        return None
+    details = raw.get("resourceFeeDetails")
+    if not isinstance(details, list):
+        return None
+    for detail in details:
+        if not isinstance(detail, dict) or _int(detail.get("feeType")) != FEE_TYPE_NIGHTLY:
+            continue
+        total = detail.get("feeTotal")
+        if isinstance(total, bool) or not isinstance(total, (int, float)):
+            continue
+        try:
+            return Decimal(str(total))
+        except InvalidOperation:
+            continue
+    return None
+
+
+def fee_details(
+    http,
+    resource_id: int,
+    start_date: date,
+    user_agent: str,
+    *,
+    sleep=time.sleep,
+    errors: list[str] | None = None,
+    budget_exhausted=lambda: False,
+) -> Decimal | None:
+    """One site's nightly rate for one stay date, or None when this build
+    cannot read one (see `parse_fee_details`, and any failed request).
+
+    **The one non-GET this project sends.** The endpoint answers `405` to a GET
+    and `415` without `Content-Type: application/json`, and the captain adopted
+    it as a read-only pricing POST — the body is `[]`, it creates nothing and
+    carries no cart, cookie or token. The posture it amends is
+    "keyless GET, plus one read-only pricing POST; still never drive a browser".
+
+    The rate is date-dependent (a seasonal step function) and a past date
+    silently answers today's rate, so `start_date` must be the real stay date.
+
+    SSRF: the URL is the module constant, and the query carries only an
+    identifier bounded exactly like `provider_ref`'s and an ISO date this
+    module formats itself.
+    """
+    if isinstance(resource_id, bool) or not isinstance(resource_id, int):
+        raise TypeError("resource_id must be an integer identifier")
+    if abs(resource_id) >= IDENTIFIER_MAX:
+        raise ValueError("resource_id is too large for an identifier")
+    body = _fetch_json(
+        http, FEE_DETAILS_URL,
+        {"resourceId": resource_id, "startDate": as_date(start_date).isoformat()},
+        user_agent,
+        label="going_to_camp fee details",
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        post_body=[],
+    )
+    return parse_fee_details(body)
 
 
 # --- the conformer --------------------------------------------------------
@@ -499,7 +1048,15 @@ class GoingToCampProvider:
 
         current: dict[str, dict] = {}
         for resource_id, site in parsed.items():
-            if wanted and not ({resource_id, site["campsite_id"], site["site"]} & wanted):
+            # Matched on the stable identifiers alone. `site` carries the
+            # catalog label, which reverts to the resourceId whenever the
+            # catalog fetch fails, so a watch naming labels would match every
+            # site on a healthy cycle and none at all on a degraded one —
+            # openings suppressed with nothing the user can see. The label is
+            # for display; the resourceId is the identity, which is what the
+            # follow-on phase that enables per-site GoingToCamp selection has
+            # to persist in `site_ids`.
+            if wanted and not ({resource_id, site["campsite_id"]} & wanted):
                 continue
             open_dates = sorted(
                 d

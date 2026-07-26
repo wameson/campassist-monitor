@@ -1,0 +1,11 @@
+{
+  "resultCode": 0,
+  "resourceFeeDetails": [
+    {
+      "feeTotal": 46.0,
+      "feeType": 1,
+      "feeCustomName": "",
+      "billablePartySize": null
+    }
+  ]
+}

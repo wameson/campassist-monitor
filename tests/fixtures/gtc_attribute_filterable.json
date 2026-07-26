@@ -1,0 +1,274 @@
+{
+  "-32768": {
+    "isMultiSelect": false,
+    "defaultSearchFilterEnumValue": null,
+    "values": [
+      {
+        "enumValue": 0,
+        "order": 1,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Primitive Hiker/Biker"
+          }
+        ]
+      },
+      {
+        "enumValue": 1,
+        "order": 2,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Primitive Walk-in"
+          }
+        ]
+      },
+      {
+        "enumValue": 2,
+        "order": 3,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Primitive With Vehicle"
+          }
+        ]
+      },
+      {
+        "enumValue": 3,
+        "order": 4,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Standard - No Hook-ups"
+          }
+        ]
+      },
+      {
+        "enumValue": 5,
+        "order": 5,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Electric Hook-ups"
+          }
+        ]
+      },
+      {
+        "enumValue": 6,
+        "order": 6,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Electrical Water Hook-up"
+          }
+        ]
+      },
+      {
+        "enumValue": 7,
+        "order": 7,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Electrical Water Sewer Hook-up"
+          }
+        ]
+      }
+    ],
+    "attributeDefinitionId": -32768,
+    "attributeType": 0,
+    "order": 10,
+    "isFilterable": true,
+    "isDisabled": false,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "displayName": "Service Type"
+      }
+    ]
+  },
+  "-32759": {
+    "isMultiSelect": false,
+    "defaultSearchFilterEnumValue": 1,
+    "values": [
+      {
+        "enumValue": 0,
+        "order": 1,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Yes"
+          }
+        ]
+      },
+      {
+        "enumValue": 1,
+        "order": 2,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "No"
+          }
+        ]
+      }
+    ],
+    "attributeDefinitionId": -32759,
+    "attributeType": 0,
+    "order": 40,
+    "isFilterable": true,
+    "isDisabled": false,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "displayName": "ADA Only"
+      }
+    ]
+  },
+  "-32738": {
+    "isMultiSelect": false,
+    "defaultSearchFilterEnumValue": null,
+    "values": [
+      {
+        "enumValue": 0,
+        "order": 1,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Yes"
+          }
+        ]
+      },
+      {
+        "enumValue": 1,
+        "order": 2,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "No"
+          }
+        ]
+      }
+    ],
+    "attributeDefinitionId": -32738,
+    "attributeType": 0,
+    "order": 50,
+    "isFilterable": true,
+    "isDisabled": false,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "displayName": "ADA Accessible"
+      }
+    ]
+  },
+  "-32753": {
+    "isMultiSelect": false,
+    "defaultSearchFilterEnumValue": null,
+    "values": [
+      {
+        "enumValue": 0,
+        "order": 1,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Not Available"
+          }
+        ]
+      },
+      {
+        "enumValue": 1,
+        "order": 2,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Head In"
+          }
+        ]
+      },
+      {
+        "enumValue": 2,
+        "order": 3,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Back In"
+          }
+        ]
+      },
+      {
+        "enumValue": 3,
+        "order": 4,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Straight Drive-thru"
+          }
+        ]
+      },
+      {
+        "enumValue": 4,
+        "order": 5,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Pull-thru Left"
+          }
+        ]
+      },
+      {
+        "enumValue": 5,
+        "order": 6,
+        "isActive": true,
+        "icon": null,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "displayName": "Pull-thru Right"
+          }
+        ]
+      }
+    ],
+    "attributeDefinitionId": -32753,
+    "attributeType": 0,
+    "order": 200,
+    "isFilterable": true,
+    "isDisabled": false,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "displayName": "Pad Location"
+      }
+    ]
+  }
+}

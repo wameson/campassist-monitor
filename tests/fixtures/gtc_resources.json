@@ -1,0 +1,667 @@
+{
+  "-2147483029": {
+    "resourceId": -2147483029,
+    "resourceLocationId": -2147483647,
+    "resourceCategoryId": -2147483648,
+    "feeScheduleId": -32757,
+    "dateScheduleId": -2147483391,
+    "dateScheduleOverrides": [],
+    "resourceModel": 0,
+    "zoneCapacitySettings": null,
+    "nonSiteSpecificSettings": null,
+    "linkedResources": [],
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "84",
+        "description": "This site is ADA only. Only people with disabilities may reserve ADA sites. Proof of eligibility must be provided to park staff when you check in at the park. The maximum capacity for all campsites is eight (8) people, including children."
+      }
+    ],
+    "allowedEquipment": [
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32768
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32767
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32765
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32764
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32763
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32762
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32759
+      }
+    ],
+    "reservableTransactionLocationIds": [
+      -2147483647,
+      -2147483570,
+      -2147483569
+    ],
+    "order": 840,
+    "maxStay": null,
+    "maxStayIsAggregate": null,
+    "maxAdultCapacity": null,
+    "minCapacity": 1,
+    "maxCapacity": 8,
+    "minBoatLength": null,
+    "maxBoatLength": null,
+    "maxBoatDraft": null,
+    "slipWidth": null,
+    "customAttributes": [],
+    "definedAttributes": [
+      {
+        "attributeDefinitionId": -32735,
+        "attributeId": -2147466956,
+        "attributeVisibility": 0,
+        "value": 45.0,
+        "values": []
+      },
+      {
+        "attributeDefinitionId": -32734,
+        "attributeId": -2147466953,
+        "attributeVisibility": 0,
+        "value": 20.0,
+        "values": []
+      },
+      {
+        "attributeDefinitionId": -32715,
+        "attributeId": -2147267122,
+        "attributeVisibility": 0,
+        "value": 45.0,
+        "values": []
+      },
+      {
+        "attributeDefinitionId": -32714,
+        "attributeId": -2147267121,
+        "attributeVisibility": 0,
+        "value": 20.0,
+        "values": []
+      },
+      {
+        "attributeDefinitionId": -32746,
+        "attributeId": -2147466971,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          4,
+          5
+        ]
+      },
+      {
+        "attributeDefinitionId": -32736,
+        "attributeId": -2147466970,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32745,
+        "attributeId": -2147466969,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1,
+          7
+        ]
+      },
+      {
+        "attributeDefinitionId": -32767,
+        "attributeId": -2147466968,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          3,
+          4
+        ]
+      },
+      {
+        "attributeDefinitionId": -32737,
+        "attributeId": -2147466967,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          0
+        ]
+      },
+      {
+        "attributeDefinitionId": -32747,
+        "attributeId": -2147466966,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1,
+          4
+        ]
+      },
+      {
+        "attributeDefinitionId": -32748,
+        "attributeId": -2147466965,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32749,
+        "attributeId": -2147466964,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32753,
+        "attributeId": -2147466963,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      },
+      {
+        "attributeDefinitionId": -32750,
+        "attributeId": -2147466962,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      },
+      {
+        "attributeDefinitionId": -32752,
+        "attributeId": -2147466960,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32740,
+        "attributeId": -2147466959,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32768,
+        "attributeId": -2147466957,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          6
+        ]
+      },
+      {
+        "attributeDefinitionId": -32756,
+        "attributeId": -2147466955,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          5
+        ]
+      },
+      {
+        "attributeDefinitionId": -32754,
+        "attributeId": -2147466954,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32744,
+        "attributeId": -2147466952,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          3
+        ]
+      },
+      {
+        "attributeDefinitionId": -32765,
+        "attributeId": -2147466951,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          3
+        ]
+      },
+      {
+        "attributeDefinitionId": -32764,
+        "attributeId": -2147466950,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          0
+        ]
+      },
+      {
+        "attributeDefinitionId": -32713,
+        "attributeId": -2147280124,
+        "attributeVisibility": 1,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32738,
+        "attributeId": -2147267124,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          0
+        ]
+      },
+      {
+        "attributeDefinitionId": -32759,
+        "attributeId": -2147267123,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          0
+        ]
+      },
+      {
+        "attributeDefinitionId": -32708,
+        "attributeId": -2147265741,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      },
+      {
+        "attributeDefinitionId": -32760,
+        "attributeId": -2147251271,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          0
+        ]
+      },
+      {
+        "attributeDefinitionId": -32757,
+        "attributeId": -2147241151,
+        "attributeVisibility": 1,
+        "value": null,
+        "values": [
+          2
+        ]
+      }
+    ],
+    "photos": [
+      {
+        "photoUrlResult": {
+          "avifUrl": "https://washington.goingtocamp.com/images/6678ce55-944c-43d3-ab64-36cc5b5ede5d.avif",
+          "url": "https://washington.goingtocamp.com/images/6678ce55-944c-43d3-ab64-36cc5b5ede5d.jpg"
+        },
+        "aspectType": 0
+      }
+    ],
+    "mapIds": [
+      -2147483638
+    ]
+  },
+  "-2147483028": {
+    "resourceId": -2147483028,
+    "resourceLocationId": -2147483647,
+    "resourceCategoryId": -2147483648,
+    "feeScheduleId": -32751,
+    "dateScheduleId": -2147483337,
+    "dateScheduleOverrides": [],
+    "resourceModel": 0,
+    "zoneCapacitySettings": null,
+    "nonSiteSpecificSettings": null,
+    "linkedResources": [],
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "4",
+        "description": "The maximum capacity for all campsites is eight (8) people, including children."
+      }
+    ],
+    "allowedEquipment": [
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32768
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32767
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32765
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32764
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32763
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32759
+      }
+    ],
+    "reservableTransactionLocationIds": [
+      -2147483647,
+      -2147483570,
+      -2147483569
+    ],
+    "order": 40,
+    "maxStay": null,
+    "maxStayIsAggregate": null,
+    "maxAdultCapacity": null,
+    "minCapacity": 1,
+    "maxCapacity": 8,
+    "minBoatLength": null,
+    "maxBoatLength": null,
+    "maxBoatDraft": null,
+    "slipWidth": null,
+    "customAttributes": [],
+    "definedAttributes": [
+      {
+        "attributeDefinitionId": -32753,
+        "attributeId": -2147465776,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      },
+      {
+        "attributeDefinitionId": -32768,
+        "attributeId": -2147465771,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          3
+        ]
+      },
+      {
+        "attributeDefinitionId": -32759,
+        "attributeId": -2147265949,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      }
+    ],
+    "photos": [],
+    "mapIds": [
+      -2147483639
+    ]
+  },
+  "-2147483027": {
+    "resourceId": -2147483027,
+    "resourceLocationId": -2147483647,
+    "resourceCategoryId": -2147483648,
+    "feeScheduleId": -32751,
+    "dateScheduleId": -2147483337,
+    "dateScheduleOverrides": [],
+    "resourceModel": 0,
+    "zoneCapacitySettings": null,
+    "nonSiteSpecificSettings": null,
+    "linkedResources": [],
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "6",
+        "description": "The maximum capacity for all campsites is eight (8) people, including children."
+      }
+    ],
+    "allowedEquipment": [
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32768
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32767
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32765
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32764
+      }
+    ],
+    "reservableTransactionLocationIds": [
+      -2147483647,
+      -2147483570,
+      -2147483569
+    ],
+    "order": 60,
+    "maxStay": null,
+    "maxStayIsAggregate": null,
+    "maxAdultCapacity": null,
+    "minCapacity": 1,
+    "maxCapacity": 8,
+    "minBoatLength": null,
+    "maxBoatLength": null,
+    "maxBoatDraft": null,
+    "slipWidth": null,
+    "customAttributes": [],
+    "definedAttributes": [
+      {
+        "attributeDefinitionId": -32753,
+        "attributeId": -2147465831,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      },
+      {
+        "attributeDefinitionId": -32768,
+        "attributeId": -2147465826,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          5
+        ]
+      },
+      {
+        "attributeDefinitionId": -32759,
+        "attributeId": -2147265947,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      }
+    ],
+    "photos": [],
+    "mapIds": [
+      -2147483639
+    ]
+  },
+  "-2147483026": {
+    "resourceId": -2147483026,
+    "resourceLocationId": -2147483647,
+    "resourceCategoryId": -2147483648,
+    "feeScheduleId": -32763,
+    "dateScheduleId": -2147483337,
+    "dateScheduleOverrides": [],
+    "resourceModel": 0,
+    "zoneCapacitySettings": null,
+    "nonSiteSpecificSettings": null,
+    "linkedResources": [],
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "28",
+        "description": "This site is set aside for campground host."
+      }
+    ],
+    "allowedEquipment": [
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32768
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32767
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32765
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32764
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32763
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32762
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32759
+      }
+    ],
+    "reservableTransactionLocationIds": [],
+    "order": 280,
+    "maxStay": null,
+    "maxStayIsAggregate": null,
+    "maxAdultCapacity": null,
+    "minCapacity": 1,
+    "maxCapacity": 8,
+    "minBoatLength": null,
+    "maxBoatLength": null,
+    "maxBoatDraft": null,
+    "slipWidth": null,
+    "customAttributes": [],
+    "definedAttributes": [
+      {
+        "attributeDefinitionId": -32753,
+        "attributeId": -2147465466,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      },
+      {
+        "attributeDefinitionId": -32768,
+        "attributeId": -2147465461,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          7
+        ]
+      },
+      {
+        "attributeDefinitionId": -32759,
+        "attributeId": -2147265925,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          1
+        ]
+      }
+    ],
+    "photos": [],
+    "mapIds": [
+      -2147483639
+    ]
+  },
+  "-2147483025": {
+    "resourceId": -2147483025,
+    "resourceLocationId": -2147483647,
+    "resourceCategoryId": -2147483648,
+    "feeScheduleId": -32751,
+    "dateScheduleId": -2147483337,
+    "dateScheduleOverrides": [],
+    "resourceModel": 0,
+    "zoneCapacitySettings": null,
+    "nonSiteSpecificSettings": null,
+    "linkedResources": [],
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "13",
+        "description": "The maximum capacity for all campsites is eight (8) people, including children."
+      }
+    ],
+    "allowedEquipment": [
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32768
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32767
+      },
+      {
+        "equipmentCategoryId": -32768,
+        "subEquipmentCategoryId": -32766
+      }
+    ],
+    "reservableTransactionLocationIds": [
+      -2147483647,
+      -2147483570,
+      -2147483569
+    ],
+    "order": 130,
+    "maxStay": null,
+    "maxStayIsAggregate": null,
+    "maxAdultCapacity": null,
+    "minCapacity": null,
+    "maxCapacity": null,
+    "minBoatLength": null,
+    "maxBoatLength": null,
+    "maxBoatDraft": null,
+    "slipWidth": null,
+    "customAttributes": [],
+    "definedAttributes": [
+      {
+        "attributeDefinitionId": -32753,
+        "attributeId": -2147465611,
+        "attributeVisibility": 0,
+        "value": null,
+        "values": [
+          2
+        ]
+      }
+    ],
+    "photos": [],
+    "mapIds": [
+      -2147483639
+    ]
+  }
+}

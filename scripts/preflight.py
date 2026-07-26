@@ -99,6 +99,7 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         # (incident 2's shape). Each tolerance is cited below the manifest.
         "provider":              (WARN, "0002_watches_provider.sql"),
         "provider_ref":          (WARN, "0002_watches_provider.sql"),
+        "include_ada_only":      (WARN, "0003_watches_include_ada_only.sql"),
         "campground_state":      (WARN, None),
         "created_at":            (WARN, None),
     },
@@ -143,6 +144,13 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          path, which errors those watches once and leaves every
 #                          recreation_gov watch — i.e. every watch at all, since
 #                          `provider` is missing along with it — polled normally.
+#   watches.include_ada_only  not read or written by the monitor today — the ADA-Only
+#                          exclusion it will gate is deliberately not wired into any
+#                          `extract_relevant` yet, so an absent column is invisible to
+#                          the cycle. It stays WARN only while that read is
+#                          `watch.get("include_ada_only")` with a default, so an absent
+#                          column reads as the same value a migrated row carries. A read
+#                          that ever subscripts it belongs in the HALT set instead.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read

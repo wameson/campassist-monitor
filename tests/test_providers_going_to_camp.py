@@ -27,13 +27,41 @@ captured in the GoingToCamp research report (Alta Lake, resourceLocationId
   gtc_map_junk_types.json  } degraded bodies, hand-built: nothing in the
   gtc_map_renamed_fields.json } captures was malformed
 
+The per-site metadata and price fixtures, captured the same way:
+
+  gtc_resources.json       five records from the live
+                           /api/resourcelocation/resources?resourceLocationId
+                           =-2147483647 body, re-keyed onto the resource ids
+                           the map fixtures above use so the two join. Sites
+                           "84" (ADA Only = Yes, Service Type 6), "4"
+                           (Service Type 3), "28" (Service Type 7) and "13"
+                           are verbatim apart from that key; "6" is
+                           capture-equivalent, its Service Type moved from 3
+                           to 5 (Electric Hook-ups, no water — 74 sites
+                           statewide, none of them at Alta Lake), and "13" is
+                           stripped back to tent-only equipment with no
+                           Service Type, no ADA Only and no capacity, which is
+                           the shape a park at the coverage floor answers with.
+                           Record "84" keeps its whole captured body — all 28
+                           definedAttributes and a photo — so the parse is
+                           proven to walk past everything it does not read
+  gtc_attribute_filterable.json  four of the 62 live definitions: the two this
+                           build decodes (Service Type -32768, ADA Only
+                           -32759) plus ADA Accessible and Pad Location, whose
+                           enum 0 is "Not Available" rather than "Yes" — the
+                           reason an index is never cast to a bool
+  gtc_equipment.json       the whole live /api/equipment body, verbatim
+  gtc_fee_details_nightly.json     the canonical feeType 1 response, verbatim
+  gtc_fee_details_party_size.json  the feeType 7 group-camp response (a price
+                           per 25 people, not per night), verbatim
+
 No test touches the network.
 """
 
 import json
 import random
 from datetime import date, timedelta
-from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
@@ -44,6 +72,7 @@ from helpers import (
     FakeDB,
     FakeGTCHTTP,
     FakeResponse,
+    load_fixture,
     make_gtc_watch,
     make_watch,
 )
@@ -55,14 +84,30 @@ from providers import (
     unpollable_reason,
 )
 from providers.going_to_camp import (
+    ADA_ONLY_DEF,
+    ATTRIBUTES_URL,
     AVAILABILITY_URL,
     BOOKING_URL,
+    ELECTRIC_SERVICE_TYPES,
+    EMPTY_VOCABULARY,
+    EQUIPMENT_URL,
+    FEE_DETAILS_URL,
     HOST,
     MAX_CHILD_MAPS,
+    RESOURCES_URL,
+    SERVICE_TYPE_DEF,
+    WATER_SERVICE_TYPES,
     InvalidProviderRef,
     ParkTooLarge,
+    Vocabulary,
+    clear_metadata_cache,
+    fee_details,
     horizon_date,
+    parse_attribute_vocabulary,
+    parse_equipment_vocabulary,
+    parse_fee_details,
     parse_map,
+    parse_resources,
     poll_range,
 )
 
@@ -70,7 +115,6 @@ TODAY = NOW.date()  # 2026-08-01
 QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 
 GTC = GoingToCampProvider()
-FIXTURES = Path(__file__).parent / "fixtures"
 
 ROOT_MAP_ID = -2147483396
 RESOURCE_LOCATION_ID = -2147483647
@@ -84,8 +128,11 @@ START, END = date(2026, 8, 14), date(2026, 8, 16)
 POLL_KEY = ("gtc_-2147483647", (RESOURCE_LOCATION_ID, ROOT_MAP_ID, "2026-08-14", "2026-08-16"))
 
 
-def load_fixture(name):
-    return json.loads((FIXTURES / f"{name}.json").read_text())
+def map_requests(http):
+    """Just the availability calls. A poll that found sites also reads the
+    park catalog and the two vocabulary tables (see the label tests), and
+    those are not part of the map recursion being asserted on."""
+    return [r for r in http.requests if r["url"] == AVAILABILITY_URL]
 
 
 def park_responder(child=None, root=None, maps=None):
@@ -206,25 +253,25 @@ def test_a_watch_straddling_the_horizon_is_served_on_its_in_horizon_nights():
     current = GTC.extract_relevant({key: parsed}, watch, TODAY)
 
     # nothing past the horizon was even asked for
-    assert http.requests
-    for request in http.requests:
+    assert map_requests(http)
+    for request in map_requests(http):
         assert request["params"]["startDate"] == "2027-07-30"
         assert request["params"]["endDate"] == "2027-08-01"
     # so no out-of-horizon night can reach the state hash or an alert
     assert current == {
         "-2147483029": {
             "campsite_id": "-2147483029",
-            "site": "-2147483029",
+            "site": "84",
             "dates": ["2027-08-01"],
         },
         "-2147483027": {
             "campsite_id": "-2147483027",
-            "site": "-2147483027",
+            "site": "6",
             "dates": ["2027-07-30", "2027-07-31", "2027-08-01"],
         },
         "-2147483025": {
             "campsite_id": "-2147483025",
-            "site": "-2147483025",
+            "site": "13",
             "dates": ["2027-07-30", "2027-08-01"],
         },
     }
@@ -240,13 +287,13 @@ def test_poll_recurses_from_the_root_map_into_every_child():
     # the root map first, then each child map it named — the root's own
     # resourceAvailabilities are empty, so without the recursion there is
     # nothing at all to report
-    assert [r["map_id"] for r in http.requests] == [ROOT_MAP_ID] + CHILD_MAP_IDS
+    assert [r["map_id"] for r in map_requests(http)] == [ROOT_MAP_ID] + CHILD_MAP_IDS
     assert set(parsed) == {
         "-2147483029", "-2147483028", "-2147483027", "-2147483026", "-2147483025",
     }
 
     # every request went to the one hardcoded endpoint with the documented params
-    for request in http.requests:
+    for request in map_requests(http):
         assert request["url"] == AVAILABILITY_URL
         assert request["headers"]["User-Agent"] == "UA"
         params = request["params"]
@@ -266,7 +313,9 @@ def test_poll_paces_the_recursion_and_charges_it_to_the_cycle_budget():
     http = FakeGTCHTTP(park_responder())
     sleeps = []
     GTC.poll(http, POLL_KEY, "UA", sleep=sleeps.append)
-    assert len(sleeps) == len(CHILD_MAP_IDS)
+    # four child maps, then the park catalog and the two vocabulary tables the
+    # labels decode through — every one of the seven paced, none of them burst
+    assert len(sleeps) == len(CHILD_MAP_IDS) + 3
     assert all(s > 0 for s in sleeps)
 
     # and once the cycle's time budget is spent mid-recursion the park is a
@@ -279,7 +328,7 @@ def test_poll_paces_the_recursion_and_charges_it_to_the_cycle_budget():
         errors=errors, budget_exhausted=lambda: next(calls, True),
     )
     assert result is None
-    assert len(http.requests) < 1 + len(CHILD_MAP_IDS)
+    assert len(map_requests(http)) < 1 + len(CHILD_MAP_IDS)
     assert errors == ["gtc_-2147483647/2026-08-14: time budget exhausted mid-recursion, park not polled"]
 
 
@@ -302,10 +351,11 @@ def test_availability_zero_is_open_and_every_other_value_is_not():
     assert parsed["-2147483026"]["availabilities"] == {
         "2026-08-14": False, "2026-08-15": False, "2026-08-16": False,  # [3,5,7]
     }
-    # per-site labels are not served by any endpoint this build can reach, so
-    # the site degrades to its resourceId
+    # the availability body names no site, so campsite_id stays the resourceId
+    # (it is the join key everything else uses) while `site` carries the real
+    # label the park catalog gave it
     assert parsed["-2147483027"]["campsite_id"] == "-2147483027"
-    assert parsed["-2147483027"]["site"] == "-2147483027"
+    assert parsed["-2147483027"]["site"] == "6"
 
 
 def test_poll_follows_a_park_that_nests_deeper_than_one_level():
@@ -320,7 +370,7 @@ def test_poll_follows_a_park_that_nests_deeper_than_one_level():
 
     parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
 
-    fetched = [r["map_id"] for r in http.requests]
+    fetched = [r["map_id"] for r in map_requests(http)]
     assert fetched == [ROOT_MAP_ID] + CHILD_MAP_IDS + [GRANDCHILD_MAP_ID]
     # the grandchild's own site is in the merged result, not missing from it
     assert "-2147483023" in parsed
@@ -489,12 +539,12 @@ def test_extract_relevant_returns_the_shape_recreation_gov_returns():
     assert current == {
         "-2147483027": {
             "campsite_id": "-2147483027",
-            "site": "-2147483027",
+            "site": "6",
             "dates": ["2026-08-14", "2026-08-15"],
         },
         "-2147483025": {
             "campsite_id": "-2147483025",
-            "site": "-2147483025",
+            "site": "13",
             "dates": ["2026-08-14"],
         },
     }
@@ -504,9 +554,9 @@ def test_extract_relevant_returns_the_shape_recreation_gov_returns():
         assert set(site) == {"campsite_id", "site", "dates"}
         assert all(isinstance(d, str) for d in site["dates"])
     assert monitor.available_sites(current) == [
-        {"campsite_id": "-2147483025", "site": "-2147483025", "date": "2026-08-14"},
-        {"campsite_id": "-2147483027", "site": "-2147483027", "date": "2026-08-14"},
-        {"campsite_id": "-2147483027", "site": "-2147483027", "date": "2026-08-15"},
+        {"campsite_id": "-2147483025", "site": "13", "date": "2026-08-14"},
+        {"campsite_id": "-2147483027", "site": "6", "date": "2026-08-14"},
+        {"campsite_id": "-2147483027", "site": "6", "date": "2026-08-15"},
     ]
 
 
@@ -528,6 +578,309 @@ def test_extract_relevant_narrows_to_site_ids_and_keeps_the_old_hash_on_failure(
     ) is None
 
 
+def test_site_ids_match_the_resource_id_and_never_the_display_label():
+    # The catalog label is display-only, and it reverts to the resourceId
+    # whenever the catalog fetch fails: matching on it would mean a labelled
+    # watch matched every site on a healthy cycle and none at all on a degraded
+    # one, suppressing openings with nothing the user could see. Only the stable
+    # identifier selects, which is what the per-site selection phase must store.
+    http = FakeGTCHTTP(park_responder())
+    availability = {POLL_KEY: GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)}
+    assert availability[POLL_KEY]["-2147483025"]["site"] == "13"  # the label is there
+
+    assert GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["13", "84"]), TODAY
+    ) == {}
+
+    narrowed = GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["-2147483025"]), TODAY
+    )
+    assert set(narrowed) == {"-2147483025"}
+
+
+# --- the park catalog: labels, ADA Only, capacity, equipment, hookups -----
+
+def catalog(vocabulary=None):
+    """The captured park catalog, decoded through the captured vocabulary."""
+    if vocabulary is None:
+        vocabulary = Vocabulary(
+            parse_attribute_vocabulary(load_fixture("gtc_attribute_filterable")),
+            parse_equipment_vocabulary(load_fixture("gtc_equipment")),
+        )
+    return parse_resources(load_fixture("gtc_resources"), vocabulary)
+
+
+def test_the_catalog_describes_each_site_from_the_captured_body():
+    described = catalog()
+    assert set(described) == {
+        "-2147483029", "-2147483028", "-2147483027", "-2147483026", "-2147483025",
+    }
+
+    # site "84": the real label, the platform's own ADA-Only flag, capacity,
+    # and equipment resolved to names through /api/equipment
+    ada = described["-2147483029"]
+    assert ada.label == "84"
+    assert ada.ada_only is True
+    assert (ada.min_capacity, ada.max_capacity) == (1, 8)
+    assert ada.service_type == "Electrical Water Hook-up"
+    assert ada.equipment[:3] == ("1 Tent", "2 Tents", "1 Van/Camper")
+    assert ada.allows_tent is True and ada.allows_rv is True
+    assert ada.max_tents == 2
+
+    # and the same attribute reading No is False, not absent — the two are
+    # different answers and a filter must be able to tell them apart
+    assert described["-2147483028"].ada_only is False
+    assert described["-2147483028"].label == "4"
+
+
+def test_electric_and_water_are_read_as_two_sets_not_one():
+    described = catalog()
+    # Service Type 6 and 7 carry both utilities
+    assert (described["-2147483029"].electric, described["-2147483029"].water) == (True, True)
+    assert (described["-2147483026"].electric, described["-2147483026"].water) == (True, True)
+    # 3 (Standard - No Hook-ups) carries neither
+    assert (described["-2147483028"].electric, described["-2147483028"].water) == (False, False)
+    # and 5 is the case that makes this two sets: electric, no water. Folding
+    # water into electric is right 98.8% of the time and wrong on exactly the
+    # sites someone filtering for water would be asking about
+    electric_only = described["-2147483027"]
+    assert electric_only.service_type == "Electric Hook-ups"
+    assert electric_only.electric is True
+    assert electric_only.water is False
+    assert ELECTRIC_SERVICE_TYPES != WATER_SERVICE_TYPES
+
+
+def test_a_tent_only_site_is_told_apart_from_an_rv_one():
+    tents = catalog()["-2147483025"]
+    assert tents.equipment == ("1 Tent", "2 Tents", "3 Tents")
+    assert tents.allows_tent is True
+    assert tents.allows_rv is False
+    assert tents.max_tents == 3
+
+
+def test_a_field_the_platform_did_not_publish_reads_unknown_never_no():
+    # coverage runs to 0% at a handful of tiny parks, so "absent" has to be
+    # distinguishable from "no": a filter built on these fields must fail open,
+    # because a silently suppressed opening is one the user cannot see
+    sparse = catalog()["-2147483025"]
+    assert sparse.ada_only is None
+    assert sparse.service_type is None
+    assert sparse.electric is None and sparse.water is None
+    assert sparse.min_capacity is None and sparse.max_capacity is None
+    # its label is still there: the one field at 100% coverage
+    assert sparse.label == "13"
+
+
+def test_a_yes_no_enum_is_resolved_and_never_cast_from_its_index():
+    # enum 0 is "Yes" on ADA Only and "Not Available" on Pad Location, so an
+    # index this build could not decode answers unknown rather than a guess
+    vocabulary = load_fixture("gtc_attribute_filterable")
+    assert vocabulary[str(ADA_ONLY_DEF)]["values"][0]["localizedValues"][0][
+        "displayName"] == "Yes"
+    assert vocabulary["-32753"]["values"][0]["localizedValues"][0][
+        "displayName"] == "Not Available"
+
+    undecodable = catalog(EMPTY_VOCABULARY)
+    assert undecodable["-2147483029"].ada_only is None
+    assert undecodable["-2147483029"].service_type is None
+    # and the fields that need no vocabulary still parse
+    assert undecodable["-2147483029"].label == "84"
+    assert undecodable["-2147483029"].max_capacity == 8
+
+
+def test_the_pinned_attribute_ids_still_mean_what_this_build_says():
+    # ADA_ONLY_DEF and SERVICE_TYPE_DEF are magic negative ints, and the
+    # electric/water sets are enum indices of the second one. Held against the
+    # captured vocabulary so a renumbering upstream is a red test rather than a
+    # field that silently stops decoding
+    raw = load_fixture("gtc_attribute_filterable")
+    assert raw[str(ADA_ONLY_DEF)]["localizedValues"][0]["displayName"] == "ADA Only"
+    assert raw[str(SERVICE_TYPE_DEF)]["localizedValues"][0]["displayName"] == "Service Type"
+
+    labels = parse_attribute_vocabulary(raw)[SERVICE_TYPE_DEF]
+    assert {v: labels[v] for v in sorted(ELECTRIC_SERVICE_TYPES)} == {
+        5: "Electric Hook-ups",
+        6: "Electrical Water Hook-up",
+        7: "Electrical Water Sewer Hook-up",
+    }
+    assert all("Water" in labels[v] for v in WATER_SERVICE_TYPES)
+    assert "Water" not in labels[5]
+    assert parse_attribute_vocabulary(raw)[ADA_ONLY_DEF] == {0: "Yes", 1: "No"}
+
+
+def test_the_equipment_vocabulary_flattens_both_categories():
+    names = parse_equipment_vocabulary(load_fixture("gtc_equipment"))
+    assert names[-32768] == "1 Tent"
+    assert names[-32766] == "3 Tents"
+    assert names[-32759] == "1 RV/Trailer up to 30'"
+    # the ids collide across namespaces — sub-equipment -32759 is an
+    # RV/Trailer, attribute definition -32759 is ADA Only — which is why only
+    # the resolved name is ever reasoned about
+    assert names[-32759] != "ADA Only"
+    # the "Group" category is flattened in alongside "Equipment"
+    assert names[-32761] == "Tents"
+
+
+def test_parse_resources_degrades_instead_of_crashing():
+    vocabulary = Vocabulary(
+        parse_attribute_vocabulary(load_fixture("gtc_attribute_filterable")),
+        parse_equipment_vocabulary(load_fixture("gtc_equipment")),
+    )
+    # a body that is not a catalog at all is unrecognized, never "no sites"
+    for body in (None, [], "<html>Azure WAF</html>", {"-1": "not a record"}):
+        assert parse_resources(body, vocabulary) is None
+    # a genuinely empty park parses as authoritative
+    assert parse_resources({}, vocabulary) == {}
+    # a record missing every field this build reads still yields a row, so the
+    # site is never dropped out of the join
+    [bare] = parse_resources({"-1": {}}, vocabulary).values()
+    assert bare.label is None and bare.equipment == ()
+    assert bare.ada_only is None and bare.max_tents is None
+
+
+# --- the site label in the availability shape -----------------------------
+
+def test_the_label_replaces_the_resource_id_and_falls_back_when_it_cannot():
+    # the nested fixtures serve -2147483024 and -2147483023, which the captured
+    # catalog does not describe: an id present in availability but absent from
+    # the catalog keeps the resourceId rather than dropping out of the poll
+    maps = {
+        NESTING_CHILD_MAP_ID: FakeResponse(200, load_fixture("gtc_child_map_nested")),
+        GRANDCHILD_MAP_ID: FakeResponse(200, load_fixture("gtc_grandchild_map")),
+    }
+    http = FakeGTCHTTP(park_responder(maps=maps))
+
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
+
+    assert parsed["-2147483029"]["site"] == "84"
+    assert parsed["-2147483024"]["site"] == "-2147483024"
+    # campsite_id is the join key everything downstream uses, so it never moves
+    assert parsed["-2147483029"]["campsite_id"] == "-2147483029"
+
+    # the catalog was read from the module's own URL, with only the identifier
+    # already bounded on its way out of provider_ref in the query
+    [request] = [r for r in http.requests if r["url"] == RESOURCES_URL]
+    assert request["method"] == "GET"
+    assert request["params"] == {"resourceLocationId": RESOURCE_LOCATION_ID}
+    assert request["headers"]["User-Agent"] == "UA"
+
+
+def test_a_catalog_this_cycle_cannot_read_never_fails_the_unit():
+    # labels are cosmetic: a park whose catalog 500s is still polled, hashed
+    # and alerted on, with the resourceId fallback and one reported line
+    http = FakeGTCHTTP(park_responder(), responses={RESOURCES_URL: FakeResponse(500)})
+    errors = []
+
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors)
+
+    assert parsed is not None
+    assert parsed["-2147483029"]["site"] == "-2147483029"
+    assert errors == ["gtc_-2147483647/2026-08-14 site metadata: HTTP 500"]
+    # and it cost exactly one request: a cosmetic read gets no retry, so a dead
+    # catalog endpoint cannot spend the budget the availability polls need
+    assert len([r for r in http.requests if r["url"] == RESOURCES_URL]) == 1
+
+    # the same for a body it cannot recognize
+    clear_metadata_cache()
+    http = FakeGTCHTTP(park_responder(), responses={RESOURCES_URL: FakeResponse(200, {"-1": 5})})
+    errors = []
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors)
+    assert parsed["-2147483029"]["site"] == "-2147483029"
+    assert errors == [
+        "gtc_-2147483647/2026-08-14 site metadata: unrecognized response body"
+    ]
+
+    # a bare JSON `null` is a 200 that carries no body at all: it reports like
+    # every other unreadable shape rather than passing for a failed request and
+    # costing the operator the line
+    clear_metadata_cache()
+    http = FakeGTCHTTP(park_responder(), responses={RESOURCES_URL: FakeResponse(200, None)})
+    errors = []
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors)
+    assert parsed["-2147483029"]["site"] == "-2147483029"
+    assert errors == ["gtc_-2147483647/2026-08-14 site metadata: unexpected response body"]
+
+    # and a vocabulary it cannot read only costs the fields that decode through
+    # it: the label needs none, so it still lands
+    clear_metadata_cache()
+    http = FakeGTCHTTP(park_responder(), responses={ATTRIBUTES_URL: FakeResponse(503)})
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
+    assert parsed["-2147483029"]["site"] == "84"
+
+
+def test_the_catalog_and_vocabulary_are_read_once_per_process():
+    # one extra GET per park per cycle, not per poll unit: two watches on the
+    # same park over different stays share the catalog, and every park in the
+    # cycle shares the vocabulary
+    http = FakeGTCHTTP(park_responder())
+    other_stay = (POLL_KEY[0], (RESOURCE_LOCATION_ID, ROOT_MAP_ID, "2026-09-01", "2026-09-03"))
+
+    GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)
+    GTC.poll(http, other_stay, "UA", sleep=lambda s: None)
+
+    for url in (RESOURCES_URL, ATTRIBUTES_URL, EQUIPMENT_URL):
+        assert len([r for r in http.requests if r["url"] == url]) == 1, url
+
+
+# --- per-night price ------------------------------------------------------
+
+def test_fee_details_reads_the_nightly_rate_over_the_one_read_only_post():
+    http = FakeGTCHTTP(
+        park_responder(),
+        responses={FEE_DETAILS_URL: FakeResponse(200, load_fixture("gtc_fee_details_nightly"))},
+    )
+
+    price = fee_details(http, -2147482979, date(2026, 8, 15), "UA", sleep=lambda s: None)
+
+    assert price == Decimal("46.0")
+    # a raw JSON decimal, kept as one for a caller to format — never a float to
+    # round or a string to match on
+    assert isinstance(price, Decimal)
+
+    [request] = [r for r in http.requests if r["url"] == FEE_DETAILS_URL]
+    # the endpoint answers 405 to a GET, which is why this one request is a
+    # POST; it stays a read — an empty body, no cart, no cookie, no token
+    assert request["method"] == "POST"
+    assert request["json"] == []
+    assert request["url"].startswith(f"https://{HOST}/")
+    assert request["params"] == {"resourceId": -2147482979, "startDate": "2026-08-15"}
+
+
+def test_fee_details_declines_to_price_what_is_not_a_nightly_rate():
+    # a group camp answers feeType 7 — a price per 25 people. Rendering that as
+    # a nightly rate would be wrong, so no price is the honest answer
+    assert parse_fee_details(load_fixture("gtc_fee_details_party_size")) is None
+    assert parse_fee_details({"resultCode": 0, "resourceFeeDetails": []}) is None
+    for body in (None, [], "<html>", {"resourceFeeDetails": "nope"}):
+        assert parse_fee_details(body) is None
+    # a nightly entry alongside one this build does not price still reads
+    assert parse_fee_details({"resourceFeeDetails": [
+        {"feeTotal": 12.5, "feeType": 0},
+        {"feeTotal": 31.00000, "feeType": 1},
+    ]}) == Decimal("31.0")
+    # a total that is not a number at all is not a price
+    assert parse_fee_details({"resourceFeeDetails": [
+        {"feeTotal": "46.00", "feeType": 1},
+    ]}) is None
+
+
+def test_fee_details_refuses_an_identifier_that_could_grow_the_query():
+    http = FakeGTCHTTP(park_responder(), responses={FEE_DETAILS_URL: FakeResponse(500)})
+    for bad in ("-2147482979", None, True, 1.5):
+        with pytest.raises(TypeError):
+            fee_details(http, bad, date(2026, 8, 15), "UA", sleep=lambda s: None)
+    with pytest.raises(ValueError):
+        fee_details(http, 10 ** 19, date(2026, 8, 15), "UA", sleep=lambda s: None)
+    assert not [r for r in http.requests if r["url"] == FEE_DETAILS_URL]
+
+    # a failed price read is None, never an exception the caller has to catch
+    errors = []
+    assert fee_details(
+        http, -2147482979, date(2026, 8, 15), "UA", sleep=lambda s: None, errors=errors
+    ) is None
+    assert errors == ["going_to_camp fee details: HTTP 500"]
+
+
 # --- provider_ref: identifiers only, and never a host ---------------------
 
 def test_the_host_is_a_constant_a_hostile_provider_ref_cannot_move():
@@ -546,8 +899,12 @@ def test_the_host_is_a_constant_a_hostile_provider_ref_cannot_move():
         GTC.poll(http, key, "UA", sleep=lambda s: None)
 
     assert http.requests
+    # every URL this provider reaches — availability, the park catalog, the two
+    # vocabulary tables — is a constant in its own module, on the one host
     for request in http.requests:
-        assert request["url"] == AVAILABILITY_URL
+        assert request["url"] in {
+            AVAILABILITY_URL, RESOURCES_URL, ATTRIBUTES_URL, EQUIPMENT_URL,
+        }
         assert request["url"].startswith(f"https://{HOST}/")
         assert "evil.invalid" not in json.dumps(request, default=str)
 
@@ -659,7 +1016,8 @@ def test_the_cycle_serves_a_going_to_camp_watch_end_to_end():
 
     [(watch_id, openings)] = apns.alerts
     assert watch_id == "w1"
-    assert {o["site"] for o in openings} == {"-2147483027", "-2147483025"}
+    # the push says "Site 6" / "Site 13", not the platform's internal resourceId
+    assert {o["site"] for o in openings} == {"6", "13"}
     row = db.tables["watches"][0]
     assert row["status"] == "monitoring"
     assert row["state_hash"]
