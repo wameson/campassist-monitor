@@ -394,12 +394,11 @@ def test_preflight_manifest_matches_schema_sql():
 
 
 def test_include_ada_only_is_warn_and_carries_its_migration():
-    # The column the ADA-Only opt-in will gate. It is classified WARN because
-    # the monitor does not read it at all yet, and when it does the read is
-    # `watch.get(...)` with a default, so an absent column reads as the same
-    # value a migrated row carries — a live DB an operator has not migrated yet
-    # keeps monitoring rather than halting. (The default itself is a deliberate
-    # behaviour change once the filter lands; see the migration.)
+    # The column the ADA-Only exclusion is gated on. It is classified WARN
+    # because the one read is `watch.get(...)` with a default, so an absent
+    # column reads as the same value a migrated row carries — a live DB an
+    # operator has not migrated yet keeps monitoring rather than halting.
+    # (The default itself is a deliberate behaviour change; see the migration.)
     severity, migration = preflight.REQUIRED["watches"]["include_ada_only"]
     assert severity == preflight.WARN
     assert migration == "0003_watches_include_ada_only.sql"

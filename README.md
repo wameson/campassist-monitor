@@ -69,13 +69,28 @@ resource catalog once per cycle (`/api/resourcelocation/resources`, keyless,
 enum indices decode through, two further paced GETs the first park of a cycle
 pays for and every later one reuses) to turn each `resourceId` into the label
 the park actually uses — an alert says "Site 42", not `-2147482979`. That
-catalog also carries the per-site detail the choose-sites work needs (the
-"ADA Only" flag, capacity, allowed equipment, and the electric/water hookup
-enum). It is cosmetic to the poll: a park whose catalog a cycle cannot read is
-still polled, hashed and alerted on, with the `resourceId` fallback and one
-reported line. Being cosmetic, it is also unretried — one paced attempt each,
-no backoff, so a dead catalog endpoint cannot spend the time budget the
-availability polls need.
+catalog also carries the per-site detail the choose-sites work needs (capacity,
+allowed equipment, the electric/water hookup enum) and the platform's own
+"ADA Only" flag, which the exclusion below reads. It is cosmetic to the poll: a
+park whose catalog a cycle cannot read is still polled, hashed and alerted on,
+with the `resourceId` fallback and one reported line. Being cosmetic, it is
+also unretried — one paced attempt each, no backoff, so a dead catalog endpoint
+cannot spend the time budget the availability polls need.
+
+**ADA-only sites are not openings unless the watch asked for them.** On this
+platform "ADA Only" means only campers with disabilities may reserve the site,
+and the platform's own search excludes those sites by default. So does the
+monitor: `going_to_camp`'s `extract_relevant` drops them unless the watch sets
+`include_ada_only` (default `false` for every watch, old and new — there is no
+backfill, so this is a deliberate behaviour change) or names the site in
+`site_ids`, in which case the user's own choice wins. The exclusion runs before
+the state hash, so an ADA-only site opening and closing is not a delta and
+costs no write. It fails open in every direction: only a site the catalog
+positively marked is ever dropped, so a catalog fetch that failed suppresses
+nothing — a suppressed opening would be invisible to the user, a surplus one is
+only noise. `recreation_gov` does not filter at all: that API publishes only a
+wider "accessible" flag meaning the site *has* accessibility features, never
+that it is reserved (see the comment at its `extract_relevant`).
 
 **Request posture at this host: keyless GET, plus one read-only pricing POST;
 still never drive a browser.** The SPA is Azure-WAF captcha-gated and `/api/*`
@@ -180,15 +195,16 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   then merge the manifest entry. A new monitor-written or read-required column is
   classified `halt`, so merging it ahead of the apply would deliberately stop every
   cycle until an operator got to the SQL editor.
-- **Not every schema column is read yet.** `watches.include_ada_only`
+- **A column read with a default is still `warn`.** `watches.include_ada_only`
   (`0003_watches_include_ada_only.sql`) is the per-watch opt-in for sites
-  reserved for campers with disabilities. The column, its migration and its
-  manifest entry ship ahead of the filter that will read it, so the apply can
-  happen before any client writes the column; nothing in the cycle reads it
-  today, which is why it is classified `warn`. Note the default is a deliberate
-  behaviour change, not a status quo: the monitor alerts on ADA-only sites
-  today, so once the filter lands every pre-existing watch stops being alerted
-  about them unless its owner opts back in. There is no backfill.
+  reserved for campers with disabilities, read only as
+  `bool(watch.get("include_ada_only"))` in `going_to_camp`'s `extract_relevant`
+  (see Providers). An absent column reads `false` — exactly what a migrated row
+  carries by default — so a live DB nobody has migrated yet keeps monitoring and
+  keeps excluding, which is why it stays `warn` rather than `halt`. Note the
+  default is a deliberate behaviour change, not a status quo: the monitor used to
+  alert on ADA-only sites, so every pre-existing watch stops being alerted about
+  them unless its owner opts back in. There is no backfill.
 - **The monitor checks before it runs.** Each run starts with a read-only schema
   preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
   data, before the start jitter. It never applies anything — the by-hand posture above

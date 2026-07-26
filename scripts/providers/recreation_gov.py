@@ -199,7 +199,19 @@ class RecreationGovProvider:
         they are unbookable, so they count toward neither the hash nor alerts.
         A watch wholly beyond the polling horizon has no pollable months yet,
         so it also returns None; a watch straddling the horizon is hashed on
-        its in-horizon months alone."""
+        its in-horizon months alone.
+
+        No ADA-only exclusion here, deliberately, and `include_ada_only` is not
+        read: this API has no such concept. It publishes `is_accessible`, which
+        its own UI defines as "has features for better accessibility" — a
+        statement about the site, not about who may reserve it — and a survey of
+        1,571 campsites at 24 accessibility-bearing facilities found no
+        restriction marker in any field or free text. Filtering on the wider
+        flag was measured to hide roughly 2.75 bookable sites per restricted one
+        it would correctly hide, so the captain scoped the filter to the
+        provider that states the fact exactly (going_to_camp). Hiding sites a
+        platform never called restricted is the same harm the feature exists to
+        prevent, pointed at a different group."""
         start = as_date(watch["start_date"])
         end = as_date(watch["end_date"])
         wanted = {str(s) for s in (watch.get("site_ids") or [])}

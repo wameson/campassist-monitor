@@ -15,7 +15,8 @@ including one this build has never seen — is parsed as NOT available.
 A second, park-scoped endpoint describes those resources: `RESOURCES_URL`
 carries each site's real label, its "ADA Only" flag, its capacity and its
 allowed equipment (see the per-site metadata section below). The availability
-API names sites by `resourceId` alone, so this is where "Site 42" comes from.
+API names sites by `resourceId` alone, so this is where "Site 42" comes from —
+and where the ADA-Only exclusion in `extract_relevant` gets its flag.
 
 Request posture: keyless GETs, plus the one read-only pricing POST this API
 offers no GET for (`FEE_DETAILS_URL`, captain-approved) — and never a browser.
@@ -260,8 +261,9 @@ def parse_map(raw, start: date, end: date) -> tuple[dict[str, dict], list[int]] 
     The availability body names no site, so `site` starts as the resourceId —
     the same way the other conformer falls back to the campsite id when a site
     name is missing. `poll_park` then overwrites it with the real label from
-    the park catalog (`apply_site_labels`), leaving the fallback in place for
-    any resource that catalog does not describe.
+    the park catalog (`apply_site_metadata`), which is also where the optional
+    `ada_only` key comes from; both are left off any resource that catalog does
+    not describe.
     """
     if not isinstance(raw, dict):
         return None
@@ -478,7 +480,7 @@ def poll_park(
             entry["availabilities"].update(site["availabilities"])
 
     if sites:
-        apply_site_labels(
+        apply_site_metadata(
             sites, http, resource_location_id, user_agent,
             label=f"{label} site metadata", sleep=sleep, errors=errors,
             budget_exhausted=budget_exhausted,
@@ -486,7 +488,7 @@ def poll_park(
     return sites
 
 
-def apply_site_labels(
+def apply_site_metadata(
     sites: dict[str, dict],
     http,
     resource_location_id: int,
@@ -497,8 +499,9 @@ def apply_site_labels(
     errors: list[str] | None = None,
     budget_exhausted=lambda: False,
 ) -> None:
-    """Replace each site's `resourceId` placeholder with its real label from
-    the park catalog, in place.
+    """Decorate the polled sites from the park catalog, in place: the real
+    label in place of the `resourceId` placeholder, and the platform's own
+    "ADA Only" flag as an optional `ada_only` key.
 
     Cosmetic by design, so it can never fail the unit: a park whose catalog
     this cycle could not read, or a resource the catalog does not describe,
@@ -508,6 +511,12 @@ def apply_site_labels(
     catalog fetch flips outcome reads as a delta; alert dedup keys on
     `campsite_id`, which never changes, so it costs one `watches` write and
     cannot produce a duplicate push.
+
+    `ada_only` is set only where the platform published the flag, so an absent
+    key means "not known to be ADA-only" — a failed catalog fetch, a resource
+    the catalog omits, a vocabulary this cycle could not decode. That is what
+    makes `extract_relevant`'s exclusion fail open: it can only ever drop a
+    site the platform positively marked.
     """
     described = site_metadata(
         http, resource_location_id, user_agent, label=label,
@@ -515,8 +524,12 @@ def apply_site_labels(
     )
     for resource_id, site in sites.items():
         entry = described.get(resource_id)
-        if entry is not None and entry.label:
+        if entry is None:
+            continue
+        if entry.label:
             site["site"] = entry.label
+        if entry.ada_only is not None:
+            site["ada_only"] = entry.ada_only
 
 
 # --- per-site metadata ----------------------------------------------------
@@ -1029,7 +1042,11 @@ class GoingToCampProvider:
         shares, or None when its park failed to poll this cycle (keep the old
         hash and retry next run). Past nights and the check-out day are
         excluded: they are unbookable, so they count toward neither the hash
-        nor an alert."""
+        nor an alert.
+
+        Sites this platform marks "ADA Only" are excluded here too, unless the
+        watch opted back in (`include_ada_only`) or named the site itself. See
+        the exclusion's three rules at the loop below."""
         # The cycle's lifecycle pass errors an unusable ref before it gets here
         # (see `unpollable_reason`); this stays the contained backstop, since
         # extract_relevant is the one entry point that runs inside per-watch
@@ -1045,6 +1062,13 @@ class GoingToCampProvider:
         start = as_date(watch["start_date"])
         end = as_date(watch["end_date"])
         wanted = {str(s) for s in (watch.get("site_ids") or [])}
+        # The per-watch opt-in, read the way the drift guard's WARN
+        # classification of this column requires: `.get` with a default, so a
+        # live DB that has not had 0003 applied yet reads exactly what a
+        # migrated row carries (false) instead of halting the cycle. Default
+        # false applies to every watch, old and new — there is no backfill, so
+        # this is the deliberate behaviour change the migration documents.
+        include_ada_only = bool(watch.get("include_ada_only"))
 
         current: dict[str, dict] = {}
         for resource_id, site in parsed.items():
@@ -1057,6 +1081,22 @@ class GoingToCampProvider:
             # follow-on phase that enables per-site GoingToCamp selection has
             # to persist in `site_ids`.
             if wanted and not ({resource_id, site["campsite_id"]} & wanted):
+                continue
+            # "ADA Only" on this platform means only campers with disabilities
+            # may reserve the site, so it is not an opening for a watch that
+            # did not ask for it — the platform's own search excludes these by
+            # default too. Three rules make that safe:
+            #   * it runs AFTER the `wanted` match, and only for an undirected
+            #     watch: a watch that named this site chose it deliberately and
+            #     the filter must not overrule the choice.
+            #   * it runs BEFORE the caller hashes this shape, so an ADA-only
+            #     site opening and closing is not a delta at all — no phantom
+            #     state_hash churn, no `sent_alerts` row, no `watches` write.
+            #   * it fails open: only a site the catalog positively marked
+            #     carries the flag (see `apply_site_metadata`), so a catalog
+            #     this cycle could not read suppresses nothing. A suppressed
+            #     opening is invisible to the user; a surplus one is only noise.
+            if site.get("ada_only") and not include_ada_only and not wanted:
                 continue
             open_dates = sorted(
                 d

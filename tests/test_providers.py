@@ -128,6 +128,27 @@ def test_extract_relevant_returns_the_shared_shape():
     assert REC_GOV.extract_relevant({("232447", date(2026, 8, 1)): None}, watch, TODAY) is None
 
 
+def test_recreation_gov_never_applies_the_ada_only_exclusion():
+    # Captain decision: the exclusion is scoped to the provider that states the
+    # fact exactly. This API publishes only "has features for better
+    # accessibility" — about the site, never about who may reserve it — so
+    # nothing here is ever filtered: not for either value of the column, and
+    # not even for a parsed shape carrying the other provider's own marker.
+    parsed = parse_availability(availability_payload({
+        "100": {"2026-08-10": "Available"},
+    }))
+    parsed["100"]["ada_only"] = True
+    availability = {("232447", date(2026, 8, 1)): parsed}
+
+    for watch in (
+        make_watch(),  # the column absent, as on an unmigrated live DB
+        make_watch(include_ada_only=False),
+        make_watch(include_ada_only=True),
+    ):
+        current = REC_GOV.extract_relevant(availability, watch, TODAY)
+        assert set(current) == {"100"}, watch.get("include_ada_only")
+
+
 def test_booking_url_points_at_the_first_opening():
     openings = [{"campsite_id": "100", "site": "S100", "date": "2026-08-10"}]
     assert REC_GOV.booking_url(make_watch(), openings) == (
