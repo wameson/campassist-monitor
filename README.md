@@ -51,7 +51,7 @@ Two conformers ship today:
 | `provider` | Module | Poll unit | `provider_ref` |
 |---|---|---|---|
 | `recreation_gov` | `scripts/providers/recreation_gov.py` | one (campground, month) request | unused — `campground_id` is the whole identity |
-| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll` | `{"resource_location_id": …, "map_id": …}`, both required (a watch without them is errored once, see Watch lifecycle) |
+| `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll`, plus one park-catalog GET (see below) | `{"resource_location_id": …, "map_id": …}`, both required (a watch without them is errored once, see Watch lifecycle) |
 
 GoingToCamp (Washington State Parks, on the Aspira platform) is map-scoped and
 recursive: a park's root map answers with pointers to its child maps and no
@@ -62,6 +62,24 @@ enum in which only `0` is confirmed to mean bookable, so every other value —
 including one this build has never seen — parses as taken. The booking deep
 link is the park's booking search pre-filled with the watch's dates (the SPA
 takes no site preselect), not a per-site page.
+
+The availability body names no site, so a successful poll reads the park's
+resource catalog once per cycle (`/api/resourcelocation/resources`, keyless,
+~64 KB per park, cached in-process alongside two tiny vocabulary tables) to
+turn each `resourceId` into the label the park actually uses — an alert says
+"Site 42", not `-2147482979`. That catalog also carries the per-site detail the
+choose-sites work needs (the "ADA Only" flag, capacity, allowed equipment, and
+the electric/water hookup enum). It is cosmetic to the poll: a park whose
+catalog a cycle cannot read is still polled, hashed and alerted on, with the
+`resourceId` fallback and one reported line.
+
+**Request posture at this host: keyless GET, plus one read-only pricing POST;
+still never drive a browser.** The SPA is Azure-WAF captcha-gated and `/api/*`
+is not, so every request stays on `/api/*` with a browser UA and the pacing
+above. The single exception is the per-night price
+(`/api/resource/feeDetails`), which answers `405` to a GET: it is a POST with
+an empty body, creating nothing and carrying no cart, cookie or token. It is
+not in the polling loop.
 
 Because the recursion costs more requests than a single month call, one park's
 whole fan-out is capped (however deeply its maps nest, and a map is never
@@ -158,6 +176,12 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   then merge the manifest entry. A new monitor-written or read-required column is
   classified `halt`, so merging it ahead of the apply would deliberately stop every
   cycle until an operator got to the SQL editor.
+- **Not every schema column is read yet.** `watches.include_ada_only`
+  (`0003_watches_include_ada_only.sql`) is the per-watch opt-in for sites
+  reserved for campers with disabilities. The column, its migration and its
+  manifest entry ship ahead of the filter that will read it, so the apply can
+  happen before any client writes the column; nothing in the cycle reads it
+  today, which is why it is classified `warn`.
 - **The monitor checks before it runs.** Each run starts with a read-only schema
   preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
   data, before the start jitter. It never applies anything — the by-hand posture above

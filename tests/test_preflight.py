@@ -393,6 +393,30 @@ def test_preflight_manifest_matches_schema_sql():
     assert set(parsed) == set(preflight.REQUIRED)
 
 
+def test_include_ada_only_is_warn_and_carries_its_migration():
+    # The column the ADA-Only opt-in will gate. It is classified WARN because
+    # the monitor does not read it at all yet and, when it does, an absent
+    # column must read as the default every watch already behaves as — so a
+    # live DB an operator has not migrated yet keeps monitoring rather than
+    # halting on a column whose absence changes nothing.
+    severity, migration = preflight.REQUIRED["watches"]["include_ada_only"]
+    assert severity == preflight.WARN
+    assert migration == "0003_watches_include_ada_only.sql"
+
+    migration_sql = (SCHEMA_SQL.parent / "migrations" / migration).read_text()
+    assert "ADD COLUMN IF NOT EXISTS include_ada_only" in migration_sql
+    assert "DEFAULT false" in migration_sql
+    # and it is in schema.sql too, so a fresh install and a migrated one agree
+    assert "include_ada_only" in parse_schema_sql(SCHEMA_SQL.read_text())["watches"]
+
+    # a WARN-only drift keeps monitoring: the annotation says so and the
+    # preflight returns rather than exiting
+    drift = preflight.Drift("watches", "include_ada_only", preflight.WARN, migration)
+    message = preflight.drift_message([drift])
+    assert message.startswith("::warning::")
+    assert f"supabase/migrations/{migration}" in message
+
+
 def test_every_manifest_column_is_classified():
     for table, columns in preflight.REQUIRED.items():
         for column, (severity, migration) in columns.items():

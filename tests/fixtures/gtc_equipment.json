@@ -1,0 +1,146 @@
+[
+  {
+    "equipmentCategoryId": -32767,
+    "order": 2,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "Group"
+      }
+    ],
+    "subEquipmentCategories": [
+      {
+        "subEquipmentCategoryId": -32761,
+        "order": 1,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "Tents"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32760,
+        "order": 2,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "Trailers"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "equipmentCategoryId": -32768,
+    "order": 1,
+    "localizedValues": [
+      {
+        "cultureName": "en-US",
+        "name": "Equipment"
+      }
+    ],
+    "subEquipmentCategories": [
+      {
+        "subEquipmentCategoryId": -32768,
+        "order": 1,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 Tent"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32767,
+        "order": 2,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "2 Tents"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32766,
+        "order": 3,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "3 Tents"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32765,
+        "order": 4,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 Van/Camper"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32764,
+        "order": 5,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer up to 20'"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32763,
+        "order": 6,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer up to 25'"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32762,
+        "order": 8,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer up to 35'"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32759,
+        "order": 7,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer up to 30'"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32758,
+        "order": 9,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer up to 40\u2019"
+          }
+        ]
+      },
+      {
+        "subEquipmentCategoryId": -32757,
+        "order": 10,
+        "localizedValues": [
+          {
+            "cultureName": "en-US",
+            "name": "1 RV/Trailer over 40\u2019"
+          }
+        ]
+      }
+    ]
+  }
+]

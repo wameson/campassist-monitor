@@ -25,6 +25,10 @@ CREATE TABLE watches (
     campground_name  TEXT NOT NULL,
     campground_state TEXT,
     site_ids     TEXT[] DEFAULT '{}',                -- empty = any site
+    include_ada_only BOOLEAN NOT NULL DEFAULT false, -- opt in to sites reserved for campers
+                                                     -- with disabilities (GoingToCamp "ADA Only");
+                                                     -- excluded by default, as the platform's own
+                                                     -- search excludes them
     start_date   DATE NOT NULL,
     end_date     DATE NOT NULL,
     status       TEXT NOT NULL DEFAULT 'monitoring'
