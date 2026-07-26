@@ -28,9 +28,9 @@ CREATE TABLE watches (
     include_ada_only BOOLEAN NOT NULL DEFAULT false, -- opt in to sites reserved for campers
                                                      -- with disabilities (GoingToCamp "ADA Only");
                                                      -- excluded by default, as the platform's own
-                                                     -- search excludes them. Not read by the
-                                                     -- monitor yet — see migrations/0003 and
-                                                     -- README "Database migrations"
+                                                     -- search excludes them. Read only by
+                                                     -- going_to_camp's extract_relevant — see
+                                                     -- migrations/0003 and README "Providers"
     start_date   DATE NOT NULL,
     end_date     DATE NOT NULL,
     status       TEXT NOT NULL DEFAULT 'monitoring'
