@@ -6,7 +6,10 @@
 -- database. For an EXISTING database, do not re-run this — instead apply any
 -- unapplied files in supabase/migrations/ (idempotent, manual; see README
 -- "Database migrations"). When you change the schema here, add a matching
--- idempotent migration so already-live databases receive the change too.
+-- idempotent migration so already-live databases receive the change too, and
+-- the column's entry in the REQUIRED manifest in scripts/preflight.py — a test
+-- holds the manifest and this file to each other in both directions. Apply the
+-- migration by hand before merging the manifest entry (README, same section).
 
 CREATE TABLE watches (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
