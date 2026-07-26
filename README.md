@@ -20,6 +20,7 @@ anti-blocking rules, and the recreation.gov API contract.
 | `scripts/providers/` | One conformer per `watches.provider` value — the poll/parse/normalize/booking-link strategy (see [Providers](#providers)) |
 | `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
+| `scripts/preflight.py` | Read-only schema-drift guard run before each cycle (see [Database migrations](#database-migrations)) |
 | `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
 | `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
 | `supabase/migrations/` | Ordered, idempotent SQL applied **by hand** to keep **existing** DBs in sync (see [Database migrations](#database-migrations)) |
@@ -149,10 +150,29 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   a human applies them against Supabase by hand. (Fresh installs still just run
   `schema.sql` once, as in Setup above.)
 - **Adding a migration when you change the schema:** update `supabase/schema.sql` (so
-  fresh installs get the change) **and** add a new `supabase/migrations/NNNN_<desc>.sql`
-  with the next number, using idempotent DDL (so existing DBs get the same change).
-  Keep the two in sync — every additive change to `schema.sql` needs a matching
-  migration.
+  fresh installs get the change), add a new `supabase/migrations/NNNN_<desc>.sql`
+  with the next number, using idempotent DDL (so existing DBs get the same change),
+  **and** add the column to the `REQUIRED` manifest in `scripts/preflight.py` (below).
+  Keep all three in sync — a CI test fails when the manifest and `schema.sql` disagree.
+  **Order matters:** apply the migration by hand in the SQL editor **first**, and only
+  then merge the manifest entry. A new monitor-written or read-required column is
+  classified `halt`, so merging it ahead of the apply would deliberately stop every
+  cycle until an operator got to the SQL editor.
+- **The monitor checks before it runs.** Each run starts with a read-only schema
+  preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
+  data, before the start jitter. It never applies anything — the by-hand posture above
+  is unchanged — it only reports, naming every missing `table.column` and the exact
+  migration file to apply.
+  - A missing column the monitor **writes or reads as required** prints an `::error::`
+    and exits non-zero *before* the cycle starts, turning what used to be a silent
+    write-time `400` into a red run with the remedy in the annotation.
+  - A missing column the monitor **provably tolerates** (app-only columns such as
+    `provider_ref`, or a read with a demonstrated fallback such as `provider`) prints a
+    `::warning::` and the cycle runs normally — drift the backend survives must never
+    pause cancellation monitoring, even when it breaks the iOS app.
+  - A probe that fails for any other reason (5xx, 429, timeout, an unrecognized error
+    code) is treated as a Supabase blip: `::warning::` and the cycle runs. Only a
+    positively-identified missing object can stop a run.
 
 ## Local development
 

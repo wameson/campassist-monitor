@@ -48,6 +48,7 @@ from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE
 # common.py only so a provider can cap against the very same constant.
 from common import MAX_ERROR_MESSAGE_CHARS, as_date, capped_line
 from db import SupabaseClient
+from preflight import preflight
 from providers import (
     PROVIDERS,
     PollKey,
@@ -108,7 +109,16 @@ PER_ID_FALLBACK_MAX = 50
 #
 #   120 s  job setup      checkout + setup-python + pip install
 # + 600 s  FANOUT_DEADLINE_SECONDS, measured from PROCESS start — the start
-#          jitter main() sleeps (≤240 s) is inside it, not on top of it
+#          jitter main() sleeps (≤240 s) and the schema preflight that runs
+#          before it are inside it, not on top of it
+#
+# The preflight (preflight.py, called from main() before the jitter) is charged
+# against that same 600 s and has ample headroom: on the healthy path it is 4
+# GETs, one per table, each bounded by the client's 30 s timeout (db.py) — at
+# most 120 s of the 600. Its per-column narrowing pass fires only on real drift,
+# on a run that is already halting or warning, and costs at worst roughly one
+# extra GET per column of the drifted table, so it cannot blow a healthy run's
+# fanout or timeout budget.
 # + 180 s  shutdown       one in-flight PATCH (30 s, db.py) + the run_summaries
 #                         insert and both prunes (30 s each), plus margin
 # = 900 s  the whole job
@@ -1041,11 +1051,19 @@ def exit_code(result: dict) -> int:
 
 def main() -> None:
     rng = random.Random()
+    db = SupabaseClient.from_env()
+    # Schema-drift guard, deliberately ahead of the jitter sleep: a run halted by
+    # drift goes red immediately instead of burning up to 240 s of Actions
+    # minutes first. Moving it ahead costs no politeness toward any campground
+    # provider — the probe is Supabase-only, and the jitter exists to
+    # desynchronize *provider* polling. Halting drift raises SystemExit(1) here,
+    # before run()'s first write; everything else warns and falls through.
+    preflight(db)
+
     delay = start_delay(rng)
     print(f"start jitter: sleeping {delay:.0f}s", flush=True)
     time.sleep(delay)
 
-    db = SupabaseClient.from_env()
     apns = APNsClient.from_env()
     with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
         result = run(db, apns, http, rng=rng)
