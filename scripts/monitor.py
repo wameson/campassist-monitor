@@ -113,12 +113,15 @@ PER_ID_FALLBACK_MAX = 50
 #          before it are inside it, not on top of it
 #
 # The preflight (preflight.py, called from main() before the jitter) is charged
-# against that same 600 s and has ample headroom: on the healthy path it is 4
-# GETs, one per table, each bounded by the client's 30 s timeout (db.py) — at
-# most 120 s of the 600. Its per-column narrowing pass fires only on real drift,
-# on a run that is already halting or warning, and costs at worst roughly one
-# extra GET per column of the drifted table, so it cannot blow a healthy run's
-# fanout or timeout budget.
+# against that same 600 s and has ample headroom: it is 4 GETs, one per table,
+# each bounded by the client's 30 s timeout (db.py) — at most 120 s of the 600.
+# That ceiling holds on a broken Supabase too: a probe failure does not end the
+# pass (a blip on one table must not hide drift on another), so the worst case
+# stays those same 4 probes, on a run where the cycle would achieve nothing
+# anyway. The per-column narrowing pass fires only on real drift, on a run that
+# is already halting or warning, and costs at worst roughly one extra GET per
+# column of the drifted table, so it cannot blow a healthy run's fanout or
+# timeout budget.
 # + 180 s  shutdown       one in-flight PATCH (30 s, db.py) + the run_summaries
 #                         insert and both prunes (30 s each), plus margin
 # = 900 s  the whole job

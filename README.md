@@ -171,12 +171,13 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
     `::warning::` and the cycle runs normally — drift the backend survives must never
     pause cancellation monitoring, even when it breaks the iOS app.
   - A probe that fails for any other reason (5xx, 429, timeout, an unrecognized error
-    code) is treated as a Supabase blip: it ends the pass, prints a `::warning::` and
-    the cycle runs. Only a positively-identified missing object can stop a run — but a
-    blip does not *un*-confirm one. Drift the pass already proved missing still counts,
-    so a halting column confirmed before the blip stops the run anyway, with the
-    annotation saying the listed set may be incomplete. A cut-short pass that confirmed
-    nothing halting always continues.
+    code) is treated as a Supabase blip: it is recorded against its own table, the
+    remaining tables are still probed, and if nothing halting was confirmed the run
+    prints a `::warning::` and the cycle runs. Only a positively-identified missing
+    object can stop a run — but a blip neither *un*-confirms one nor hides one on
+    another table. Whatever the pass did prove missing still counts, so a halting
+    column stops the run even when other probes blipped, with the annotation naming
+    the tables it could not classify so the listed set is not read as complete.
 
 ## Local development
 

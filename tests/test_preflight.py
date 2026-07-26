@@ -54,8 +54,8 @@ def error_db(exc: BaseException):
 
 def _halt_then_blip(call):
     """PostgREST for a live database genuinely missing `consecutive_not_found`
-    (incident 1's shape), behind a Supabase that starts blipping on the very
-    next table — so the pass confirms a HALT column and is then cut short."""
+    (incident 1's shape), behind a Supabase that blips on every other table — so
+    the pass confirms a HALT column and can vouch for nothing else."""
     if call[0] != "select":
         return None
     if call[1] == "watches":
@@ -90,7 +90,7 @@ def run_preflight(db):
 # --- clean -----------------------------------------------------------------
 
 def test_preflight_clean():
-    assert preflight.check_schema(schema_db()) == ([], None)
+    assert preflight.check_schema(schema_db()) == ([], ())
 
     db = schema_db()
     lines, code = run_preflight(db)
@@ -110,7 +110,7 @@ def test_preflight_detects_missing_column():
     db = schema_db({"watches": {"provider", "provider_ref"}}, report_first="provider")
 
     drifts, incomplete = preflight.check_schema(db)
-    assert incomplete is None
+    assert incomplete == ()
     assert {d.label for d in drifts} == {"watches.provider", "watches.provider_ref"}
     assert {d.severity for d in drifts} == {preflight.WARN}
 
@@ -181,7 +181,10 @@ def test_preflight_transient_does_not_hard_fail(exc):
     db = error_db(exc)
     drifts, incomplete = preflight.check_schema(db)
     assert drifts == [], "a blip proves nothing missing"
-    assert incomplete, "...but it does mean the pass could not finish"
+    # ...but every table it could not classify is recorded, and all of them are
+    # still probed: one failure never short-circuits the rest of the manifest.
+    assert len(incomplete) == len(preflight.REQUIRED)
+    assert [c[1] for c in db.calls_of("select")] == list(preflight.REQUIRED)
 
     lines, code = run_preflight(db)
     assert code is None
@@ -209,12 +212,12 @@ def test_preflight_transient_during_narrowing_still_halts_on_confirmed_drift():
     (line,) = lines
     assert line.startswith("::error::")
     assert "watches.status" in line
-    assert "did not finish" in line
+    assert "could not be classified" in line
 
 
 def test_preflight_confirmed_halt_survives_a_later_table_blip():
     """The cross-table case: `watches` is genuinely missing a monitor-written
-    column and the *next* table's probe blips. The `device_tokens` 503 says
+    column and every later table's probe blips. The `device_tokens` 503 says
     nothing about the `watches` column already proven absent, so the run halts."""
     lines, code = run_preflight(FakeDB(fail_on=_halt_then_blip))
     assert code == 1, "a Supabase blip must never discard a confirmed halting drift"
@@ -222,7 +225,36 @@ def test_preflight_confirmed_halt_survives_a_later_table_blip():
     assert line.startswith("::error::")
     assert "watches.consecutive_not_found" in line
     assert "supabase/migrations/0001_watches_consecutive_not_found.sql" in line
-    assert "did not finish" in line, "the operator must know more may be missing"
+    assert "could not be classified" in line, "the operator must know more may be missing"
+    assert "device_tokens" in line, "the tables that blipped are named"
+
+
+def test_preflight_early_blip_does_not_suppress_a_later_tables_drift():
+    """The mirror of the case above: the *first* table probed blips while a later
+    one is genuinely missing a monitor-written column. Tables are independent
+    assertions, so the pass keeps going and `sent_alerts.watch_id` is still
+    confirmed and still halts — a blip must not blind the guard, only shorten
+    what it can vouch for."""
+    def fail_on(call):
+        if call[0] != "select":
+            return None
+        if call[1] == "watches":
+            return postgrest_error(503, "unavailable")
+        if call[1] == "sent_alerts" and "watch_id" in call[2]["select"].split(","):
+            return postgrest_error(400, "column sent_alerts.watch_id does not exist")
+        return None
+
+    db = FakeDB(fail_on=fail_on)
+    lines, code = run_preflight(db)
+    assert code == 1, "a blip on the first table must not suppress drift on a later one"
+    (line,) = lines
+    assert line.startswith("::error::")
+    assert "sent_alerts.watch_id" in line
+    assert "could not be classified" in line and "watches" in line
+
+    probed = [c[1] for c in db.calls_of("select")]
+    assert probed[0] == "watches" and "sent_alerts" in probed
+    assert set(probed) == set(preflight.REQUIRED), "every table is probed, blip or not"
 
 
 def test_preflight_confirmed_warn_plus_blip_still_continues():
@@ -243,7 +275,7 @@ def test_preflight_confirmed_warn_plus_blip_still_continues():
     assert code is None
     (line,) = lines
     assert line.startswith("::warning::")
-    assert "watches.provider" in line and "did not finish" in line
+    assert "watches.provider" in line and "could not be classified" in line
 
 
 def test_preflight_unreproduced_42703_is_inconclusive_not_clean():
