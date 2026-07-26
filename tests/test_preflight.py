@@ -52,6 +52,19 @@ def error_db(exc: BaseException):
     return FakeDB(fail_on=lambda call: exc if call[0] == "select" else None)
 
 
+def _halt_then_blip(call):
+    """PostgREST for a live database genuinely missing `consecutive_not_found`
+    (incident 1's shape), behind a Supabase that starts blipping on the very
+    next table — so the pass confirms a HALT column and is then cut short."""
+    if call[0] != "select":
+        return None
+    if call[1] == "watches":
+        if "consecutive_not_found" in call[2]["select"].split(","):
+            return postgrest_error(400, "column watches.consecutive_not_found does not exist")
+        return None
+    return postgrest_error(503, "unavailable")
+
+
 def http_error(status: int, code: str = "PGRST100", message: str = "unrecognized"):
     """A PostgREST rejection carrying a code the guard must not read as drift."""
     request = httpx.Request("GET", "https://project.supabase.invalid/rest/v1/watches")
@@ -77,7 +90,7 @@ def run_preflight(db):
 # --- clean -----------------------------------------------------------------
 
 def test_preflight_clean():
-    assert preflight.check_schema(schema_db()) == []
+    assert preflight.check_schema(schema_db()) == ([], None)
 
     db = schema_db()
     lines, code = run_preflight(db)
@@ -96,7 +109,8 @@ def test_preflight_clean():
 def test_preflight_detects_missing_column():
     db = schema_db({"watches": {"provider", "provider_ref"}}, report_first="provider")
 
-    drifts = preflight.check_schema(db)
+    drifts, incomplete = preflight.check_schema(db)
+    assert incomplete is None
     assert {d.label for d in drifts} == {"watches.provider", "watches.provider_ref"}
     assert {d.severity for d in drifts} == {preflight.WARN}
 
@@ -149,7 +163,7 @@ def test_preflight_mixed_severity_halts():
     assert "supabase/migrations/0002_watches_provider.sql" in line
 
 
-# --- transient: a Supabase blip never stops the cycle -----------------------
+# --- transient: a blip alone never stops the cycle, and never un-confirms ----
 
 @pytest.mark.parametrize(
     "exc",
@@ -165,8 +179,9 @@ def test_preflight_mixed_severity_halts():
 )
 def test_preflight_transient_does_not_hard_fail(exc):
     db = error_db(exc)
-    with pytest.raises(preflight.TransientProbeFailure):
-        preflight.check_schema(db)
+    drifts, incomplete = preflight.check_schema(db)
+    assert drifts == [], "a blip proves nothing missing"
+    assert incomplete, "...but it does mean the pass could not finish"
 
     lines, code = run_preflight(db)
     assert code is None
@@ -174,22 +189,81 @@ def test_preflight_transient_does_not_hard_fail(exc):
     assert line.startswith("::warning::") and "inconclusive" in line
 
 
-def test_preflight_transient_during_narrowing_does_not_hard_fail():
-    """An incomplete enumeration cannot be classified in either direction, so
-    the guard fails open rather than halting on a set it could not finish."""
-    seen: list[str] = []
-
+def test_preflight_transient_during_narrowing_still_halts_on_confirmed_drift():
+    """A blip cannot un-confirm a column already proven missing. The narrowing
+    pass identifies `watches.status` — monitor-written, HALT — and only then hits
+    a 503: the enumeration is incomplete, but the HALT verdict is monotone, so
+    the run stops rather than walking into the write-time 400 the guard exists
+    to prevent. The annotation says the listed set may be short."""
     def fail_on(call):
         if call[0] != "select" or call[1] != "watches":
             return None
-        seen.append(call[2]["select"])
-        if len(seen) == 1:
+        # The combined probe, then the per-column pass: `status` is confirmed
+        # missing, everything probed after it is answered with a blip.
+        if call[2]["select"] in (",".join(preflight.REQUIRED["watches"]), "status"):
             return postgrest_error(400, "column watches.status does not exist")
         return postgrest_error(503, "unavailable")
 
     lines, code = run_preflight(FakeDB(fail_on=fail_on))
+    assert code == 1
+    (line,) = lines
+    assert line.startswith("::error::")
+    assert "watches.status" in line
+    assert "did not finish" in line
+
+
+def test_preflight_confirmed_halt_survives_a_later_table_blip():
+    """The cross-table case: `watches` is genuinely missing a monitor-written
+    column and the *next* table's probe blips. The `device_tokens` 503 says
+    nothing about the `watches` column already proven absent, so the run halts."""
+    lines, code = run_preflight(FakeDB(fail_on=_halt_then_blip))
+    assert code == 1, "a Supabase blip must never discard a confirmed halting drift"
+    (line,) = lines
+    assert line.startswith("::error::")
+    assert "watches.consecutive_not_found" in line
+    assert "supabase/migrations/0001_watches_consecutive_not_found.sql" in line
+    assert "did not finish" in line, "the operator must know more may be missing"
+
+
+def test_preflight_confirmed_warn_plus_blip_still_continues():
+    """The other side of the narrowed rule: an incomplete set cannot be called
+    *tolerable* with confidence, but the plan's fail-open decision governs where
+    nothing halting was confirmed — monitoring continues."""
+    def fail_on(call):
+        if call[0] != "select":
+            return None
+        if call[1] == "watches":
+            requested = call[2]["select"].split(",")
+            if "provider" in requested:
+                return postgrest_error(400, "column watches.provider does not exist")
+            return None
+        return postgrest_error(503, "unavailable")
+
+    lines, code = run_preflight(FakeDB(fail_on=fail_on))
     assert code is None
-    assert lines[0].startswith("::warning::") and "inconclusive" in lines[0]
+    (line,) = lines
+    assert line.startswith("::warning::")
+    assert "watches.provider" in line and "did not finish" in line
+
+
+def test_preflight_unreproduced_42703_is_inconclusive_not_clean():
+    """A table that rejects the combined probe but answers every single-column
+    probe contradicts itself (a column dropped and re-added between the two, or
+    a `42703` raised for something other than a select-list column). That is the
+    one path that used to exit silently as schema-clean; it must warn instead."""
+    def fail_on(call):
+        if call[0] == "select" and call[1] == "watches" and "," in call[2]["select"]:
+            return postgrest_error(400, "column watches.status does not exist")
+        return None
+
+    db = FakeDB(fail_on=fail_on)
+    drifts, incomplete = preflight.check_schema(db)
+    assert drifts == [] and incomplete
+
+    lines, code = run_preflight(db)
+    assert code is None, "an unreproduced code proves nothing missing; keep monitoring"
+    (line,) = lines
+    assert line.startswith("::warning::") and "inconclusive" in line
 
 
 # --- invariants -------------------------------------------------------------
@@ -206,15 +280,18 @@ def test_preflight_performs_no_writes():
 
 def test_preflight_message_is_publishable():
     halt = preflight.drift_message(
-        preflight.check_schema(schema_db({"watches": {"status", "provider"}}))
+        preflight.check_schema(schema_db({"watches": {"status", "provider"}})).drifts
     )
     warn = preflight.drift_message(
-        preflight.check_schema(schema_db({"watches": {"provider", "provider_ref"}}))
+        preflight.check_schema(schema_db({"watches": {"provider", "provider_ref"}})).drifts
     )
     transient, _ = run_preflight(error_db(postgrest_error(503, "boom")))
+    # The cut-short renderings too: they splice a probe-failure detail into a
+    # message that is otherwise pure manifest identifiers.
+    cut_short, _ = run_preflight(FakeDB(fail_on=_halt_then_blip))
 
     known = {f"{t}.{c}" for t, cols in preflight.REQUIRED.items() for c in cols}
-    for message in (halt, warn, *transient):
+    for message in (halt, warn, *transient, *cut_short):
         assert FAKE_SERVICE_KEY not in message
         assert "Bearer" not in message and "apikey" not in message
         assert "supabase.invalid" not in message  # no request URL, no project ref

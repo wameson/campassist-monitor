@@ -28,8 +28,18 @@ Severity decides what a confirmed drift does, and the rule is the two incidents:
 halt when the drift would break the monitor itself (incident 1), warn and keep
 monitoring when the monitor provably survives it (incident 2). Anything that is
 not a positively-identified missing object — 5xx, 429, timeout, transport error,
-a 4xx with a code we do not recognize — is a transient probe failure that warns
-and proceeds, because a Supabase blip must never pause cancellation monitoring.
+a 4xx with a code we do not recognize — cuts the pass short rather than proving
+anything, because a Supabase blip must never pause cancellation monitoring.
+
+A cut-short pass does **not** discard what it already confirmed. A HALT verdict
+is monotone: further probing can only reveal more missing columns, never unmake
+one already proven absent, and a blip on `device_tokens` says nothing about a
+`watches` column the previous probe positively identified as gone. So the rule
+is narrower than "any transient fails open": a confirmed HALT halts even when
+the pass was cut short, and the message says the enumerated set may be
+incomplete. Fail-open governs everything else — a WARN-only confirmed set, or no
+confirmed drift at all — because an incomplete set cannot be classified as
+*tolerable* with confidence, and the next run re-checks 30 minutes later.
 """
 
 from __future__ import annotations
@@ -155,9 +165,35 @@ class Drift(NamedTuple):
         return f"{self.table}.{self.column}" if self.column else f"table {self.table}"
 
 
+class SchemaCheck(NamedTuple):
+    """One probe pass: every drift it positively confirmed, plus why it could not
+    finish (None when it ran to the end).
+
+    The two fields are independent on purpose. Confirmed drift survives a pass
+    that was cut short — that is what stops a blip from un-confirming a missing
+    column the monitor writes — while `incomplete` is what keeps a partial
+    enumeration from being read as *tolerable*.
+    """
+
+    drifts: list[Drift]
+    incomplete: str | None
+
+
 class TransientProbeFailure(Exception):
     """The probe could not reach a verdict — 5xx, 429, timeout, transport error,
-    or a 4xx whose code is not a schema code. Never a reason to stop the cycle."""
+    or a 4xx whose code is not a schema code. Never a reason on its own to stop
+    the cycle: it cuts the pass short, and only drift already confirmed decides
+    whether the run halts.
+
+    It therefore carries that drift (`confirmed`) rather than unwinding past it,
+    so a blip on one probe cannot erase a missing column an earlier probe had
+    already positively identified.
+    """
+
+    def __init__(self, detail: str, confirmed: list[Drift] | None = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.confirmed: list[Drift] = list(confirmed or [])
 
 
 def _postgrest_code(exc: BaseException) -> str | None:
@@ -213,8 +249,9 @@ def _narrow(db, table: str) -> list[Drift]:
     genuinely gone — incident 1, waved through. So each column is probed on its
     own and the table is judged on the complete set.
 
-    A transient failure anywhere in the pass aborts it: an incomplete set cannot
-    be classified in either direction, and fail-open is the rule for uncertainty.
+    A transient failure anywhere in the pass ends it, but the columns already
+    proven missing travel out on the exception: an incomplete set cannot be read
+    as *tolerable*, yet a HALT column it did enumerate stays confirmed.
     """
     missing: list[Drift] = []
     for column, (severity, migration) in REQUIRED[table].items():
@@ -227,33 +264,61 @@ def _narrow(db, table: str) -> list[Drift]:
                 continue
             if code in MISSING_RELATION_CODES:
                 return [Drift(table, None, _table_severity(table), None)]
-            raise TransientProbeFailure(_transient_detail(exc)) from exc
+            raise TransientProbeFailure(_transient_detail(exc), missing) from exc
     return missing
 
 
-def check_schema(db) -> list[Drift]:
-    """Probe the live schema and return every missing object, or [] when clean.
+def _unreproduced_detail(table: str) -> str:
+    """A `42703` no manifest column reproduces: the table rejected the combined
+    select list, then answered every single-column probe. The two answers
+    contradict each other (a column dropped and re-added between them, or a
+    `42703` raised for something other than a select-list column), so the pass
+    is inconclusive for that table rather than clean."""
+    return capped_line(
+        f"{table} rejected the column list with {MISSING_COLUMN_CODE}, no column reproduced it"
+    )
+
+
+def _check_table(db, table: str, columns) -> SchemaCheck:
+    """One table's verdict. Raises TransientProbeFailure when the probe could not
+    classify it, carrying whatever the narrowing pass had already confirmed."""
+    try:
+        _probe(db, table, columns)
+    except Exception as exc:
+        code = _schema_code(exc)
+        if code in MISSING_RELATION_CODES:
+            return SchemaCheck([Drift(table, None, _table_severity(table), None)], None)
+        if code != MISSING_COLUMN_CODE:
+            raise TransientProbeFailure(_transient_detail(exc)) from exc
+        missing = _narrow(db, table)
+        return SchemaCheck(missing, None if missing else _unreproduced_detail(table))
+    return SchemaCheck([], None)
+
+
+def check_schema(db) -> SchemaCheck:
+    """Probe the live schema: every missing object it confirmed, and why the pass
+    stopped early when it did.
 
     One combined `GET` per table on the healthy path (four total, zero writes).
     The per-column narrowing pass fires only on real drift — on a run that is
     already halting or warning — so it cannot inflate a healthy run's budget.
 
-    Raises TransientProbeFailure when any probe fails for a reason that is not a
-    positively-identified missing object; the caller warns and proceeds.
+    A probe failure that is not a positively-identified missing object ends the
+    pass and fills `incomplete`; the drift confirmed up to that point is returned
+    with it, never discarded, so the caller can still act on a HALT the pass had
+    already proven.
     """
     drifts: list[Drift] = []
+    incomplete: str | None = None
     for table, columns in REQUIRED.items():
         try:
-            _probe(db, table, columns)
-        except Exception as exc:
-            code = _schema_code(exc)
-            if code == MISSING_COLUMN_CODE:
-                drifts.extend(_narrow(db, table))
-            elif code in MISSING_RELATION_CODES:
-                drifts.append(Drift(table, None, _table_severity(table), None))
-            else:
-                raise TransientProbeFailure(_transient_detail(exc)) from exc
-    return drifts
+            checked = _check_table(db, table, columns)
+        except TransientProbeFailure as blip:
+            drifts.extend(blip.confirmed)
+            return SchemaCheck(drifts, incomplete or blip.detail)
+        drifts.extend(checked.drifts)
+        incomplete = incomplete or checked.incomplete
+    return SchemaCheck(drifts, incomplete)
 
 
 def _transient_detail(exc: BaseException) -> str:
@@ -284,11 +349,12 @@ def _remedy(drifts: list[Drift]) -> str:
     return f'Apply {listed} in the Supabase SQL editor (README "Database migrations")'
 
 
-def drift_message(drifts: list[Drift]) -> str:
+def drift_message(drifts: list[Drift], *, incomplete: str | None = None) -> str:
     """One GitHub Actions annotation naming every missing object and its remedy.
 
     Identifiers and migration filenames only — all of them already published in
-    `supabase/schema.sql`. No row data, no user-supplied values, no credentials.
+    `supabase/schema.sql`. No row data, no user-supplied values, no credentials;
+    `incomplete` carries only the short probe-failure detail.
     """
     halting = sorted(d.label for d in drifts if d.severity == HALT)
     missing = ", ".join(sorted(d.label for d in drifts))
@@ -296,16 +362,23 @@ def drift_message(drifts: list[Drift]) -> str:
         "If the migration is already applied, PostgREST may still be caching the "
         "old schema — run NOTIFY pgrst, 'reload schema'."
     )
+    cut_short = (
+        f"The probe pass did not finish ({incomplete}), so more objects may be "
+        "missing than are listed here. "
+        if incomplete
+        else ""
+    )
     if halting:
         return (
             f"::error::schema drift — {missing} missing from the live database. "
-            f"The monitor writes or requires {', '.join(halting)}. "
+            f"The monitor writes or requires {', '.join(halting)}. {cut_short}"
             f"{_remedy(drifts)}, then re-run. "
             f"No watches were polled this run. {cache_hint}"
         )
     return (
         f"::warning::schema drift — {missing} missing from the live database. "
-        f"The monitor tolerates this; the iOS app may not. {_remedy(drifts)}. "
+        f"The monitor tolerates this; the iOS app may not. {cut_short}"
+        f"{_remedy(drifts)}. "
         f"Monitoring continued normally this run. {cache_hint}"
     )
 
@@ -319,22 +392,23 @@ def preflight(db, *, emit=_print) -> None:
 
     Raises SystemExit(1) — before the cycle's first write and without entering
     run() — only for a positively-identified missing object the monitor writes
-    or reads as required. Drift the monitor provably tolerates, and every
-    transient probe failure, print a warning and return: halting on those would
-    turn the hours-long window between merging a migration and an operator
-    applying it into zero cancellation monitoring, inverting the blast radius of
-    the very drift this guard was built for.
+    or reads as required, including one confirmed by a pass a probe failure then
+    cut short: that verdict cannot be undone by a blip on a later probe, and
+    continuing walks into the write-time 400 this guard exists to stop. Drift the
+    monitor provably tolerates, and a cut-short pass that confirmed nothing
+    halting, print a warning and return: halting on those would turn the
+    hours-long window between merging a migration and an operator applying it
+    into zero cancellation monitoring, inverting the blast radius of the very
+    drift this guard was built for.
     """
-    try:
-        drifts = check_schema(db)
-    except TransientProbeFailure as exc:
+    checked = check_schema(db)
+    if checked.drifts:
+        emit(drift_message(checked.drifts, incomplete=checked.incomplete))
+        if any(d.severity == HALT for d in checked.drifts):
+            raise SystemExit(1)
+        return
+    if checked.incomplete:
         emit(
-            f"::warning::schema preflight inconclusive ({exc}) — proceeding with the cycle; "
-            "a transient probe failure never stops monitoring."
+            f"::warning::schema preflight inconclusive ({checked.incomplete}) — proceeding "
+            "with the cycle; a pass that confirmed no halting drift never stops monitoring."
         )
-        return
-    if not drifts:
-        return
-    emit(drift_message(drifts))
-    if any(d.severity == HALT for d in drifts):
-        raise SystemExit(1)
