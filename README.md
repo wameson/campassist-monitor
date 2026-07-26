@@ -65,15 +65,17 @@ takes no site preselect), not a per-site page.
 
 The availability body names no site, so a successful poll reads the park's
 resource catalog once per cycle (`/api/resourcelocation/resources`, keyless,
-~64 KB per park, cached in-process alongside two tiny vocabulary tables) to
-turn each `resourceId` into the label the park actually uses — an alert says
-"Site 42", not `-2147482979`. That catalog also carries the per-site detail the
-choose-sites work needs (the "ADA Only" flag, capacity, allowed equipment, and
-the electric/water hookup enum). It is cosmetic to the poll: a park whose
-catalog a cycle cannot read is still polled, hashed and alerted on, with the
-`resourceId` fallback and one reported line. Being cosmetic, it is also
-unretried — one paced attempt each, no backoff, so a dead catalog endpoint
-cannot spend the time budget the availability polls need.
+~64 KB per park, cached in-process — as are the two tiny vocabulary tables its
+enum indices decode through, two further paced GETs the first park of a cycle
+pays for and every later one reuses) to turn each `resourceId` into the label
+the park actually uses — an alert says "Site 42", not `-2147482979`. That
+catalog also carries the per-site detail the choose-sites work needs (the
+"ADA Only" flag, capacity, allowed equipment, and the electric/water hookup
+enum). It is cosmetic to the poll: a park whose catalog a cycle cannot read is
+still polled, hashed and alerted on, with the `resourceId` fallback and one
+reported line. Being cosmetic, it is also unretried — one paced attempt each,
+no backoff, so a dead catalog endpoint cannot spend the time budget the
+availability polls need.
 
 **Request posture at this host: keyless GET, plus one read-only pricing POST;
 still never drive a browser.** The SPA is Azure-WAF captcha-gated and `/api/*`

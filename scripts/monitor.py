@@ -7,8 +7,8 @@ or with persistently-404ing campgrounds → dedupe the poll plan across all user
 → poll each provider politely (one browser UA per run, shuffled order, 1.2–2.8 s
 gaps, exponential backoff, all under a per-cycle time budget) → delta-detect
 per watch via state_hash → APNs alert
-with (site, date) dedup + 6 h cooldown → batched last_checked_at write → one
-run_summaries row → 30-day retention pruning.
+with (campsite id, date) dedup + 6 h cooldown → batched last_checked_at write
+→ one run_summaries row → 30-day retention pruning.
 
 Everything site-specific — the request host, the parsing, the normalization to
 the shared availability shape, the booking link — lives behind the `Provider`
@@ -239,7 +239,12 @@ def available_sites(current: dict[str, dict]) -> list[dict]:
 def filter_unalerted(
     db, watch: dict, openings: list[dict], now: datetime, cooldown_hours: int = ALERT_COOLDOWN_HOURS
 ) -> list[dict]:
-    """Drop openings whose (site, date) was alerted within the cooldown."""
+    """Drop openings whose (campsite_id, date) was alerted within the cooldown.
+
+    Keyed on `campsite_id`, never the `site` label: a provider may render the
+    same campsite under a different label from one cycle to the next (a
+    going_to_camp catalog fetch that fails falls back to the resourceId), and
+    dedup that moved with the label would re-push an opening already sent."""
     if not openings:
         return []
     rows = db.select("sent_alerts", {"watch_id": f"eq.{watch['id']}"})

@@ -105,7 +105,7 @@ SERVICE_TYPE_DEF = -32768  # the hookup enum, decoded below
 #
 # These are enum indices of one known definition, so they are read directly —
 # unlike a Yes/No attribute, whose index says nothing without the vocabulary
-# (0 is "Yes" on ADA Only and "Not Available" on Site Shade). The same test
+# (0 is "Yes" on ADA Only and "Not Available" on Pad Location). The same test
 # holds these values to the captured vocabulary, so the shortcut cannot drift
 # silently either.
 ELECTRIC_SERVICE_TYPES = frozenset({5, 6, 7})
@@ -113,7 +113,7 @@ WATER_SERVICE_TYPES = frozenset({6, 7})
 
 # The Yes/No labels of a boolean-shaped enum, read off the vocabulary rather
 # than cast from the index: enum 0 is "Yes" on ADA Only and "Not Available" on
-# Site Shade, so the index alone means nothing.
+# Pad Location, so the index alone means nothing.
 ENUM_YES = "Yes"
 ENUM_NO = "No"
 
@@ -617,7 +617,7 @@ def _yes_no(vocabulary: Vocabulary, definition_id: int, defined) -> bool | None:
     """A Yes/No attribute as a bool, resolved through the vocabulary.
 
     The index is never cast: enum 0 reads "Yes" on ADA Only and "Not Available"
-    on Site Shade, so a definition this build could not fetch a vocabulary for
+    on Pad Location, so a definition this build could not fetch a vocabulary for
     answers None — unknown — and not False."""
     value = _enum_value(defined, definition_id)
     if value is None:
