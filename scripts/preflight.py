@@ -144,13 +144,14 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          path, which errors those watches once and leaves every
 #                          recreation_gov watch — i.e. every watch at all, since
 #                          `provider` is missing along with it — polled normally.
-#   watches.include_ada_only  not read or written by the monitor today — the ADA-Only
-#                          exclusion it will gate is deliberately not wired into any
-#                          `extract_relevant` yet, so an absent column is invisible to
-#                          the cycle. It stays WARN only while that read is
-#                          `watch.get("include_ada_only")` with a default, so an absent
-#                          column reads as the same value a migrated row carries. A read
-#                          that ever subscripts it belongs in the HALT set instead.
+#   watches.include_ada_only  `bool(watch.get("include_ada_only"))` in going_to_camp's
+#                          `extract_relevant`, the one place the ADA-Only exclusion is
+#                          gated (recreation_gov never reads it). An absent column reads
+#                          `false`, which is exactly what a migrated row carries by
+#                          default, so an unmigrated live DB keeps monitoring and keeps
+#                          excluding — never halts, never suppresses differently. It
+#                          stays WARN only while that read is `.get` with a default; a
+#                          read that ever subscripts it belongs in the HALT set instead.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read

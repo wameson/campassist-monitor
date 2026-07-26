@@ -87,6 +87,7 @@ from providers.going_to_camp import (
     ADA_ONLY_DEF,
     ATTRIBUTES_URL,
     AVAILABILITY_URL,
+    AVAILABLE,
     BOOKING_URL,
     ELECTRIC_SERVICE_TYPES,
     EMPTY_VOCABULARY,
@@ -239,7 +240,12 @@ def test_the_requested_range_is_clamped_to_the_horizon_not_just_gated_by_it():
 
 
 def test_a_watch_straddling_the_horizon_is_served_on_its_in_horizon_nights():
-    watch = make_gtc_watch(start_date="2027-07-30", end_date="2029-01-01")
+    # opted in to the ADA-only sites so the boundary is what is under test:
+    # -2147483029's only in-range open night IS the horizon night, which makes
+    # it the sharpest evidence here, and the exclusion would otherwise drop it
+    watch = make_gtc_watch(
+        start_date="2027-07-30", end_date="2029-01-01", include_ada_only=True
+    )
     [key] = GTC.poll_plan(watch, TODAY)
     # a body one night LONGER than the clamped range: if the request overshot
     # the horizon by a day, that fourth (open) night would show up below in
@@ -820,6 +826,127 @@ def test_the_catalog_and_vocabulary_are_read_once_per_process():
 
     for url in (RESOURCES_URL, ATTRIBUTES_URL, EQUIPMENT_URL):
         assert len([r for r in http.requests if r["url"] == url]) == 1, url
+
+
+# --- the ADA-Only exclusion -----------------------------------------------
+#
+# The captured catalog marks resource -2147483029 ("84") ADA Only = Yes. Its
+# only open night in the captured availability body is the third one, 8/16 —
+# the check-out day of the stay every test above uses, and therefore not an
+# opening at all — so these tests watch one night longer, to 8/17, which makes
+# that night a real opening for the filter to have something to drop.
+
+ADA_STAY = dict(start_date="2026-08-14", end_date="2026-08-17")
+ADA_POLL_KEY = (
+    "gtc_-2147483647", (RESOURCE_LOCATION_ID, ROOT_MAP_ID, "2026-08-14", "2026-08-17")
+)
+ADA_ONLY_ID = "-2147483029"
+
+
+def ada_stay_availability(http=None):
+    """The captured park polled over the ADA stay, as the cycle hands it to
+    `extract_relevant`."""
+    if http is None:
+        http = FakeGTCHTTP(park_responder())
+    return {ADA_POLL_KEY: GTC.poll(http, ADA_POLL_KEY, "UA", sleep=lambda s: None)}
+
+
+def test_an_ada_only_site_is_not_an_opening_for_a_watch_that_did_not_ask():
+    availability = ada_stay_availability()
+    # the platform published the flag, so the poll carries it through
+    assert availability[ADA_POLL_KEY][ADA_ONLY_ID]["ada_only"] is True
+    assert availability[ADA_POLL_KEY][ADA_ONLY_ID]["availabilities"]["2026-08-16"] is True
+
+    watch = make_gtc_watch(**ADA_STAY)
+    # the column is absent from this watch entirely — a live DB that has not
+    # had 0003 applied — and reads as the same `false` a migrated row carries
+    assert "include_ada_only" not in watch
+
+    current = GTC.extract_relevant(availability, watch, TODAY)
+
+    assert ADA_ONLY_ID not in current
+    # and nothing else is dropped: "6" is ADA Only = No, "13" carries no
+    # ADA Only attribute at all, and both are still openings
+    assert set(current) == {"-2147483027", "-2147483025"}
+    # an explicit false reads identically to the absent column
+    assert GTC.extract_relevant(
+        availability, make_gtc_watch(include_ada_only=False, **ADA_STAY), TODAY
+    ) == current
+
+
+def test_the_same_site_is_an_opening_for_a_watch_that_opted_in():
+    availability = ada_stay_availability()
+
+    current = GTC.extract_relevant(
+        availability, make_gtc_watch(include_ada_only=True, **ADA_STAY), TODAY
+    )
+
+    assert current[ADA_ONLY_ID] == {
+        "campsite_id": ADA_ONLY_ID,
+        "site": "84",  # the catalog's own label, as for every other site
+        "dates": ["2026-08-16"],
+    }
+    assert set(current) == {ADA_ONLY_ID, "-2147483027", "-2147483025"}
+
+
+def test_a_watch_that_named_an_ada_only_site_still_matches_it():
+    # The exclusion exists to keep an undirected watch quiet, not to overrule a
+    # deliberate choice: a watch whose site_ids names this resource alerts on
+    # it with the opt-in off, which is what proves the filter runs after the
+    # wanted match rather than in front of it.
+    availability = ada_stay_availability()
+    watch = make_gtc_watch(site_ids=[ADA_ONLY_ID], **ADA_STAY)
+    assert "include_ada_only" not in watch
+
+    current = GTC.extract_relevant(availability, watch, TODAY)
+
+    assert set(current) == {ADA_ONLY_ID}
+    assert current[ADA_ONLY_ID]["dates"] == ["2026-08-16"]
+
+
+def test_metadata_this_cycle_cannot_read_excludes_nothing():
+    # Fail open in both halves of the decode. A suppressed opening is invisible
+    # to the user — nothing tells them the catalog 500'd — while a surplus one
+    # is only the noise the monitor already makes today, so an unreadable
+    # catalog (or an unreadable vocabulary, which leaves the Yes/No enum
+    # undecodable) filters nothing at all.
+    for responses in (
+        {RESOURCES_URL: FakeResponse(500)},
+        {ATTRIBUTES_URL: FakeResponse(503)},
+    ):
+        clear_metadata_cache()
+        http = FakeGTCHTTP(park_responder(), responses=responses)
+        availability = ada_stay_availability(http)
+
+        assert "ada_only" not in availability[ADA_POLL_KEY][ADA_ONLY_ID], responses
+        current = GTC.extract_relevant(availability, make_gtc_watch(**ADA_STAY), TODAY)
+        assert ADA_ONLY_ID in current, responses
+
+
+def test_an_ada_only_site_opening_and_closing_never_churns_the_state_hash():
+    # The exclusion runs before the caller hashes this shape, so an ADA-only
+    # site going bookable and back is not a delta for an undirected watch: no
+    # phantom `watches` PATCH, no `sent_alerts` row, no push with nothing in it.
+    excluded, opted_in = [], []
+    for availability_enum in (AVAILABLE, 1):  # bookable, then taken
+        clear_metadata_cache()
+        body = load_fixture("gtc_child_map_daily")
+        body["resourceAvailabilities"][ADA_ONLY_ID][2]["availability"] = availability_enum
+        availability = ada_stay_availability(
+            FakeGTCHTTP(park_responder(child=FakeResponse(200, body)))
+        )
+        for hashes, watch in (
+            (excluded, make_gtc_watch(**ADA_STAY)),
+            (opted_in, make_gtc_watch(include_ada_only=True, **ADA_STAY)),
+        ):
+            hashes.append(
+                monitor.state_hash(GTC.extract_relevant(availability, watch, TODAY))
+            )
+
+    assert excluded[0] == excluded[1]
+    # the watch that asked for these sites still sees the change, so the
+    # stability above is the exclusion and not a hash that ignores the site
+    assert opted_in[0] != opted_in[1]
 
 
 # --- per-night price ------------------------------------------------------
