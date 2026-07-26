@@ -71,7 +71,9 @@ turn each `resourceId` into the label the park actually uses — an alert says
 choose-sites work needs (the "ADA Only" flag, capacity, allowed equipment, and
 the electric/water hookup enum). It is cosmetic to the poll: a park whose
 catalog a cycle cannot read is still polled, hashed and alerted on, with the
-`resourceId` fallback and one reported line.
+`resourceId` fallback and one reported line. Being cosmetic, it is also
+unretried — one paced attempt each, no backoff, so a dead catalog endpoint
+cannot spend the time budget the availability polls need.
 
 **Request posture at this host: keyless GET, plus one read-only pricing POST;
 still never drive a browser.** The SPA is Azure-WAF captcha-gated and `/api/*`
@@ -181,7 +183,10 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   reserved for campers with disabilities. The column, its migration and its
   manifest entry ship ahead of the filter that will read it, so the apply can
   happen before any client writes the column; nothing in the cycle reads it
-  today, which is why it is classified `warn`.
+  today, which is why it is classified `warn`. Note the default is a deliberate
+  behaviour change, not a status quo: the monitor alerts on ADA-only sites
+  today, so once the filter lands every pre-existing watch stops being alerted
+  about them unless its owner opts back in. There is no backfill.
 - **The monitor checks before it runs.** Each run starts with a read-only schema
   preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
   data, before the start jitter. It never applies anything — the by-hand posture above

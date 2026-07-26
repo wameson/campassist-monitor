@@ -62,7 +62,6 @@ import json
 import random
 from datetime import date, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -73,6 +72,7 @@ from helpers import (
     FakeDB,
     FakeGTCHTTP,
     FakeResponse,
+    load_fixture,
     make_gtc_watch,
     make_watch,
 )
@@ -115,7 +115,6 @@ TODAY = NOW.date()  # 2026-08-01
 QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 
 GTC = GoingToCampProvider()
-FIXTURES = Path(__file__).parent / "fixtures"
 
 ROOT_MAP_ID = -2147483396
 RESOURCE_LOCATION_ID = -2147483647
@@ -127,10 +126,6 @@ CHILD_MAP_IDS = [NESTING_CHILD_MAP_ID, -2147483638, -2147483465, DAILY_CHILD_MAP
 # The stay make_gtc_watch describes: nights 8/14 and 8/15, check-out 8/16.
 START, END = date(2026, 8, 14), date(2026, 8, 16)
 POLL_KEY = ("gtc_-2147483647", (RESOURCE_LOCATION_ID, ROOT_MAP_ID, "2026-08-14", "2026-08-16"))
-
-
-def load_fixture(name):
-    return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
 def map_requests(http):
@@ -583,6 +578,26 @@ def test_extract_relevant_narrows_to_site_ids_and_keeps_the_old_hash_on_failure(
     ) is None
 
 
+def test_site_ids_match_the_resource_id_and_never_the_display_label():
+    # The catalog label is display-only, and it reverts to the resourceId
+    # whenever the catalog fetch fails: matching on it would mean a labelled
+    # watch matched every site on a healthy cycle and none at all on a degraded
+    # one, suppressing openings with nothing the user could see. Only the stable
+    # identifier selects, which is what the per-site selection phase must store.
+    http = FakeGTCHTTP(park_responder())
+    availability = {POLL_KEY: GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)}
+    assert availability[POLL_KEY]["-2147483025"]["site"] == "13"  # the label is there
+
+    assert GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["13", "84"]), TODAY
+    ) == {}
+
+    narrowed = GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["-2147483025"]), TODAY
+    )
+    assert set(narrowed) == {"-2147483025"}
+
+
 # --- the park catalog: labels, ADA Only, capacity, equipment, hookups -----
 
 def catalog(vocabulary=None):
@@ -761,6 +776,9 @@ def test_a_catalog_this_cycle_cannot_read_never_fails_the_unit():
     assert parsed is not None
     assert parsed["-2147483029"]["site"] == "-2147483029"
     assert errors == ["gtc_-2147483647/2026-08-14 site metadata: HTTP 500"]
+    # and it cost exactly one request: a cosmetic read gets no retry, so a dead
+    # catalog endpoint cannot spend the budget the availability polls need
+    assert len([r for r in http.requests if r["url"] == RESOURCES_URL]) == 1
 
     # the same for a body it cannot recognize
     clear_metadata_cache()
@@ -771,6 +789,16 @@ def test_a_catalog_this_cycle_cannot_read_never_fails_the_unit():
     assert errors == [
         "gtc_-2147483647/2026-08-14 site metadata: unrecognized response body"
     ]
+
+    # a bare JSON `null` is a 200 that carries no body at all: it reports like
+    # every other unreadable shape rather than passing for a failed request and
+    # costing the operator the line
+    clear_metadata_cache()
+    http = FakeGTCHTTP(park_responder(), responses={RESOURCES_URL: FakeResponse(200, None)})
+    errors = []
+    parsed = GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None, errors=errors)
+    assert parsed["-2147483029"]["site"] == "-2147483029"
+    assert errors == ["gtc_-2147483647/2026-08-14 site metadata: unexpected response body"]
 
     # and a vocabulary it cannot read only costs the fields that decode through
     # it: the label needs none, so it still lands

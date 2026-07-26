@@ -11,8 +11,13 @@
 -- meaning of every existing watch the moment it was toggled.
 --
 -- Backfill-free: `DEFAULT false` fills every existing row as part of the
--- ALTER, which is the behaviour they already have, so there is no UPDATE to
--- run and nothing about an existing watch changes.
+-- ALTER, so there is no UPDATE to run. Be clear about what that means: the
+-- monitor alerts on ADA-only sites TODAY, so the effective behaviour of every
+-- existing watch is include_ada_only = true. This default is therefore a
+-- deliberate change of behaviour, applied uniformly to existing and new
+-- watches, and once the filter lands in the follow-on phase pre-existing
+-- watches WILL stop being alerted about ADA-only openings. The captain's
+-- decision is to accept that with no backfill.
 --
 -- Idempotent: `IF NOT EXISTS` makes this safe to re-run. Apply it BY HAND in
 -- the Supabase SQL editor, like every file here (see README "Database

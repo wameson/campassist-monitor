@@ -148,11 +148,9 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          exclusion it will gate is deliberately not wired into any
 #                          `extract_relevant` yet, so an absent column is invisible to
 #                          the cycle. It stays WARN only while that read is
-#                          `watch.get("include_ada_only")` with a default: the column is
-#                          the *permissive* setting (absent must read as "exclude", the
-#                          behaviour every watch already has), so a missing column
-#                          changes nothing a user can see. A read that ever subscripts
-#                          it belongs in the HALT set instead.
+#                          `watch.get("include_ada_only")` with a default, so an absent
+#                          column reads as the same value a migrated row carries. A read
+#                          that ever subscripts it belongs in the HALT set instead.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read

@@ -526,7 +526,9 @@ def apply_site_labels(
 # the real label ("84"), the platform's own "ADA Only" flag, capacity, and the
 # equipment the site takes. Its enum indices are meaningless on their own, so
 # they decode through two tiny vocabulary tables (ATTRIBUTES_URL, EQUIPMENT_URL)
-# fetched once per process.
+# fetched once per process. All three are paced but unretried (`_fetch_json`):
+# a cosmetic read that a retry-and-backoff could spend fifteen seconds on is a
+# read that starves the availability polls it is supposed to decorate.
 #
 # Everything here degrades to "the platform did not say" rather than to "no".
 # A field this build cannot read is None, never False: a later filter built on
@@ -754,8 +756,20 @@ def _fetch_json(
     budget_exhausted,
     post_body=None,
 ):
-    """One paced request to a URL constant in this module, with the same
-    backoff `fetch_map` uses, returning the decoded body or None.
+    """One paced request to a URL constant in this module, returning the
+    decoded body or None.
+
+    **One attempt, no backoff** — deliberately unlike the 2/4/8 s `fetch_map`
+    spends on availability. Everything read through here is cosmetic to the
+    poll, so a dead endpoint must not spend the cycle time the availability
+    polls need: a failure here fails open to no label rather than retrying into
+    the budget. Availability keeps its retries because a transient blip there
+    costs a real unit.
+
+    A 200 whose body is neither an object nor an array is a failure like any
+    other rather than a value: handing it back would make an unusable body
+    indistinguishable from a failed request, and cost the operator the one line
+    every other unreadable shape reports.
 
     `post_body` is what makes this the module's only non-GET: FEE_DETAILS_URL
     answers `405` to a GET and `415` without a JSON content type, so a price
@@ -767,30 +781,26 @@ def _fetch_json(
         failure = f"{label}: time budget exhausted"
     else:
         sleep(CHILD_MAP_DELAY_SECONDS)  # paced like the child-map recursion
-        for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
+        try:
+            if post_body is None:
+                resp = http.get(url, params=params, headers=headers)
+            else:
+                resp = http.post(url, params=params, headers=headers, json=post_body)
+            status = resp.status_code
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            status = None
+            failure = f"{label}: {exc!r}"
+        if status == 200:
             try:
-                if post_body is None:
-                    resp = http.get(url, params=params, headers=headers)
-                else:
-                    resp = http.post(url, params=params, headers=headers, json=post_body)
-                status = resp.status_code
-            except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                status = None
-                failure = f"{label}: {exc!r}"
-            if status == 200:
-                try:
-                    return resp.json()
-                except ValueError:
-                    failure = f"{label}: invalid JSON"
-                    break
-            if status is not None:
-                failure = f"{label}: HTTP {status}"
-                if not (status in RETRYABLE_STATUS or status >= 500):
-                    break
-            if attempt < len(BACKOFF_DELAYS_SECONDS):
-                if budget_exhausted():
-                    break
-                sleep(BACKOFF_DELAYS_SECONDS[attempt])
+                body = resp.json()
+            except ValueError:
+                failure = f"{label}: invalid JSON"
+            else:
+                if isinstance(body, (dict, list)):
+                    return body
+                failure = f"{label}: unexpected response body"
+        elif status is not None:
+            failure = f"{label}: HTTP {status}"
     if errors is not None:
         errors.append(capped_line(failure))
     return None
@@ -800,8 +810,8 @@ def _fetch_json(
 # one cycle: this is a per-cycle cache of park-scoped catalogs and a
 # park-independent vocabulary — never per-watch state, which the Provider
 # protocol forbids. A failed fetch is cached as "nothing known" so one broken
-# park cannot spend a retry-and-backoff on every poll unit that names it; the
-# next cycle is a new process and tries again.
+# park cannot spend a request on every poll unit that names it; the next cycle
+# is a new process and tries again.
 _VOCABULARY: Vocabulary | None = None
 _SITE_METADATA: dict[int, dict[str, SiteMetadata]] = {}
 
@@ -1038,7 +1048,15 @@ class GoingToCampProvider:
 
         current: dict[str, dict] = {}
         for resource_id, site in parsed.items():
-            if wanted and not ({resource_id, site["campsite_id"], site["site"]} & wanted):
+            # Matched on the stable identifiers alone. `site` carries the
+            # catalog label, which reverts to the resourceId whenever the
+            # catalog fetch fails, so a watch naming labels would match every
+            # site on a healthy cycle and none at all on a degraded one —
+            # openings suppressed with nothing the user can see. The label is
+            # for display; the resourceId is the identity, which is what the
+            # follow-on phase that enables per-site GoingToCamp selection has
+            # to persist in `site_ids`.
+            if wanted and not ({resource_id, site["campsite_id"]} & wanted):
                 continue
             open_dates = sorted(
                 d
