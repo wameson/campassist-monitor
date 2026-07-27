@@ -522,6 +522,14 @@ A summary INSERT that itself fails is the one unrepresentable case — there is 
 > (camp-assist PR #26). Do not re-tick, un-tick, or tidy these.** Items under **Validate** are
 > operator gates that only an operator closes — several are verified offline yet stay unticked
 > for that reason.
+>
+> One exception, recorded so a later reader knows why it differs from camp-assist's copy: the
+> **Phase 13a backend Build/Tests blocks and the single Phase 13c backend item** were
+> re-verified against *this* repo's code when the backend plan was split out here, and each
+> box ticked there carries the `file:line` (or shipping test name) that proves it — the same
+> evidence discipline camp-assist PR #26 used. Nothing else was re-ticked, and no `Validate`
+> box was touched. No lasting divergence is created: a follow-on task removes these backend
+> sections from camp-assist's `PLAN.md`, making this doc their only home.
 
 ### Phase 1 — Supabase + backend core
 
@@ -640,28 +648,30 @@ Placement rules and the fail-open contract are in
 [The ADA-Only exclusion](#the-ada-only-exclusion) above.
 
 **Build — backend:**
-- [ ] Park-metadata fetch in `scripts/providers/going_to_camp.py`: `GET https://{HOST}/api/resourcelocation/resources?resourceLocationId=<id>`, host from the module constant, id via `_identifier`, reusing `fetch_map`'s backoff shape so one flaky metadata call cannot fail a whole poll unit.
-- [ ] **One fetch per distinct park per cycle**, deduplicated within the cycle. **No persistent cache and no TTL** — the monitor is a `*/30` cron and every cycle is a fresh process, so there is nothing to carry over and nothing to go stale. On failure the cycle has no marker set: filter nothing, labels fall back to resourceIds. Do not introduce cross-process storage; the zero-new-writes property depends on its absence.
-- [ ] Resolve the `ADA Only` attribute id rather than trusting the magic negative int: read `-32759` back from `/api/attribute/filterable` by `displayName` and pin it in a fixture assertion, so a renumbering surfaces as a **test failure** rather than a filter that silently stops filtering.
-- [ ] `parse_map` tags each resource with `"ada_only": bool` and sets `"site"` to the real label from `localizedValues[].name`, replacing the resourceId fallback. Absent metadata ⇒ `ada_only = False` and the resourceId fallback — today's behavior exactly.
-- [ ] `extract_relevant` skips `ada_only` sites **after** the `wanted` site-id match and **before** `state_hash`, unless `bool(watch.get("include_ada_only"))`. Missing key reads `false`.
-- [ ] `scripts/providers/recreation_gov.py`: **no filtering**, with the decision cited in a comment at `extract_relevant` so the asymmetry is deliberate and documented.
-- [ ] `supabase/migrations/0003_watches_include_ada_only.sql` (idempotent, backfill-free) + the column in `supabase/schema.sql` + the `("include_ada_only", (WARN, "0003_…"))` entry in `preflight.REQUIRED`, with the tolerance citation. **Apply the migration by hand first, then merge the manifest entry.**
-- [ ] Charge the metadata GET against the existing pacing/time budget in the arithmetic comment, as Phase 12 did for its probes.
+- [x] Park-metadata fetch in `scripts/providers/going_to_camp.py`: `GET https://{HOST}/api/resourcelocation/resources?resourceLocationId=<id>`, host from the module constant, id via `_identifier`, and — unlike `fetch_map` — **one paced attempt with no backoff**, because the catalog is cosmetic and a dead endpoint must not spend the time budget the availability polls need (see the network-posture section above). A failure fails open to no labels rather than failing the poll unit. *(`going_to_camp.py:54` `RESOURCES_URL`, `:867-899` `site_metadata`, `:760-819` `_fetch_json`'s "one attempt, no backoff" contract, `:175` `_identifier`.)*
+- [x] **One fetch per distinct park per cycle**, deduplicated within the cycle. **No persistent cache and no TTL** — the monitor is a `*/30` cron and every cycle is a fresh process, so there is nothing to carry over and nothing to go stale. On failure the cycle has no marker set: filter nothing, labels fall back to resourceIds. Do not introduce cross-process storage; the zero-new-writes property depends on its absence. *(`going_to_camp.py:820-829` — two process-lifetime caches, a failed fetch cached as `{}`; `:885-899`.)*
+- [x] Resolve the `ADA Only` attribute id rather than trusting the magic negative int: read `-32759` back from `/api/attribute/filterable` by `displayName` and pin it in a fixture assertion, so a renumbering surfaces as a **test failure** rather than a filter that silently stops filtering. *(`going_to_camp.py:99` `ADA_ONLY_DEF`, `:675` resolved through `_yes_no(vocabulary, …)` never a cast; pinned by `test_the_pinned_attribute_ids_still_mean_what_this_build_says`.)*
+- [x] Each resource is tagged with `ada_only` and its `"site"` set to the real label from `localizedValues[].name`, replacing the resourceId fallback. Absent metadata ⇒ no `ada_only` key and the resourceId fallback — today's behavior exactly. *(Shipped in `apply_site_metadata` (`going_to_camp.py:491-536`) rather than in `parse_map` as predicted, which keeps the availability parse independent of the catalog; `:531-532` sets `ada_only` **only** where the platform published it, so absent reads unknown rather than `False`.)*
+- [x] `extract_relevant` skips `ada_only` sites **after** the `wanted` site-id match and **before** `state_hash`, unless `bool(watch.get("include_ada_only"))`. Missing key reads `false`. *(`going_to_camp.py:1071` and `:1099`.)*
+- [x] `scripts/providers/recreation_gov.py`: **no filtering**, with the decision cited in a comment at `extract_relevant` so the asymmetry is deliberate and documented. *(`recreation_gov.py:203-214`.)*
+- [x] `supabase/migrations/0003_watches_include_ada_only.sql` (idempotent, backfill-free) + the column in `supabase/schema.sql` + the `("include_ada_only", (WARN, "0003_…"))` entry in `preflight.REQUIRED`, with the tolerance citation. **Apply the migration by hand first, then merge the manifest entry.** *(`supabase/migrations/0003_watches_include_ada_only.sql:28`, `supabase/schema.sql:28`, `preflight.py:102` with the citation at `:148`.)*
+- [x] Charge the metadata GET against the existing pacing/time budget, as Phase 12 did for its probes. *(`going_to_camp.py:793-796` — `budget_exhausted()` short-circuits the request, and it is paced by the same `CHILD_MAP_DELAY_SECONDS` as the child-map recursion; accounted as "one keyless GET per park, per process" at `:53`.)*
 
-**Tests — backend (offline, captured fixtures):**
-- [ ] `test_gtc_ada_only_excluded` — a captured park with two ADA-only ids open in the window yields openings for neither on an **undirected** watch; the other 108 open sites are unaffected.
-- [ ] `test_gtc_ada_only_included_when_opted_in` — same fixture with `include_ada_only: true` yields both.
-- [ ] `test_gtc_explicit_site_selection_outranks_ada_filter` — a watch naming an ADA-only resource alerts on it **with the opt-in off**, proving the exclusion runs after the `wanted` match.
-- [ ] `test_gtc_ada_absent_attribute_does_not_filter` — attribute absent or unrecognized enum → stays bookable.
-- [ ] `test_gtc_metadata_fetch_failure_fails_open` — 500/timeout filters nothing, labels degrade to resourceIds, cycle completes normally.
-- [ ] `test_gtc_metadata_fetched_once_per_park_per_cycle` — two watches on the same park cost one metadata GET, and no state survives the process.
-- [ ] `test_gtc_ada_only_does_not_churn_state_hash` — an ADA-only site opening and closing leaves `state_hash` byte-identical on an undirected watch.
-- [ ] `test_gtc_ada_attribute_id_is_pinned` — `-32759` resolves to `displayName "ADA Only"`; a renumber fails here first.
-- [ ] `test_gtc_site_labels` — `site` is the human label; a resource missing from metadata falls back to the resourceId.
-- [ ] `test_recreation_gov_never_ada_filters` — an accessible rec.gov site is still alertable.
-- [ ] `test_preflight_manifest_matches_schema_sql` passes with the new column in both.
-- [ ] Write-budget and cycle-time suites unchanged — this phase adds no per-watch write.
+**Tests — backend (offline, captured fixtures).** Every ADA/metadata test below shipped under a
+different name than this plan predicted, so the shipping name is cited on each one; only the
+last two kept their predicted names:
+- [x] ADA-only sites are not openings for an **undirected** watch, and nothing else is dropped. *(`test_an_ada_only_site_is_not_an_opening_for_a_watch_that_did_not_ask` — the captured park marks one id ADA Only, not the two predicted, and it asserts the park's other open sites survive; it also covers the absent-column case, a live DB without `0003`, reading the same `false`.)*
+- [x] Same fixture with `include_ada_only: true` yields it. *(`test_the_same_site_is_an_opening_for_a_watch_that_opted_in`.)*
+- [x] A watch naming an ADA-only resource alerts on it **with the opt-in off**, proving the exclusion runs after the `wanted` match. *(`test_a_watch_that_named_an_ada_only_site_still_matches_it`.)*
+- [x] Attribute absent or unrecognized enum → stays bookable. *(`test_an_ada_only_site_is_not_an_opening_for_a_watch_that_did_not_ask` asserts a site carrying no `ADA Only` attribute is still an opening; `test_metadata_this_cycle_cannot_read_excludes_nothing` covers the undecodable enum via an unreadable vocabulary.)*
+- [x] A metadata fetch failure filters nothing, labels degrade to resourceIds, cycle completes normally. *(`test_metadata_this_cycle_cannot_read_excludes_nothing` and `test_a_catalog_this_cycle_cannot_read_never_fails_the_unit`.)*
+- [x] Two watches on the same park cost one metadata GET, and no state survives the process. *(`test_the_catalog_and_vocabulary_are_read_once_per_process`; `tests/conftest.py` clears the caches between tests.)*
+- [x] An ADA-only site opening and closing leaves `state_hash` byte-identical on an undirected watch. *(`test_an_ada_only_site_opening_and_closing_never_churns_the_state_hash`, which also asserts the opted-in watch *does* see the change.)*
+- [x] `-32759` resolves to `displayName "ADA Only"`; a renumber fails here first. *(`test_the_pinned_attribute_ids_still_mean_what_this_build_says`.)*
+- [x] `site` is the human label; a resource missing from metadata falls back to the resourceId. *(`test_the_label_replaces_the_resource_id_and_falls_back_when_it_cannot`.)*
+- [x] An accessible rec.gov site is still alertable. *(`test_recreation_gov_never_applies_the_ada_only_exclusion`, `tests/test_providers.py:131`.)*
+- [x] `test_preflight_manifest_matches_schema_sql` passes with the new column in both, and `test_include_ada_only_is_warn_and_carries_its_migration` pins the `WARN` classification to `0003`. *(`tests/test_preflight.py:396`.)*
+- [x] Write-budget and cycle-time suites unchanged — this phase adds no per-watch write; the catalog read is a `GET`. *(`test_write_budget`, `test_healthy_cycle_keeps_the_write_budget`.)*
 
 **Validate:**
 - [ ] Confirm `0002_watches_provider.sql` is applied to the live DB **before** anything here ships; then apply `0003` by hand and only then merge the manifest entry. The preflight reports the live column set — use it rather than guessing.
@@ -673,7 +683,7 @@ Placement rules and the fail-open contract are in
 The rest of 13c is iOS and lives in camp-assist's `PLAN.md`. Its one backend item, dispatched
 as its own `campassist-monitor` task (captain, 2026-07-26):
 
-- [ ] `going_to_camp.extract_relevant`'s `wanted` match already tests `{resource_id, campsite_id, site}`, and 13a made `site` the real label — confirm a watch written with `resourceId` values matches, and that alert copy reads "Site 42". The iOS half shipped independently, since the wizard writes the `resourceId` the backend already matches on and neither side's contract moved.
+- [x] `going_to_camp.extract_relevant`'s `wanted` match already tests `{resource_id, campsite_id, site}`, and 13a made `site` the real label — confirm a watch written with `resourceId` values matches, and that alert copy reads "Site 42". The iOS half shipped independently, since the wizard writes the `resourceId` the backend already matches on and neither side's contract moved. *(`test_a_watch_on_one_resource_id_alerts_on_that_site_under_its_label` — the id selects and `monitor.available_sites` carries the catalog label, while `alert_rows` stays keyed on the id; `test_site_ids_match_the_resource_id_and_never_the_display_label` proves the label never selects; `test_a_selection_still_matches_when_the_label_could_not_be_resolved` proves a degraded label never fails the match closed.)*
 
 ---
 
