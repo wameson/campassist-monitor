@@ -9,8 +9,10 @@ detects new openings via state hashes, and sends APNs push notifications with a
 direct booking link. Supabase (free tier) is the shared database; there is no
 server.
 
-See the CampAssist `PLAN.md` (Phase 1) for the full design: write budget,
-anti-blocking rules, and the recreation.gov API contract.
+See [`PLAN.md`](PLAN.md) in this repo for the full backend design: schema and
+migration rules, the monitor workflow, the poll/alert pipeline, the provider
+seam, and the backend phase checklists. The iOS/product plan lives in the
+`camp-assist` repo's `PLAN.md`.
 
 ## Layout
 
