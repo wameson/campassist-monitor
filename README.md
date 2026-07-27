@@ -68,12 +68,16 @@ resource catalog once per cycle (`/api/resourcelocation/resources`, keyless,
 ~64 KB per park, cached in-process — as are the two tiny vocabulary tables its
 enum indices decode through, two further paced GETs the first park of a cycle
 pays for and every later one reuses) to turn each `resourceId` into the label
-the park actually uses — an alert says "Site 42", not `-2147482979`. That
-catalog also carries the per-site detail the choose-sites work needs (capacity,
-allowed equipment, the electric/water hookup enum) and the platform's own
-"ADA Only" flag, which the exclusion below reads. It is cosmetic to the poll: a
-park whose catalog a cycle cannot read is still polled, hashed and alerted on,
-with the `resourceId` fallback and one reported line. Being cosmetic, it is
+the park actually uses — an opening carries "Site 42", not `-2147482979` (the
+push body itself is a count, so the label travels with the opening rather than
+appearing in the notification text). The label is display only: a watch that
+names sites is matched on the `resourceId`, which is what the client persists
+in `site_ids`. That catalog also carries the per-site detail the choose-sites
+work needs (capacity, allowed equipment, the electric/water hookup enum) and the
+platform's own "ADA Only" flag, which the exclusion below reads. It is cosmetic
+to the poll: a park whose catalog a cycle cannot read is still polled, hashed
+and alerted on — the selection still matches, only the display label falls back
+to the `resourceId` — with one reported line. Being cosmetic, it is
 also unretried — one paced attempt each, no backoff, so a dead catalog endpoint
 cannot spend the time budget the availability polls need.
 

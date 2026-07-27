@@ -1077,9 +1077,9 @@ class GoingToCampProvider:
             # catalog fetch fails, so a watch naming labels would match every
             # site on a healthy cycle and none at all on a degraded one —
             # openings suppressed with nothing the user can see. The label is
-            # for display; the resourceId is the identity, which is what the
-            # follow-on phase that enables per-site GoingToCamp selection has
-            # to persist in `site_ids`.
+            # for display; the resourceId is the identity, and it is the
+            # resourceId the client persists in `site_ids` for a per-site
+            # GoingToCamp watch while showing the label.
             if wanted and not ({resource_id, site["campsite_id"]} & wanted):
                 continue
             # "ADA Only" on this platform means only campers with disabilities
