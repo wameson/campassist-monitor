@@ -197,8 +197,9 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   Keep all three in sync — a CI test fails when the manifest and `schema.sql` disagree.
   **Order matters:** apply the migration by hand in the SQL editor **first**, and only
   then merge the manifest entry. A new monitor-written or read-required column is
-  classified `halt`, so merging it ahead of the apply would deliberately stop every
-  cycle until an operator got to the SQL editor.
+  classified `halt` unless its read or write is demonstrably tolerant of the column
+  being absent (the two bullets below), so merging it ahead of the apply would
+  deliberately stop every cycle until an operator got to the SQL editor.
 - **A column read with a default is still `warn`.** `watches.include_ada_only`
   (`0003_watches_include_ada_only.sql`) is the per-watch opt-in for sites
   reserved for campers with disabilities, read only as
@@ -312,8 +313,11 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   of sequential 30-second PATCHes against a struggling Supabase would blow
   the workflow's 15-minute timeout and kill the run before its summary row
   and pruning. For the same reason batches larger than `PER_ID_FALLBACK_MAX`
-  (50) skip the fan-out entirely, and the fan-out itself is capped twice: it
-  may spend `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of wall clock in total
+  (50) skip the fan-out entirely — as does a rejection a caller knows is
+  about the *payload* rather than any one row, which today is the missing
+  `error_reason` column alone (see Database migrations). The fan-out itself
+  is capped twice: it may spend
+  `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of wall clock in total
   across a cycle — every per-id write is charged when it returns, so however
   many batches fall back, the cycle's whole fan-out spend is that allowance
   plus the one PATCH still in flight when it runs out (30 s) — and it may
@@ -375,9 +379,9 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   The trade is an occasional missed re-alert instead of a repeating push.
 - **Errored-watch census:** every cycle reads how many watches are in
   `status='error'` with a trip that has not passed yet (one extra `select`, no
-  writes, so the write budget is
-  untouched) and reports the count on the world-readable `run_summaries.errors`
-  row, with a per-reason breakdown in the operator-only annotation. A watch that
+  writes, so the write budget is untouched) and reports the count on the
+  world-readable `run_summaries.errors` row, with a per-reason breakdown in the
+  operator-only annotation. A watch that
   has been errored is *absent*, not failing, so without this a run serving one
   watch of four looked exactly like a clean run serving all four — three of five
   watches once went unmonitored for two days across a wall of green runs. The
