@@ -645,12 +645,13 @@ def test_an_any_open_watch_is_untouched_by_the_selection_path():
     every_open = GTC.extract_relevant(availability, make_gtc_watch(), TODAY)
 
     assert set(every_open) == {"-2147483027", "-2147483025"}
-    # an empty list is the same undirected watch as a missing column, and a
-    # `site_ids` of its own must not make the whole park look selected
-    for site_ids in ([], None):
-        assert GTC.extract_relevant(
-            availability, make_gtc_watch(site_ids=site_ids), TODAY
-        ) == every_open
+
+    absent = make_gtc_watch()
+    del absent["site_ids"]  # the shape a row read without the column has
+    # an empty list, an explicit null and an absent column are all the same
+    # undirected watch: none of them may make the whole park look selected
+    for watch in (absent, make_gtc_watch(site_ids=None), make_gtc_watch(site_ids=[])):
+        assert GTC.extract_relevant(availability, watch, TODAY) == every_open
 
 
 def test_a_selection_still_matches_when_the_label_could_not_be_resolved():
