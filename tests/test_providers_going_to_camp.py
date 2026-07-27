@@ -604,6 +604,77 @@ def test_site_ids_match_the_resource_id_and_never_the_display_label():
     assert set(narrowed) == {"-2147483025"}
 
 
+# --- per-site selection: what the client persists vs. what the user reads --
+#
+# The app stores the stable `resource_id` in `site_ids` and shows the catalog
+# label. These three hold the two apart end to end: the id selects, the label
+# is what the alert says, and a cycle that could not read the label still
+# alerts (the id is what identifies a site, so a missing label never fails the
+# match closed).
+
+def test_a_watch_on_one_resource_id_alerts_on_that_site_under_its_label():
+    http = FakeGTCHTTP(park_responder())
+    availability = {POLL_KEY: GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)}
+
+    current = GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["-2147483027"]), TODAY
+    )
+
+    # only the named site, however many others the park has open
+    assert current == {
+        "-2147483027": {
+            "campsite_id": "-2147483027",
+            "site": "6",
+            "dates": ["2026-08-14", "2026-08-15"],
+        },
+    }
+    # and what the alert carries is the catalog's label, never the resourceId
+    openings = monitor.available_sites(current)
+    assert [o["site"] for o in openings] == ["6", "6"]
+    # while the dedup rows stay keyed on the id, which does not move with it
+    assert [r["site_id"] for r in monitor.alert_rows(make_gtc_watch(), openings, NOW)] == [
+        "-2147483027",
+        "-2147483027",
+    ]
+
+
+def test_an_any_open_watch_is_untouched_by_the_selection_path():
+    http = FakeGTCHTTP(park_responder())
+    availability = {POLL_KEY: GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)}
+
+    every_open = GTC.extract_relevant(availability, make_gtc_watch(), TODAY)
+
+    assert set(every_open) == {"-2147483027", "-2147483025"}
+    # an empty list is the same undirected watch as a missing column, and a
+    # `site_ids` of its own must not make the whole park look selected
+    for site_ids in ([], None):
+        assert GTC.extract_relevant(
+            availability, make_gtc_watch(site_ids=site_ids), TODAY
+        ) == every_open
+
+
+def test_a_selection_still_matches_when_the_label_could_not_be_resolved():
+    # The catalog is cosmetic (see `test_a_catalog_this_cycle_cannot_read_never
+    # _fails_the_unit`), so on a cycle that could not read it every `site`
+    # reverts to the resourceId. A selection matches anyway: it was persisted
+    # against the id, which is exactly why the label is not part of the match.
+    http = FakeGTCHTTP(park_responder(), responses={RESOURCES_URL: FakeResponse(500)})
+    availability = {POLL_KEY: GTC.poll(http, POLL_KEY, "UA", sleep=lambda s: None)}
+    assert availability[POLL_KEY]["-2147483027"]["site"] == "-2147483027"
+
+    current = GTC.extract_relevant(
+        availability, make_gtc_watch(site_ids=["-2147483027"]), TODAY
+    )
+
+    assert current == {
+        "-2147483027": {
+            "campsite_id": "-2147483027",
+            "site": "-2147483027",  # degraded display, never a dropped opening
+            "dates": ["2026-08-14", "2026-08-15"],
+        },
+    }
+
+
 # --- the park catalog: labels, ADA Only, capacity, equipment, hookups -----
 
 def catalog(vocabulary=None):
