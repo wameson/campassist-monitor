@@ -9,8 +9,10 @@ detects new openings via state hashes, and sends APNs push notifications with a
 direct booking link. Supabase (free tier) is the shared database; there is no
 server.
 
-See the CampAssist `PLAN.md` (Phase 1) for the full design: write budget,
-anti-blocking rules, and the recreation.gov API contract.
+See [`PLAN.md`](PLAN.md) in this repo for the full backend design: schema and
+migration rules, the monitor workflow, the poll/alert pipeline, the provider
+seam, and the backend phase checklists. The iOS/product plan lives in the
+`camp-assist` repo's `PLAN.md`.
 
 ## Layout
 
@@ -124,8 +126,9 @@ Whatever a provider's own identifiers are, `watches.campground_id` stays the
 watch's campground identity for the cycle's 404-strike lifecycle and
 `campgrounds_polled` telemetry, and must match `[A-Za-z0-9_-]+` — a watch whose
 id has any other character is errored before it is ever polled. A
-`going_to_camp` row therefore needs a stable id in that alphabet (the tests use
-`gtc_<resourceLocationId>`); the backend never parses it.
+`going_to_camp` row therefore needs a stable id in that alphabet: the client
+packs `gtc_<resourceLocationId>_<mapId>` — **underscores, never colons**, the
+contract `PLAN.md` states in full. The backend never parses it.
 
 To add a provider: write the conformer in its own module under
 `scripts/providers/`, then register it in `scripts/providers/__init__.py`.

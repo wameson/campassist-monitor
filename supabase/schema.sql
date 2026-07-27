@@ -1,6 +1,7 @@
 -- CampAssist Supabase schema (Phase 1).
 -- Paste this whole file into the Supabase SQL editor and run it once.
--- Source of truth: CampAssist PLAN.md "Supabase Schema".
+-- This file is the authoritative DDL; the design behind it is PLAN.md
+-- "Supabase schema" in this repo.
 --
 -- This is the fresh-install bootstrap: the full current schema for a brand-new
 -- database. For an EXISTING database, do not re-run this — instead apply any
