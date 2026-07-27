@@ -213,8 +213,11 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   `watches.error_reason` (`0004_watches_error_reason.sql`) records *why* a watch was
   errored. The monitor writes it, which normally means `halt`, but the write is
   demonstrably tolerant: the reason rides along with the `status='error'` write and,
-  when PostgREST rejects that write with `42703` naming this column, it is retried
-  once without it and dropped for the rest of the cycle. An unmigrated database
+  when PostgREST rejects that write for want of this column — `42703`, or the
+  `PGRST204` schema-cache miss it answers a write body with — it is retried once
+  without it and dropped for the rest of the cycle. That first attempt also skips
+  the per-id fallback for this one signature, so the cost is literally one extra
+  write however many watches were in the batch. An unmigrated database
   therefore still errors watches, still keeps its lifecycle and still monitors — the
   reason is simply not recorded, and the census reports those rows as `unrecorded`.
   Halting instead would stop the whole cycle over a column that only annotates an
@@ -371,7 +374,8 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   dedup rows that would suppress it are exactly the ones that failed to write.
   The trade is an occasional missed re-alert instead of a repeating push.
 - **Errored-watch census:** every cycle reads how many watches are in
-  `status='error'` (one extra `select`, no writes, so the write budget is
+  `status='error'` with a trip that has not passed yet (one extra `select`, no
+  writes, so the write budget is
   untouched) and reports the count on the world-readable `run_summaries.errors`
   row, with a per-reason breakdown in the operator-only annotation. A watch that
   has been errored is *absent*, not failing, so without this a run serving one
@@ -382,7 +386,11 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   as `other`, a row errored before `0004` as `unrecorded`) because `error_reason`
   sits on a row its owner can write. The count reports the population *entering*
   the cycle; watches errored during it are reported by the lifecycle passes and
-  join the census next cycle.
+  join the census next cycle. Past-date errored watches are left out on purpose:
+  nothing can be done about a trip that has already happened, and a warning that
+  fires every cycle forever is worth what no warning is worth. (Having the expiry
+  pass move those rows to `expired` would be tidier, but it costs writes and mixes
+  two concerns — a possible follow-up, not an oversight.)
 - **Errors and run status:** polling and alert errors (provider request
   failures, unrecognized responses, APNs delivery problems) and contained
   per-watch failures are all recorded in the `run_summaries.errors` column

@@ -54,7 +54,8 @@ from db import SupabaseClient
 # MISSING_COLUMN_CODE is shared with the preflight rather than restated: both
 # ask the same question of PostgREST — is this column absent from the live
 # database? — the preflight before the cycle, `rejects_missing_column` while it
-# writes.
+# writes (which additionally accepts the code PostgREST uses for a *write*, see
+# WRITE_MISSING_COLUMN_CODES).
 from preflight import MISSING_COLUMN_CODE, preflight
 from providers import (
     PROVIDERS,
@@ -121,6 +122,20 @@ ERROR_REASONS = frozenset({
 ERROR_REASON_UNRECORDED = "unrecorded"
 ERROR_REASON_OTHER = "other"
 ERROR_REASON_COLUMN = "error_reason"
+
+# How PostgREST says "that column is not there" about a column named in a write
+# *body*, which is the only thing `rejects_missing_column` classifies. Two codes
+# mean it: `PGRST204` is PostgREST's own schema-cache miss ("Could not find the
+# 'error_reason' column of 'watches' in the schema cache"), while `42703` is
+# PostgreSQL's, which surfaces for select lists and filters — and which
+# preflight.py cites having seen on a write during the 0001 incident, possibly
+# from a PostgREST older than the one now fronting this database. Both are
+# permanent 4xx and both mean the same thing, so the write path accepts either:
+# recognizing only one would leave an unapplied migration failing every
+# status='error' write outright, the failing-forever shape error_reason exists
+# to expose. The preflight's own select-list probe keeps MISSING_COLUMN_CODE
+# alone — there, 42703 is the only code the question can produce.
+WRITE_MISSING_COLUMN_CODES = frozenset({MISSING_COLUMN_CODE, "PGRST204"})
 
 # Systemic-failure threshold (tune here). A cycle exits non-zero only when
 # contained watch failures affect more than SYSTEMIC_ERROR_RATE of the watches
@@ -394,13 +409,19 @@ def is_permanent_failure(exc: BaseException) -> bool:
 
 def rejects_missing_column(exc: BaseException, column: str) -> bool:
     """True when PostgREST rejected this write *because* `column` is absent from
-    the live database: a permanent rejection carrying the `42703` code and naming
-    the column. That is the exact signature of a migration nobody has applied
-    yet, and the only write failure worth retrying without the column — any other
-    rejection would fail identically the second time.
+    the live database: a permanent rejection carrying one of the missing-column
+    codes and naming the column in its `message`. That is the exact signature of
+    a migration nobody has applied yet, and the only write failure worth retrying
+    without the column — any other rejection would fail identically the second
+    time.
 
-    Only the response body is read, never the request, whose headers carry the
-    service-role key (the rule `rejection_reason` follows).
+    Only `message` is read, never `details`/`hint`: those echo row values (see
+    `summarize_exception`'s safe rendering), so a rejection about some other
+    column whose echoed values happened to contain this column's name would be
+    misread as drift — and latch the reason off for the rest of a cycle on a
+    database where the column exists. And only the response body is read, never
+    the request, whose headers carry the service-role key (the rule
+    `rejection_reason` follows).
     """
     if not is_permanent_failure(exc):
         return False
@@ -409,10 +430,9 @@ def rejects_missing_column(exc: BaseException, column: str) -> bool:
         body = response.json()
     except Exception:
         return False
-    if not isinstance(body, dict) or str(body.get("code")) != MISSING_COLUMN_CODE:
+    if not isinstance(body, dict) or str(body.get("code")) not in WRITE_MISSING_COLUMN_CODES:
         return False
-    named = " ".join(str(body.get(key) or "") for key in ("message", "details", "hint"))
-    return column in named
+    return column in str(body.get("message") or "")
 
 
 def error_reason_census(rows) -> list[tuple[str, int]]:
@@ -496,7 +516,14 @@ class FanoutBudget:
             self.remaining -= self._monotonic() - started
 
 
-def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = None) -> PatchOutcome:
+def patch_watches(
+    db,
+    watch_ids,
+    data: dict,
+    *,
+    budget: FanoutBudget | None = None,
+    fanout=True,
+) -> PatchOutcome:
     """PATCH `data` onto many watches, isolating the row that is actually bad.
 
     The healthy path is the single batched `id=in.(…)` write the write budget
@@ -509,6 +536,12 @@ def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = No
     run before its summary and pruning. For the same reason a fan-out stops as
     soon as `budget` is spent, and a batch larger than PER_ID_FALLBACK_MAX is
     not fanned out at all.
+
+    `fanout` lets a caller veto the fallback for rejections it knows are about
+    the *payload* rather than any row: `False`, or a predicate on the batch
+    exception so the veto can be narrowed to one signature and every other
+    rejection keeps the isolating behaviour a caller may depend on
+    (`write_errored` uses the predicate form — see there).
 
     Ids the fan-out never reached — and every id of a batch that was not fanned
     out — carry the batch exception but are absent from `isolated`.
@@ -524,6 +557,8 @@ def patch_watches(db, watch_ids, data: dict, *, budget: FanoutBudget | None = No
     if len(ids) == 1:
         # the batch *was* a single-row write, so it named the bad row itself
         return isolated_failure(ids[0], batch_failure)
+    if not (fanout(batch_failure) if callable(fanout) else fanout):
+        return PatchOutcome({watch_id: batch_failure for watch_id in ids}, frozenset())
     if not is_permanent_failure(batch_failure) or len(ids) > PER_ID_FALLBACK_MAX:
         return PatchOutcome({watch_id: batch_failure for watch_id in ids}, frozenset())
     failures: dict[str, BaseException] = {}
@@ -620,8 +655,8 @@ def run(
     # near-total delivery outage behind a green run.
     apns_rejected_ids: set[str] = set()
 
-    def write_watches(watch_ids, data: dict) -> PatchOutcome:
-        return patch_watches(db, watch_ids, data, budget=fanout_budget)
+    def write_watches(watch_ids, data: dict, *, fanout=True) -> PatchOutcome:
+        return patch_watches(db, watch_ids, data, budget=fanout_budget, fanout=fanout)
 
     # `error_reason` is WARN-classified in preflight.REQUIRED, which obliges the
     # cycle to keep working on a live database where 0004 has not been applied
@@ -636,6 +671,14 @@ def run(
     # drifted database costs one extra write, not one per error site. Both
     # attempts happen only on paths that were already writing, so the no-change
     # write budget is untouched.
+    #
+    # That one-extra-write cost is literal, which is what the WARN classification
+    # rests on: the reason-carrying attempt vetoes the per-id fan-out for exactly
+    # this signature, so a drifted batch of N watches costs 2 writes rather than
+    # N+2 and charges the cycle-wide FanoutBudget nothing — the fallback is there
+    # to find the one bad *row*, and a column missing from the whole table is not
+    # one. Every other rejection still fans out exactly as it always did, because
+    # the 404 site depends on isolation to error a genuinely bad row.
     reason_writable = True
 
     def write_errored(watch_ids, reason: str, extra: dict | None = None) -> PatchOutcome:
@@ -643,7 +686,11 @@ def run(
         data = {"status": "error", **(extra or {})}
         if not reason_writable:
             return write_watches(watch_ids, data)
-        outcome = write_watches(watch_ids, {**data, ERROR_REASON_COLUMN: reason})
+        outcome = write_watches(
+            watch_ids,
+            {**data, ERROR_REASON_COLUMN: reason},
+            fanout=lambda exc: not rejects_missing_column(exc, ERROR_REASON_COLUMN),
+        )
         drifted = {
             watch_id for watch_id, exc in outcome.failures.items()
             if rejects_missing_column(exc, ERROR_REASON_COLUMN)
@@ -706,8 +753,23 @@ def run(
     # untouched. The count is the population *entering* the cycle: watches this
     # cycle errors are reported by the lifecycle passes below and join the census
     # from the next cycle on.
+    #
+    # Scoped to trips that have not passed, because a warning that fires forever
+    # is worth exactly as much as no warning at all: an errored watch whose dates
+    # are behind us is nothing anyone can act on, and left in the count it would
+    # desensitize an operator to the very signal this census exists to give. The
+    # expiry pass below could instead move those rows to 'expired' — arguably the
+    # more correct state — but that adds writes and mixes two concerns, so it is
+    # a deliberate possible follow-up, not an oversight.
+    #
+    # No projection: naming error_reason in a select list would be rejected by
+    # exactly the database this design must tolerate (one where 0004 has not been
+    # applied), which is how preflight probes for a missing column. select=* is
+    # what keeps the read `.get`-tolerant.
     try:
-        errored = db.select("watches", {"status": "eq.error"})
+        errored = db.select(
+            "watches", {"status": "eq.error", "end_date": f"gte.{today.isoformat()}"}
+        )
     except Exception as exc:  # containment: a census must never cost a cycle
         errored = None
         errors.append("errored-watch census unavailable")

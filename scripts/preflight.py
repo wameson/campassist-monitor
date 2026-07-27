@@ -156,9 +156,13 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #   watches.error_reason   the one WARN column the monitor *writes*, and the exception is
 #                          demonstrated rather than assumed: `run`'s `write_errored` sends it
 #                          with the status='error' write and, when PostgREST rejects that write
-#                          with 42703 naming this column (`monitor.rejects_missing_column`),
+#                          for want of this column (42703, or the PGRST204 schema-cache miss it
+#                          answers a write body with — `monitor.rejects_missing_column`),
 #                          retries once without it and stops sending it for the rest of the
-#                          cycle. So an unmigrated database still errors watches, still keeps
+#                          cycle. That attempt also vetoes the per-id fan-out for this one
+#                          signature, so the drift costs one extra write whatever the batch
+#                          size and charges the FanoutBudget nothing.
+#                          So an unmigrated database still errors watches, still keeps
 #                          its lifecycle, and still monitors — the reason is simply not
 #                          recorded, and the census reports those rows as `unrecorded`. It is
 #                          also read, `.get`-tolerantly, in `monitor.error_reason_census`.

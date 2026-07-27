@@ -34,6 +34,8 @@ from helpers import (
 QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 OPEN_PAYLOAD = availability_payload({"100": {"2026-08-10": "Available"}})
 QUIET_PAYLOAD = availability_payload({"100": {"2026-08-10": "Reserved"}})
+# what the census asks the database for: errored, and still worth reporting
+CENSUS_PARAMS = {"status": "eq.error", "end_date": "gte.2026-08-01"}
 
 
 def errored_watch(watch_id, reason, **overrides):
@@ -79,8 +81,52 @@ def test_the_errored_population_is_reported_every_cycle():
     assert monitor.exit_code(result) == 0
 
     # and it costs one select and no writes: the errored rows are never touched
-    assert db.calls_of("select", "watches")[1][2] == {"status": "eq.error"}
+    assert db.calls_of("select", "watches")[1][2] == CENSUS_PARAMS
     assert not [c for c in db.calls_of("patch", "watches") if "w-dead" in str(c[2])]
+
+
+def test_an_errored_watch_whose_trip_has_passed_is_not_reported():
+    # the census is a call to act, so it stops calling once nobody can: a watch
+    # errored on dates already behind us is unactionable, and a warning that
+    # fires forever every cycle is worth exactly what no warning is worth
+    db = FakeDB({"watches": [
+        errored_watch(
+            "w-past",
+            monitor.ERROR_REASON_INVALID_CAMPGROUND_ID,
+            start_date="2026-07-01",
+            end_date="2026-07-03",
+        ),
+        errored_watch(
+            "w-soon", monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND, user_id="u2",
+        ),
+    ]})
+
+    result, _ = run_cycle(db)
+
+    # the filter is the database's job, so the past-date row is never even read
+    assert result["watches_errored"] == 1
+    assert "1 watch(es) in status='error', not monitored" in result["errors"]
+    assert f"{monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND}: 1" in result["errors_detail"]
+    assert monitor.ERROR_REASON_INVALID_CAMPGROUND_ID not in result["errors_detail"]
+
+
+def test_a_pool_of_only_past_errored_watches_says_nothing():
+    # the end state the scoping exists for: the noise stops rather than becoming
+    # a permanent warning nobody reads
+    db = FakeDB({"watches": [
+        errored_watch(
+            "w-past",
+            monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND,
+            start_date="2026-07-01",
+            end_date="2026-07-03",
+        ),
+        make_watch(id="w-ok", user_id="u2"),
+    ]})
+
+    result, _ = run_cycle(db, QUIET_PAYLOAD)
+
+    assert result["watches_errored"] == 0
+    assert result["errors"] is None
 
 
 def test_a_clean_pool_reports_an_empty_population():
@@ -127,7 +173,7 @@ def test_a_failed_census_does_not_cost_the_cycle():
     # the census is visibility, never a dependency: if the extra select is
     # rejected the watches are still polled, alerted and stamped
     def fail_on(call):
-        if call[0] == "select" and call[1] == "watches" and call[2] == {"status": "eq.error"}:
+        if call[0] == "select" and call[1] == "watches" and call[2] == CENSUS_PARAMS:
             return postgrest_error(503, "upstream connect error")
         return None
 
@@ -226,16 +272,34 @@ def rejects_the_reason_column(call):
     return None
 
 
-def test_a_missing_error_reason_column_still_errors_the_watch():
+def rejects_the_reason_column_from_the_schema_cache(call):
+    """The same drift as PostgREST itself reports it for a column named in a
+    write *body*: PGRST204 rather than PostgreSQL's 42703."""
+    if call[0] == "patch" and call[1] == "watches" and "error_reason" in call[3]:
+        return postgrest_error(
+            400,
+            "Could not find the 'error_reason' column of 'watches' in the schema cache",
+            code="PGRST204",
+        )
+    return None
+
+
+@pytest.mark.parametrize(
+    "rejecter",
+    [rejects_the_reason_column, rejects_the_reason_column_from_the_schema_cache],
+    ids=["42703", "PGRST204"],
+)
+def test_a_missing_error_reason_column_still_errors_the_watch(rejecter):
     # WARN, and it has to be earned: an unapplied migration must not stop the
     # lifecycle, or it would park a watch in the exact failing-forever state the
-    # column exists to make visible
+    # column exists to make visible. Whichever of the two codes the PostgREST in
+    # front of this database answers with, the tolerance has to hold.
     db = FakeDB(
         {"watches": [
             make_watch(id="w-bad", campground_id="gtc:-2147483625"),
             make_watch(id="w-ok", user_id="u2", campground_id="222"),
         ]},
-        fail_on=rejects_the_reason_column,
+        fail_on=rejecter,
     )
 
     result, apns = run_cycle(db)
@@ -301,18 +365,140 @@ def test_only_a_missing_column_is_retried_without_the_reason(exc):
     assert result["watch_errors"] == 1  # recorded, not swallowed
 
 
+def test_a_drifted_batch_of_many_watches_is_not_fanned_out():
+    # the cost claim the WARN classification rests on has to be literal: a
+    # missing column is a fact about the whole table, not about any one row, so
+    # the per-id fallback would spend N doomed writes (and the cycle-wide
+    # fan-out allowance other error sites may need) to learn what the batch
+    # rejection already said. Two watches, both errored in the same pass.
+    db = FakeDB(
+        {"watches": [
+            make_watch(id="w-bad1", campground_id="gtc:-2147483625"),
+            make_watch(id="w-bad2", user_id="u2", campground_id="gtc:-2147483626"),
+            make_watch(id="w-ok", user_id="u3", campground_id="222"),
+        ]},
+        fail_on=rejects_the_reason_column,
+    )
+
+    result, apns = run_cycle(db)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert rows["w-bad1"]["status"] == "error" and rows["w-bad2"]["status"] == "error"
+    attempted = [c for c in db.calls_of("patch", "watches") if "error_reason" in c[3]]
+    assert len(attempted) == 1  # one batch, and no per-id retry of it
+    assert attempted[0][2]["id"] == "in.(w-bad1,w-bad2)"
+    # the reason-free retry is batched too, so the drift costs one extra write
+    retried = [
+        c for c in db.calls_of("patch", "watches")
+        if c[3].get("status") == "error" and "error_reason" not in c[3]
+    ]
+    assert [c[2]["id"] for c in retried] == ["in.(w-bad1,w-bad2)"]
+    assert [watch_id for watch_id, _ in apns.alerts] == ["w-ok"]
+    assert result["watch_errors"] == 0
+
+
+def test_a_veto_of_the_fanout_leaves_the_allowance_untouched():
+    # the budget half of the same claim, read straight off a FanoutBudget: a
+    # vetoed fan-out issues no per-id write, so it charges nothing
+    db = FakeDB(
+        {"watches": [make_watch(id="w0"), make_watch(id="w1", user_id="u2")]},
+        fail_on=lambda call: (
+            postgrest_error(400, "column watches.error_reason does not exist")
+            if call[0] == "patch" else None
+        ),
+    )
+    budget = monitor.FanoutBudget(60.0, float("inf"))
+
+    outcome = monitor.patch_watches(
+        db,
+        ["w0", "w1"],
+        {"status": "error", "error_reason": monitor.ERROR_REASON_WRITE_REJECTED},
+        budget=budget,
+        fanout=False,
+    )
+
+    assert len(db.calls_of("patch", "watches")) == 1
+    assert budget.remaining == 60.0
+    # nothing pinned the failure to either row, so neither may be errored on it
+    assert set(outcome.failures) == {"w0", "w1"} and outcome.isolated == frozenset()
+
+
+def test_a_rejection_that_is_not_the_drift_still_fans_out_and_isolates():
+    # the veto is narrowed to the one signature: every other batch rejection
+    # keeps the isolation the 404 site relies on to error a genuinely bad row
+    watches = [
+        make_watch(
+            id=f"w{i}",
+            user_id=f"u{i}",
+            campground_id="9999",
+            consecutive_not_found=monitor.NOT_FOUND_ERROR_THRESHOLD - 1,
+        )
+        for i in range(3)
+    ]
+
+    def fail_on(call):
+        if call[0] != "patch" or call[1] != "watches" or "status" not in call[3]:
+            return None
+        if call[2]["id"].startswith("in.") or call[2]["id"] == "eq.w0":
+            return postgrest_error(400, 'null value in column "status" violates not-null')
+        return None
+
+    db = FakeDB({"watches": watches}, fail_on=fail_on)
+
+    result = monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
+
+    per_id = [c for c in db.calls_of("patch", "watches") if c[2]["id"].startswith("eq.")]
+    assert [c[2]["id"] for c in per_id] == ["eq.w0", "eq.w1", "eq.w2"]
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    assert rows["w1"]["status"] == "error" and rows["w2"]["status"] == "error"
+    # w0's own row rejected the write, so it is recorded rather than errored here
+    assert rows["w0"]["status"] == "monitoring"
+    assert result["watch_errors"] == 1
+
+
 def test_rejects_missing_column_reads_only_the_response_body():
-    # the discriminator itself: a 42703 naming this column, and nothing else
+    # the discriminator itself: a missing-column code naming this column in the
+    # message, and nothing else
     column = monitor.ERROR_REASON_COLUMN
     assert monitor.rejects_missing_column(
         postgrest_error(400, f"column watches.{column} does not exist"), column
+    )
+    # PostgREST's own code for a column named in a write body means the same
+    # thing, and its message names the column too
+    assert monitor.rejects_missing_column(
+        postgrest_error(
+            400,
+            f"Could not find the '{column}' column of 'watches' in the schema cache",
+            code="PGRST204",
+        ),
+        column,
     )
     # a different column's 42703 is not this drift
     assert not monitor.rejects_missing_column(
         postgrest_error(400, "column watches.state_hash does not exist"), column
     )
-    # and a schema code on a transient status proves nothing
+    # nor is one whose details/hint merely echo a row value containing this
+    # column's name: those fields carry client-written text, and reading them
+    # would drop the reason for the rest of a cycle on a database that has it
+    assert not monitor.rejects_missing_column(
+        postgrest_error(
+            400,
+            "column watches.state_hash does not exist",
+            details=f"Key (campground_id)=({column}) is not present",
+            hint=f"Perhaps you meant {column}",
+        ),
+        column,
+    )
+    # and a schema code on a transient status proves nothing, either of them
     assert not monitor.rejects_missing_column(
         postgrest_error(503, f"column watches.{column} does not exist"), column
+    )
+    assert not monitor.rejects_missing_column(
+        postgrest_error(
+            503,
+            f"Could not find the '{column}' column of 'watches' in the schema cache",
+            code="PGRST204",
+        ),
+        column,
     )
     assert not monitor.rejects_missing_column(ValueError("no response to read"), column)

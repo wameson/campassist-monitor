@@ -26,8 +26,11 @@
 -- Nullable with no default: the reason belongs to `status='error'` alone, so
 -- every other status carries NULL. The column is classified WARN in
 -- `preflight.REQUIRED` — the monitor writes it, but the write is retried once
--- without it when PostgREST answers 42703, so a database nobody has migrated yet
--- still errors watches normally and keeps monitoring.
+-- without it when PostgREST answers 42703 (or its own PGRST204 for a column
+-- named in a write body), so a database nobody has migrated yet still errors
+-- watches normally and keeps monitoring. That first attempt skips the per-id
+-- fallback for this signature, so the untaken migration costs one extra write
+-- per cycle, not one per errored watch.
 --
 -- Idempotent: `IF NOT EXISTS` makes this safe to re-run. Apply it BY HAND in
 -- the Supabase SQL editor, like every file here (see README "Database
