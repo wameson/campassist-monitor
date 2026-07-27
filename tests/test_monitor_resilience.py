@@ -151,7 +151,7 @@ def test_transient_failure_does_not_error_the_watch():
     row = next(r for r in db.tables["watches"] if r["id"] == "w1")
     assert row["status"] == "monitoring"
     assert row["state_hash"] is None  # keeps the old hash, so it re-alerts
-    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    assert not [c for c in db.calls_of("patch", "watches") if c[3].get("status") == "error"]
     assert result["watch_errors"] == 1
     assert monitor.exit_code(result) == 0
 
@@ -211,8 +211,12 @@ def test_unattributed_batch_failure_never_errors_watches():
     rows = {r["id"]: r for r in db.tables["watches"]}
     assert all(rows[w["id"]]["status"] == "monitoring" for w in doomed)
     # one batch, no fan-out, and no end-of-cycle status='error' retry either
+    # (that write is the one carrying the write-rejected reason)
     assert len([c for c in db.calls_of("patch", "watches") if "status" in c[3]]) == 1
-    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    assert not [
+        c for c in db.calls_of("patch", "watches")
+        if c[3].get("error_reason") == monitor.ERROR_REASON_WRITE_REJECTED
+    ]
 
     # the healthy watches were served, and the failures are still counted
     assert sorted(w for w, _ in apns.alerts) == ["h0", "h1", "h2", "h3"]
@@ -239,7 +243,7 @@ def test_strike_count_failure_still_serves_the_watch():
     row = next(r for r in db.tables["watches"] if r["id"] == "w1")
     assert row["state_hash"] and row["last_checked_at"] is not None
     assert row["status"] == "monitoring"
-    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    assert not [c for c in db.calls_of("patch", "watches") if c[3].get("status") == "error"]
 
     # recorded and counted, but isolated — the run stays green
     assert result["watch_errors"] == 1 and result["watches_checked"] == 4
@@ -761,7 +765,7 @@ def test_sent_alerts_failure_does_not_error_the_watch(op):
 
     w1 = next(r for r in db.tables["watches"] if r["id"] == "w1")
     assert w1["status"] == "monitoring"  # finding 1: not the watch's fault
-    assert not [c for c in db.calls_of("patch", "watches") if c[3] == {"status": "error"}]
+    assert not [c for c in db.calls_of("patch", "watches") if c[3].get("status") == "error"]
     # the watch was polled — only table-scoped work failed — so it is still
     # stamped rather than left looking unchecked to its user
     assert w1["last_checked_at"] is not None

@@ -209,6 +209,16 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   default is a deliberate behaviour change, not a status quo: the monitor used to
   alert on ADA-only sites, so every pre-existing watch stops being alerted about
   them unless its owner opts back in. There is no backfill.
+- **A column the monitor writes can still be `warn` — if the write proves it.**
+  `watches.error_reason` (`0004_watches_error_reason.sql`) records *why* a watch was
+  errored. The monitor writes it, which normally means `halt`, but the write is
+  demonstrably tolerant: the reason rides along with the `status='error'` write and,
+  when PostgREST rejects that write with `42703` naming this column, it is retried
+  once without it and dropped for the rest of the cycle. An unmigrated database
+  therefore still errors watches, still keeps its lifecycle and still monitors — the
+  reason is simply not recorded, and the census reports those rows as `unrecorded`.
+  Halting instead would stop the whole cycle over a column that only annotates an
+  error, which is exactly the blast radius inversion the `warn` class exists to avoid.
 - **The monitor checks before it runs.** Each run starts with a read-only schema
   preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
   data, before the start jitter. It never applies anything — the by-hand posture above
@@ -272,6 +282,20 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   campground; any successful poll resets the count), or whose own database
   writes are permanently rejected (see Failure containment) — the app never
   has to clean these up.
+
+  `status='error'` is **terminal**: an errored watch is absent from the only
+  query the cycle runs, and no code path writes the status back. Two things
+  follow, both of them deliberate. Every such write also records a
+  machine-readable `watches.error_reason` — `invalid_campground_id`,
+  `unreadable_provider_ref`, `campground_not_found`, `watch_write_rejected`
+  (`monitor.ERROR_REASONS`) — so terminal and fixable can be told apart at all:
+  only `campground_not_found` is genuinely permanent, `watch_write_rejected`
+  recovers the moment its migration is applied, and the two remaining ones need a
+  data or client fix. And every cycle reports how many watches are sitting in
+  `status='error'` (see Errors and run status), because a pool that quietly
+  shrank must not look like a healthy one. Re-arming an errored watch is
+  deliberately **not** automatic: a blanket retry would re-poll known-dead
+  watches forever and undo what the terminal design buys.
 - **Failure containment:** a failure that belongs to one watch — a rejected
   write, a malformed row — is caught, recorded, and skipped; it never
   aborts the cycle. The other watches are still polled and alerted, and the
@@ -346,6 +370,19 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   identical push going out again every cycle until the drift is fixed: the
   dedup rows that would suppress it are exactly the ones that failed to write.
   The trade is an occasional missed re-alert instead of a repeating push.
+- **Errored-watch census:** every cycle reads how many watches are in
+  `status='error'` (one extra `select`, no writes, so the write budget is
+  untouched) and reports the count on the world-readable `run_summaries.errors`
+  row, with a per-reason breakdown in the operator-only annotation. A watch that
+  has been errored is *absent*, not failing, so without this a run serving one
+  watch of four looked exactly like a clean run serving all four — three of five
+  watches once went unmonitored for two days across a wall of green runs. The
+  count is a standing fact, not this cycle's verdict: it never changes the exit
+  code. The breakdown stays operator-only and bucketed (an unknown value counts
+  as `other`, a row errored before `0004` as `unrecorded`) because `error_reason`
+  sits on a row its owner can write. The count reports the population *entering*
+  the cycle; watches errored during it are reported by the lifecycle passes and
+  join the census next cycle.
 - **Errors and run status:** polling and alert errors (provider request
   failures, unrecognized responses, APNs delivery problems) and contained
   per-watch failures are all recorded in the `run_summaries.errors` column

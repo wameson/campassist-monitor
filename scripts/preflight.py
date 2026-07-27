@@ -100,6 +100,7 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         "provider":              (WARN, "0002_watches_provider.sql"),
         "provider_ref":          (WARN, "0002_watches_provider.sql"),
         "include_ada_only":      (WARN, "0003_watches_include_ada_only.sql"),
+        "error_reason":          (WARN, "0004_watches_error_reason.sql"),
         "campground_state":      (WARN, None),
         "created_at":            (WARN, None),
     },
@@ -152,6 +153,17 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          excluding — never halts, never suppresses differently. It
 #                          stays WARN only while that read is `.get` with a default; a
 #                          read that ever subscripts it belongs in the HALT set instead.
+#   watches.error_reason   the one WARN column the monitor *writes*, and the exception is
+#                          demonstrated rather than assumed: `run`'s `write_errored` sends it
+#                          with the status='error' write and, when PostgREST rejects that write
+#                          with 42703 naming this column (`monitor.rejects_missing_column`),
+#                          retries once without it and stops sending it for the rest of the
+#                          cycle. So an unmigrated database still errors watches, still keeps
+#                          its lifecycle, and still monitors — the reason is simply not
+#                          recorded, and the census reports those rows as `unrecorded`. It is
+#                          also read, `.get`-tolerantly, in `monitor.error_reason_census`.
+#                          Classifying it HALT would invert the blast radius: the cycle would
+#                          stop entirely over a column that only annotates an error.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read

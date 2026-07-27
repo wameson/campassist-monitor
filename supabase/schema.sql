@@ -35,6 +35,13 @@ CREATE TABLE watches (
     end_date     DATE NOT NULL,
     status       TEXT NOT NULL DEFAULT 'monitoring'
                  CHECK (status IN ('monitoring','paused','expired','error')),
+    error_reason TEXT,                               -- why status='error', from the monitor's own
+                                                     -- small vocabulary (monitor.ERROR_REASONS);
+                                                     -- NULL for every other status. status='error'
+                                                     -- is terminal, so this is the only record of
+                                                     -- whether a data fix would revive the watch —
+                                                     -- see migrations/0004 and README "Errors and
+                                                     -- run status"
     state_hash   TEXT,                               -- delta detection
     consecutive_not_found INT NOT NULL DEFAULT 0,    -- cycles the campground 404ed; status='error' at 3
     created_at   TIMESTAMPTZ DEFAULT NOW(),

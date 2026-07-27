@@ -1,9 +1,11 @@
 """CampAssist availability monitor — one cycle per GitHub Actions run.
 
-Cycle: jittered start → read active watches → expire past-date watches →
+Cycle: jittered start → read active watches (and count the errored ones, which
+are terminal and would otherwise be invisible) → expire past-date watches →
 route each watch to the provider its `provider` column names → error watches
 with invalid campground ids, with provider config their provider cannot poll,
-or with persistently-404ing campgrounds → dedupe the poll plan across all users
+or with persistently-404ing campgrounds, recording why on each row →
+dedupe the poll plan across all users
 → poll each provider politely (one browser UA per run, shuffled order, 1.2–2.8 s
 gaps, exponential backoff, all under a per-cycle time budget) → delta-detect
 per watch via state_hash → APNs alert
@@ -36,6 +38,7 @@ import json
 import random
 import re
 import time
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
@@ -48,7 +51,11 @@ from apns import CONFIG_FAILURE, DELIVERED, PERMANENT_FAILURE, RETRYABLE_FAILURE
 # common.py only so a provider can cap against the very same constant.
 from common import MAX_ERROR_MESSAGE_CHARS, as_date, capped_line
 from db import SupabaseClient
-from preflight import preflight
+# MISSING_COLUMN_CODE is shared with the preflight rather than restated: both
+# ask the same question of PostgREST — is this column absent from the live
+# database? — the preflight before the cycle, `rejects_missing_column` while it
+# writes.
+from preflight import MISSING_COLUMN_CODE, preflight
 from providers import (
     PROVIDERS,
     PollKey,
@@ -78,6 +85,42 @@ ALERT_COOLDOWN_HOURS = 6
 RETENTION_DAYS = 30
 NOT_FOUND_ERROR_THRESHOLD = 3
 CAMPGROUND_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+# Why a watch was moved to status='error', recorded in watches.error_reason
+# alongside every such write. status='error' is terminal — an errored watch
+# leaves the only query the cycle runs and no code path puts it back — so the
+# single status bit could not tell an operator (or any future retry policy, or
+# the app) apart a watch a data fix would revive from one that is dead for good.
+# These four values are the whole vocabulary a *write* may use: a small stable
+# machine-readable set, deliberately not prose, so a policy can classify on them.
+#
+#   invalid_campground_id    the id fails CAMPGROUND_ID_RE and is never polled.
+#   unreadable_provider_ref  the watch's own provider says it can never poll the
+#                            client-written config on this row.
+#   campground_not_found     the campground 404ed for NOT_FOUND_ERROR_THRESHOLD
+#                            consecutive cycles — a delisted or non-reservable
+#                            facility, the one genuinely permanent cause.
+#   watch_write_rejected     a write pinned to this row was rejected outright
+#                            (see is_permanent_failure) — the retry-worthy one:
+#                            a missing column recovers the moment its migration
+#                            is applied.
+ERROR_REASON_INVALID_CAMPGROUND_ID = "invalid_campground_id"
+ERROR_REASON_UNREADABLE_PROVIDER_REF = "unreadable_provider_ref"
+ERROR_REASON_CAMPGROUND_NOT_FOUND = "campground_not_found"
+ERROR_REASON_WRITE_REJECTED = "watch_write_rejected"
+ERROR_REASONS = frozenset({
+    ERROR_REASON_INVALID_CAMPGROUND_ID,
+    ERROR_REASON_UNREADABLE_PROVIDER_REF,
+    ERROR_REASON_CAMPGROUND_NOT_FOUND,
+    ERROR_REASON_WRITE_REJECTED,
+})
+# Reported by the census below, never written: a row errored before 0004 was
+# applied (or by an older build) carries no reason, and `watches` is a table its
+# owner can write, so any value outside the vocabulary is bucketed rather than
+# echoed into the log.
+ERROR_REASON_UNRECORDED = "unrecorded"
+ERROR_REASON_OTHER = "other"
+ERROR_REASON_COLUMN = "error_reason"
 
 # Systemic-failure threshold (tune here). A cycle exits non-zero only when
 # contained watch failures affect more than SYSTEMIC_ERROR_RATE of the watches
@@ -349,6 +392,47 @@ def is_permanent_failure(exc: BaseException) -> bool:
     return status is not None and 400 <= status < 500 and status != 429
 
 
+def rejects_missing_column(exc: BaseException, column: str) -> bool:
+    """True when PostgREST rejected this write *because* `column` is absent from
+    the live database: a permanent rejection carrying the `42703` code and naming
+    the column. That is the exact signature of a migration nobody has applied
+    yet, and the only write failure worth retrying without the column — any other
+    rejection would fail identically the second time.
+
+    Only the response body is read, never the request, whose headers carry the
+    service-role key (the rule `rejection_reason` follows).
+    """
+    if not is_permanent_failure(exc):
+        return False
+    response = getattr(exc, "response", None)
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict) or str(body.get("code")) != MISSING_COLUMN_CODE:
+        return False
+    named = " ".join(str(body.get(key) or "") for key in ("message", "details", "hint"))
+    return column in named
+
+
+def error_reason_census(rows) -> list[tuple[str, int]]:
+    """Per-reason tally of the errored watches, commonest first.
+
+    Operator-channel only, and bucketed rather than echoed: `watches` is a table
+    its owner can write, so a reason outside this build's vocabulary counts as
+    `other` and a row that predates the column counts as `unrecorded`. No row
+    value ever reaches either log through here.
+    """
+    def bucket(row) -> str:
+        reason = row.get(ERROR_REASON_COLUMN)
+        if not reason:  # absent column, or a row errored before 0004
+            return ERROR_REASON_UNRECORDED
+        return str(reason) if str(reason) in ERROR_REASONS else ERROR_REASON_OTHER
+
+    counts = Counter(bucket(row) for row in rows)
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
 class PatchOutcome(NamedTuple):
     """Which watches a batched PATCH could not write, and which of those
     failures a write actually *pinned* to that row (`isolated`).
@@ -539,6 +623,42 @@ def run(
     def write_watches(watch_ids, data: dict) -> PatchOutcome:
         return patch_watches(db, watch_ids, data, budget=fanout_budget)
 
+    # `error_reason` is WARN-classified in preflight.REQUIRED, which obliges the
+    # cycle to keep working on a live database where 0004 has not been applied
+    # yet: erroring a watch is a lifecycle step, and a monitor that could not
+    # take it would turn an unapplied migration into a watch failing identically
+    # every cycle forever — the very shape this column exists to make visible.
+    # So the reason rides along with the status write and, if PostgREST rejects
+    # that write *because the column is missing*, it is retried once without it:
+    # the status lands either way and the reason is best-effort. Nothing else is
+    # retried — any other rejection would fail the same way twice — and after one
+    # such rejection the column is left alone for the rest of the cycle, so a
+    # drifted database costs one extra write, not one per error site. Both
+    # attempts happen only on paths that were already writing, so the no-change
+    # write budget is untouched.
+    reason_writable = True
+
+    def write_errored(watch_ids, reason: str, extra: dict | None = None) -> PatchOutcome:
+        nonlocal reason_writable
+        data = {"status": "error", **(extra or {})}
+        if not reason_writable:
+            return write_watches(watch_ids, data)
+        outcome = write_watches(watch_ids, {**data, ERROR_REASON_COLUMN: reason})
+        drifted = {
+            watch_id for watch_id, exc in outcome.failures.items()
+            if rejects_missing_column(exc, ERROR_REASON_COLUMN)
+        }
+        if not drifted:
+            return outcome
+        reason_writable = False
+        retried = write_watches(sorted(drifted), data)
+        failures = {
+            watch_id: exc for watch_id, exc in outcome.failures.items()
+            if watch_id not in drifted
+        }
+        failures.update(retried.failures)
+        return PatchOutcome(failures, (outcome.isolated - drifted) | retried.isolated)
+
     def record_failures(
         outcome: PatchOutcome, context: str, *, errorable=True, blocking=True, rated=True
     ) -> None:
@@ -576,6 +696,34 @@ def run(
         return str(watch["id"]) in blocked_ids
 
     watches = db.select("watches", {"status": "eq.monitoring"})
+
+    # Visibility: how many watches are sitting in status='error'. That state is
+    # terminal — an errored watch is absent from the select above and no code
+    # path ever puts it back — so without this census a cycle serving one watch
+    # of four reads exactly like a clean cycle serving all four. It is how three
+    # of five watches once went unmonitored for two days across a wall of green
+    # runs. One extra select, no writes, so the no-change write budget is
+    # untouched. The count is the population *entering* the cycle: watches this
+    # cycle errors are reported by the lifecycle passes below and join the census
+    # from the next cycle on.
+    try:
+        errored = db.select("watches", {"status": "eq.error"})
+    except Exception as exc:  # containment: a census must never cost a cycle
+        errored = None
+        errors.append("errored-watch census unavailable")
+        detail_only.append(capped_line(f"errored-watch census: {summarize_exception(exc)}"))
+    watches_errored = None if errored is None else len(errored)
+    if errored:
+        # The count is an aggregate that names nobody, so it goes on the
+        # world-readable row — that is the whole point of the census, since a
+        # NULL `errors` is what made the outage invisible. The per-reason
+        # breakdown is operator-only: `error_reason` sits on a row its owner can
+        # write, and the breakdown is an operator's signal either way.
+        errors.append(f"{watches_errored} watch(es) in status='error', not monitored")
+        detail_only.append(capped_line(
+            "errored watches by reason: "
+            + ", ".join(f"{reason}: {count}" for reason, count in error_reason_census(errored))
+        ))
 
     # Backend-owned lifecycle: expire past-date watches (one batched write).
     # An expiring watch is leaving the pool either way, so a failure here is
@@ -629,7 +777,7 @@ def run(
         # errorable=False: this write *is* the status='error' write, so there
         # is nothing for the end-of-cycle marking to retry.
         record_failures(
-            write_watches((w["id"] for w in invalid), {"status": "error"}),
+            write_errored((w["id"] for w in invalid), ERROR_REASON_INVALID_CAMPGROUND_ID),
             "error-invalid",
             errorable=False,
             blocking=False,
@@ -670,7 +818,9 @@ def run(
             )
             # errorable=False: this write *is* the status='error' write (as above).
             record_failures(
-                write_watches((w["id"] for w, _ in unpollable), {"status": "error"}),
+                write_errored(
+                    (w["id"] for w, _ in unpollable), ERROR_REASON_UNREADABLE_PROVIDER_REF
+                ),
                 "error-unpollable",
                 errorable=False,
                 blocking=False,
@@ -773,9 +923,10 @@ def run(
                 "consecutive cycles, watch(es) errored"
             ))
         record_failures(
-            write_watches(
+            write_errored(
                 (w["id"] for w in errored_404),
-                {"status": "error", "consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
+                ERROR_REASON_CAMPGROUND_NOT_FOUND,
+                {"consecutive_not_found": NOT_FOUND_ERROR_THRESHOLD},
             ),
             "error-404",
             blocking=False,
@@ -924,7 +1075,7 @@ def run(
     # erroring every watch at once.
     error_mark_failures: dict[str, BaseException] = {}
     if mark_errored and not systemic:
-        error_mark_failures = write_watches(mark_errored, {"status": "error"}).failures
+        error_mark_failures = write_errored(mark_errored, ERROR_REASON_WRITE_REJECTED).failures
         if error_mark_failures:
             # Belongs to no single watch — a DB-level problem that would
             # otherwise leave every affected watch quietly 'monitoring' — so it
@@ -1012,6 +1163,11 @@ def run(
         **summary,
         "watches_considered": considered,
         "watch_errors": len(watch_failures),
+        # The errored population this cycle inherited (None if the census
+        # select itself failed). Not a column of run_summaries — the persisted
+        # signal is the count line the census put on `errors`, which is what
+        # turns a silent green run into one that says three watches are dead.
+        "watches_errored": watches_errored,
         # Full-detail rendering (watch UUIDs + PostgREST details) for the
         # operator-only Action annotation; never persisted to run_summaries.
         "errors_detail": "; ".join(detail_errors) or None,

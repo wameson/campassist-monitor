@@ -1,0 +1,37 @@
+-- 0004: add watches.error_reason
+--
+-- Why: `status='error'` is terminal. An errored watch is absent from the only
+-- query the cycle runs (`status = eq.monitoring`) and no code path writes the
+-- status back, so the single bit could not say whether a watch was dead for
+-- good or one data fix away from healthy. Three watches once sat errored for two
+-- days over a one-character id mismatch while every run reported green. The
+-- monitor now writes a machine-readable reason alongside every status='error'
+-- write (`monitor.ERROR_REASONS`), so an operator, the app, and any future retry
+-- policy can tell the two apart:
+--
+--   invalid_campground_id    campground_id fails CAMPGROUND_ID_RE — fixable by a
+--                            data or client change; retry alone is futile
+--   unreadable_provider_ref  the watch's provider cannot read its provider_ref —
+--                            same shape: fixable, not retryable on its own
+--   campground_not_found     404 for 3 consecutive cycles — genuinely permanent
+--                            (delisted or non-reservable facility)
+--   watch_write_rejected     a write pinned to this row was rejected outright —
+--                            the retry-worthy one: a missing column recovers the
+--                            moment its migration is applied
+--
+-- Backfill-free, and deliberately so: rows already errored predate the column
+-- and stay NULL. The monitor's per-reason census reports them as `unrecorded`
+-- rather than guessing a cause it cannot know.
+--
+-- Nullable with no default: the reason belongs to `status='error'` alone, so
+-- every other status carries NULL. The column is classified WARN in
+-- `preflight.REQUIRED` — the monitor writes it, but the write is retried once
+-- without it when PostgREST answers 42703, so a database nobody has migrated yet
+-- still errors watches normally and keeps monitoring.
+--
+-- Idempotent: `IF NOT EXISTS` makes this safe to re-run. Apply it BY HAND in
+-- the Supabase SQL editor, like every file here (see README "Database
+-- migrations"); CI does not run migrations.
+
+ALTER TABLE watches
+    ADD COLUMN IF NOT EXISTS error_reason TEXT;

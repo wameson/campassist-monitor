@@ -301,7 +301,12 @@ def test_persistent_404_errors_watch_after_three_cycles():
     http = FakeHTTP(lambda cg: FakeResponse(404))
     summary = monitor.run(db, FakeAPNs(), http, **QUIET)
     assert http.requests == []
-    assert summary["errors"] is None
+    # out of the pool, but never out of sight: the census reports the errored
+    # population every cycle, and the reason it recorded is on the operator
+    # channel — a run that serves nobody must not read like a clean one
+    assert summary["errors"] == "1 watch(es) in status='error', not monitored"
+    assert summary["watches_errored"] == 1
+    assert f"{monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND}: 1" in summary["errors_detail"]
 
 
 def test_404_strikes_reset_on_successful_poll():
