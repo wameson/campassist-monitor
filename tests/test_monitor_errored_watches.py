@@ -447,7 +447,11 @@ def test_a_rejection_that_is_not_the_drift_still_fans_out_and_isolates():
 
     result = monitor.run(db, FakeAPNs(), FakeHTTP(lambda cg: FakeResponse(404)), **QUIET)
 
-    per_id = [c for c in db.calls_of("patch", "watches") if c[2]["id"].startswith("eq.")]
+    per_id = [
+        c for c in db.calls_of("patch", "watches")
+        if c[2]["id"].startswith("eq.")
+        and c[3].get("error_reason") == monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND
+    ]
     assert [c[2]["id"] for c in per_id] == ["eq.w0", "eq.w1", "eq.w2"]
     rows = {r["id"]: r for r in db.tables["watches"]}
     assert rows["w1"]["status"] == "error" and rows["w2"]["status"] == "error"
