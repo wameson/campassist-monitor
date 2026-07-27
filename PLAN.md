@@ -9,8 +9,8 @@ screens, the Add-Watch wizard, design system, and the iOS halves of the shared p
 Anything that crosses both repos (a schema column, a `campground_id` format, a provider
 contract) is specified here and referenced there.
 
-`README.md` in this repo is the operator-facing summary of what has shipped; `CLAUDE.md` holds
-the sharp-edge notes. This file is the design and the sequencing.
+`README.md` in this repo is the operator-facing summary of what has shipped; `AGENTS.md`
+(aliased `CLAUDE.md`) holds the sharp-edge notes. This file is the design and the sequencing.
 
 ---
 
