@@ -1266,7 +1266,11 @@ def test_a_watch_with_an_unusable_provider_ref_is_errored_once_and_converges():
     steady = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
 
     assert not [c for c in db.calls if c[0] == "patch" and "w-bad" in str(c)]
-    assert steady["errors"] is None
+    # converged, but not silent: the errored watch is now reported as a
+    # population count, with the reason it recorded operator-only
+    assert steady["errors"] == "1 watch(es) in status='error', not monitored"
+    assert steady["watches_errored"] == 1
+    assert f"{monitor.ERROR_REASON_UNREADABLE_PROVIDER_REF}: 1" in steady["errors_detail"]
     assert db.write_count <= 5
 
 

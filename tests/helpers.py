@@ -2,7 +2,7 @@
 
 FakeDB implements the same interface as db.SupabaseClient against
 in-memory tables, supporting the PostgREST filter subset the monitor
-uses (eq, in, lt), and can be given a `fail_on` hook that raises for
+uses (eq, in, lt, gte), and can be given a `fail_on` hook that raises for
 chosen calls the way a real PostgREST rejection would. FakeHTTP stands
 in for the recreation.gov client and FakeGTCHTTP for the GoingToCamp one
 (which addresses maps by query parameter rather than by path). No test
@@ -45,6 +45,9 @@ def _matches(row: dict, params: dict | None) -> bool:
         elif op == "lt":
             if not val < arg:
                 return False
+        elif op == "gte":
+            if not val >= arg:
+                return False
         else:
             raise NotImplementedError(f"FakeDB filter op {op!r}")
     return True
@@ -57,6 +60,7 @@ def postgrest_error(
     status: int = 400,
     message: str = "column watches.x does not exist",
     *,
+    code: str = "42703",
     details=None,
     hint=None,
 ):
@@ -67,7 +71,10 @@ def postgrest_error(
     response body. The request carries service-key headers like the real one, so
     a rendering that leaked them would show up in the tests. `details`/`hint`
     stand in for the fields PostgREST populates on a constraint violation, where
-    `details` echoes the offending key values."""
+    `details` echoes the offending key values. `code` defaults to PostgreSQL's
+    missing-column `42703`; PostgREST answers a column named in a write *body*
+    with its own `PGRST204` instead, which the monitor's write path also has to
+    recognize."""
     request = httpx.Request(
         "PATCH",
         "https://project.supabase.invalid/rest/v1/watches?id=in.%28w0,w1%29",
@@ -76,7 +83,7 @@ def postgrest_error(
     response = httpx.Response(
         status,
         request=request,
-        json={"code": "42703", "message": message, "details": details, "hint": hint},
+        json={"code": code, "message": message, "details": details, "hint": hint},
     )
     try:
         response.raise_for_status()
