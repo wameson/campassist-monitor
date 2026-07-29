@@ -584,10 +584,46 @@ def test_fanout_deadline_fits_inside_the_job_timeout():
         + monitor.FANOUT_DEADLINE_SECONDS
         + monitor.SHUTDOWN_RESERVE_SECONDS
     ) <= monitor.JOB_TIMEOUT_SECONDS
+    # since the jitter came down to 20 s, a worst-case jitter + a fully spent
+    # poll budget still reaches the fan-out with room left, where the 240 s
+    # jitter used to arrive past the deadline with none
     assert (
         monitor.START_JITTER_MAX_SECONDS + monitor.CYCLE_TIME_BUDGET_SECONDS
-        > monitor.FANOUT_DEADLINE_SECONDS
-    )  # a worst-case jitter + poll phase leaves no fan-out room at all
+        <= monitor.FANOUT_DEADLINE_SECONDS
+    )
+
+
+def test_worst_case_jitter_and_poll_phase_still_reaches_the_fanout():
+    # the behavioural half of the arithmetic above, through run() rather than
+    # through the constants: anchor process start at the worst case a cycle can
+    # reach the fan-out with — the full start jitter, then a fully spent poll
+    # budget — and w1's rejected row is still isolated per-id. At the 240 s
+    # jitter this was, the same worst case arrived past FANOUT_DEADLINE_SECONDS
+    # and the whole batch went down together.
+    def worst_case(jitter):
+        db, _ = pool(4, fail_on=fails_watch_patch("w1", columns=("last_checked_at",)))
+        apns = FakeAPNs()
+        result = monitor.run(
+            db, apns, FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+            **QUIET,
+            monotonic=Clock(jitter + monitor.CYCLE_TIME_BUDGET_SECONDS),
+            process_started=0.0,
+        )
+        checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+        rows = {r["id"]: r for r in db.tables["watches"]}
+        return result, checked, rows
+
+    result, checked, rows = worst_case(monitor.START_JITTER_MAX_SECONDS)
+    assert len(checked) == 5  # the batch, then one per-id write per row
+    assert rows["w1"]["status"] == "error"  # w1 alone, pinned to its own row
+    assert all(rows[f"w{i}"]["last_checked_at"] is not None for i in (0, 2, 3))
+    assert monitor.exit_code(result) == 0  # the other three were served: contained
+
+    # what the old jitter bought at the same worst case: batch only, so the one
+    # bad row is never identified and the other three go unchecked with it
+    _, checked_at_240, rows_at_240 = worst_case(240.0)
+    assert len(checked_at_240) == 1
+    assert all(rows_at_240[f"w{i}"]["last_checked_at"] is None for i in range(4))
 
 
 def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
@@ -615,9 +651,12 @@ def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
 
 
 def test_run_anchors_the_fanout_deadline_to_process_start():
-    # the start jitter main() sleeps counts against the fan-out, so a run that
-    # started late gets no fan-out at all — reaching the summary row and the
-    # pruning matters more than isolating one row
+    # everything since process start — the preflight, the start jitter, the poll
+    # phase — counts against the fan-out, so a run that got there late enough
+    # gets no fan-out at all: reaching the summary row and the pruning matters
+    # more than isolating one row. The 20 s jitter can no longer cause that on
+    # its own (see test_fanout_deadline_fits_inside_the_job_timeout); a slow
+    # Supabase or a stalled preflight still can, which is what this pins.
     clock = Clock(monitor.FANOUT_DEADLINE_SECONDS + 100)
     db, _ = pool(4, fail_on=fails_watch_patch("w0", "w1", "w2", "w3",
                                               columns=("last_checked_at",)))

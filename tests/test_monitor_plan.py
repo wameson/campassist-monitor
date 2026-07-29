@@ -154,10 +154,14 @@ def test_jitter_bounds():
     starts = [monitor.start_delay(rng) for _ in range(2000)]
     gaps = [monitor.inter_request_delay(rng) for _ in range(2000)]
 
-    assert all(0 <= s <= 240 for s in starts)
+    # 20 s, not the 240 s this was: a job has to stay inside GitHub's 1-minute
+    # billing floor, and the desync it buys is only needed at all because the
+    # trigger is moving to an exact-wall-clock external cron (monitor.py).
+    assert monitor.START_JITTER_MAX_SECONDS == 20.0
+    assert all(0 <= s <= 20 for s in starts)
     assert all(1.2 <= g <= 2.8 for g in gaps)
     # the whole range is actually used, not a constant
-    assert min(starts) < 30 and max(starts) > 210
+    assert min(starts) < 2.5 and max(starts) > 17.5
     assert min(gaps) < 1.35 and max(gaps) > 2.65
 
     # run() sleeps between consecutive recreation.gov requests within bounds

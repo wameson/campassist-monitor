@@ -72,9 +72,27 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
 ]
 
-START_JITTER_MAX_SECONDS = 240.0
+# Start jitter, cut from 240 s on 2026-07-28 (captain-approved, measured). Two
+# findings set the new value. It was costing a *mean of 120 s of billed runner
+# time per run* against ~10 s of real work — 92% of the monitor's Actions
+# minutes were time.sleep() — which alone put an honest */30 cadence at
+# ~4,154 min/mo against a 2,000-minute free tier, i.e. an outage at the default
+# $0 spending limit, not a bill. And under the `schedule` trigger it was buying
+# nothing: GitHub's own throttling already spreads delivery near-uniformly
+# across all 60 minutes of the hour, so the desync below was already being
+# provided for free.
+#
+# It is 20 s rather than 0 because the trigger is planned to move to an
+# external cron that fires at exact wall-clock times, which restores the
+# desync rationale; reinstating a removed constant later is a second change.
+# 20 s is the top of the free band: billing is per job rounded up to the whole
+# minute, and a jitter-free job measured 11–25 s end to end, so anything ≤20 s
+# still lands inside the 1-minute floor while 30 s or more doubles the bill.
+# Cost is flat below that edge and the desync grows with the spread, so take
+# the maximum — it still leaves 15–30 s of headroom against runner variance.
+START_JITTER_MAX_SECONDS = 20.0
 INTER_REQUEST_DELAY_RANGE = (1.2, 2.8)
-# Keeps jitter (≤240 s) + polling + one in-flight request (≤20 s) + the
+# Keeps jitter (≤20 s) + polling + one in-flight request (≤20 s) + the
 # bookkeeping writes inside the workflow's 15-minute timeout even under
 # sustained 403/429 blocking.
 CYCLE_TIME_BUDGET_SECONDS = 480.0
@@ -167,7 +185,7 @@ PER_ID_FALLBACK_MAX = 50
 #
 #   120 s  job setup      checkout + setup-python + pip install
 # + 600 s  FANOUT_DEADLINE_SECONDS, measured from PROCESS start — the start
-#          jitter main() sleeps (≤240 s) and the schema preflight that runs
+#          jitter main() sleeps (≤20 s) and the schema preflight that runs
 #          before it are inside it, not on top of it
 #
 # The preflight (preflight.py, called from main() before the jitter) is charged
@@ -190,6 +208,18 @@ PER_ID_FALLBACK_MAX = 50
 # the leftover budget. No per-id write starts once the allowance is gone, so a
 # whole cycle's fan-out spend is at most 100 s plus the one PATCH still in
 # flight (30 s, db.py) — across every fan-out site together, not per site.
+#
+# Since the jitter came down to 20 s, the slowest *poll phase* reaches the
+# fan-out with room to spare rather than already past the deadline: 20 s of
+# jitter plus a fully spent CYCLE_TIME_BUDGET_SECONDS (480 s) is 500 s of the
+# 600 s, leaving ~100 s of per-row isolation where 240 s of jitter used to
+# arrive with none. That covers the jitter and the poll phase only — the
+# preflight above is charged against the same 600 s, so a cycle slow enough
+# there can still arrive past the deadline and get no fan-out at all, the trade
+# README.md and PLAN.md hedge the same way. The deadline still binds, and still
+# yields to the summary row and the pruning when it does; it just no longer
+# binds on a healthy run. test_fanout_deadline_fits_inside_the_job_timeout
+# holds the jitter-plus-poll term of that arithmetic, not the whole worst case.
 JOB_TIMEOUT_SECONDS = 900.0
 JOB_SETUP_RESERVE_SECONDS = 120.0
 SHUTDOWN_RESERVE_SECONDS = 180.0
@@ -200,13 +230,19 @@ PER_ID_FALLBACK_BUDGET_SECONDS = 100.0
 
 # Process start, captured at import — before main() sleeps its start jitter —
 # so the fan-out deadline covers the jitter instead of stacking on top of it.
+# The jitter is small now, but the anchor stays: the preflight also runs before
+# run() is entered, and the deadline is meant to cover everything since import.
 PROCESS_STARTED = time.monotonic()
 
 
 # --- jitter ---------------------------------------------------------------
 
 def start_delay(rng: random.Random) -> float:
-    """Random run-start delay to desynchronize from the exact cron tick."""
+    """Random run-start delay to desynchronize from the exact trigger tick.
+
+    Kept small deliberately — see START_JITTER_MAX_SECONDS for why 20 s and not
+    the 240 s this was, nor 0.
+    """
     return rng.uniform(0, START_JITTER_MAX_SECONDS)
 
 
@@ -607,12 +643,13 @@ def run(
     # The fan-out runs after the poll budget is spent, so it cannot share
     # budget_exhausted() (already true by then) and gets its own cap instead —
     # anchored by default to process start, not to run() entry, so the start
-    # jitter counts against it rather than being added on top of it. That
-    # default holds for every caller on the real clock, wrapped or instrumented
-    # or not. A caller on a clock of its own (tests) is on another timeline
-    # PROCESS_STARTED says nothing about, so it passes process_started=None to
-    # anchor to this run's own `started` reading instead — same clock domain,
-    # no jitter to account for — or an explicit reading of its own clock.
+    # jitter (≤20 s) and the preflight ahead of it count against it rather than
+    # being added on top of it. That default holds for every caller on the real
+    # clock, wrapped or instrumented or not. A caller on a clock of its own
+    # (tests) is on another timeline PROCESS_STARTED says nothing about, so it
+    # passes process_started=None to anchor to this run's own `started` reading
+    # instead — same clock domain, no jitter to account for — or an explicit
+    # reading of its own clock.
     if process_started is None:
         process_started = started
     fanout_budget = FanoutBudget(
@@ -1279,11 +1316,13 @@ def main() -> None:
     rng = random.Random()
     db = SupabaseClient.from_env()
     # Schema-drift guard, deliberately ahead of the jitter sleep: a run halted by
-    # drift goes red immediately instead of burning up to 240 s of Actions
-    # minutes first. Moving it ahead costs no politeness toward any campground
-    # provider — the probe is Supabase-only, and the jitter exists to
-    # desynchronize *provider* polling. Halting drift raises SystemExit(1) here,
-    # before run()'s first write; everything else warns and falls through.
+    # drift goes red before sleeping at all. That mattered far more when the
+    # jitter was 240 s of billed Actions minutes; at 20 s the ordering is kept
+    # because it is still free — the probe is Supabase-only, and the jitter
+    # exists to desynchronize *provider* polling, so nothing is owed to a
+    # campground host by a run that never reaches one. Halting drift raises
+    # SystemExit(1) here, before run()'s first write; everything else warns and
+    # falls through.
     preflight(db)
 
     delay = start_delay(rng)

@@ -170,8 +170,8 @@ Repo → **Settings → Secrets and variables → Actions** → add all six:
 
 Actions → **Monitor Campsites** → **Run workflow**. A run with zero watches
 completes cleanly and writes one `run_summaries` row. Scheduled runs then fire
-every 30 minutes (GitHub adds its own 0–5 min cron jitter; the script adds a
-random 0–4 min start delay on top by design).
+every 30 minutes (GitHub adds its own cron delay; the script adds a random
+0–20 s start delay on top by design — see `START_JITTER_MAX_SECONDS`).
 
 ## Database migrations
 
@@ -325,12 +325,14 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   many batches fall back, the cycle's whole fan-out spend is that allowance
   plus the one PATCH still in flight when it runs out (30 s) — and it may
   never run past `FANOUT_DEADLINE_SECONDS` (600 s)
-  measured from **process start** — so the up-to-240 s start jitter counts
-  against it instead of stacking on top of it. The arithmetic closes against
-  the workflow's `timeout-minutes: 15` (900 s): 120 s for checkout /
-  setup-python / pip, 600 s to the fan-out deadline, 180 s of shutdown
-  reserve for one in-flight PATCH (30 s) plus the summary insert and both
-  prunes. A worst-case run — full jitter and a full poll budget — therefore
+  measured from **process start** — so the preflight and the up-to-20 s start
+  jitter count against it instead of stacking on top of it. The arithmetic
+  closes against the workflow's `timeout-minutes: 15` (900 s): 120 s for
+  checkout / setup-python / pip, 600 s to the fan-out deadline, 180 s of
+  shutdown reserve for one in-flight PATCH (30 s) plus the summary insert and
+  both prunes. Since the jitter came down from 240 s, even a worst case — full
+  jitter plus a fully spent 480 s poll budget — reaches the fan-out with ~100 s
+  of the 600 left. A run slow enough to arrive past the deadline anyway still
   gets no fan-out at all, which is the right trade: reaching the summary row
   and the pruning matters more than isolating one row.
 
