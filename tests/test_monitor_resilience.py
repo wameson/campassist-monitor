@@ -593,6 +593,39 @@ def test_fanout_deadline_fits_inside_the_job_timeout():
     )
 
 
+def test_worst_case_jitter_and_poll_phase_still_reaches_the_fanout():
+    # the behavioural half of the arithmetic above, through run() rather than
+    # through the constants: anchor process start at the worst case a cycle can
+    # reach the fan-out with — the full start jitter, then a fully spent poll
+    # budget — and w1's rejected row is still isolated per-id. At the 240 s
+    # jitter this was, the same worst case arrived past FANOUT_DEADLINE_SECONDS
+    # and the whole batch went down together.
+    def worst_case(jitter):
+        db, _ = pool(4, fail_on=fails_watch_patch("w1", columns=("last_checked_at",)))
+        apns = FakeAPNs()
+        result = monitor.run(
+            db, apns, FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+            **QUIET,
+            monotonic=Clock(jitter + monitor.CYCLE_TIME_BUDGET_SECONDS),
+            process_started=0.0,
+        )
+        checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+        rows = {r["id"]: r for r in db.tables["watches"]}
+        return result, checked, rows
+
+    result, checked, rows = worst_case(monitor.START_JITTER_MAX_SECONDS)
+    assert len(checked) == 5  # the batch, then one per-id write per row
+    assert rows["w1"]["status"] == "error"  # w1 alone, pinned to its own row
+    assert all(rows[f"w{i}"]["last_checked_at"] is not None for i in (0, 2, 3))
+    assert monitor.exit_code(result) == 0  # the other three were served: contained
+
+    # what the old jitter bought at the same worst case: batch only, so the one
+    # bad row is never identified and the other three go unchecked with it
+    _, checked_at_240, rows_at_240 = worst_case(240.0)
+    assert len(checked_at_240) == 1
+    assert all(rows_at_240[f"w{i}"]["last_checked_at"] is None for i in range(4))
+
+
 def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
     # run() wires the allowance into the fan-out: a Supabase slow enough to eat
     # the job timeout one row at a time is cut off, and the cycle still reports
