@@ -33,7 +33,7 @@ per cycle.
 campassist-monitor (GitHub, PRIVATE)
   .github/workflows/monitor.yml   cron */30 + workflow_dispatch, timeout-minutes: 15
     ├── preflight: read-only schema-drift probe (before the jitter)
-    ├── start jitter: sleep rand(0–240s)
+    ├── start jitter: sleep rand(0–20s)
     ├── read status=eq.monitoring watches + errored-watch census
     ├── expire past-end_date watches
     ├── plan PollUnits (provider, PollKey) — deduped cross-user, per provider
@@ -57,6 +57,16 @@ campassist-monitor (GitHub, PRIVATE)
 | Backend pytest CI (ubuntu 1×, ~2 min/PR) | ~40 min/mo |
 | iOS unit tests on merge to main (macOS **10×**) | ~320 min/mo |
 | **Total** | **~1,800 / 2,000** |
+
+**This table only holds because the job stays inside the 1-minute billing floor.** Billing is
+per job, rounded up to the whole minute, so the ~1 min/run figure is a *floor*, not an
+estimate — and until 2026-07-28 reality missed it by 2.9×. A 226-run measurement found the
+median job at 141 s against ~10 s of real work: the 240 s start jitter was a mean of 120 s of
+billed `time.sleep()` per run — 92% of the monitor's Actions minutes — which would have put an
+honest `*/30` at **~4,154 min/mo**. At a GitHub Free account's default $0 spending limit that
+is not a bill, it is every private-repo Action stopping until the next billing cycle. Cutting
+the jitter to 20 s (`START_JITTER_MAX_SECONDS`) restored the floor. **The rule that keeps this
+table true: nothing may push a no-change cycle past ~60 s of wall clock.**
 
 **Why 30 min and not 15:** the budget above. Escape hatches when it is hit, in order:
 (1) **self-hosted runner** on an always-on home machine — unlimited free minutes on private
@@ -208,7 +218,7 @@ A no-change cycle performs **≤5 Supabase writes** regardless of watch count: 1
 delta-only writing is what keeps ~200–500 writes/day at any scale instead of ~9,600.
 
 ### Anti-blocking (jittered, polite)
-Random 0–240 s start delay per run; 1.2–2.8 s inter-request delays; randomized poll order;
+Random 0–20 s start delay per run; 1.2–2.8 s inter-request delays; randomized poll order;
 one realistic browser User-Agent per run, rotated across runs; exponential backoff on
 403/429/5xx (2 → 4 → 8 s, then skip that unit this cycle). Escalation path is the self-hosted
 runner (residential IP).
@@ -227,9 +237,12 @@ midnight. A watch straddling the horizon is served for its in-horizon nights alo
 
 | Users | Unique campgrounds | Requests/cycle | Runtime incl. jitter |
 |---|---|---|---|
-| 100 | 20 | ~20 | ~1 min |
-| 1,000 | 80 | ~80 | ~3–4 min |
-| 10,000 | 200 | ~200 | ~7–9 min |
+| 100 | 20 | ~20 | <1 min |
+| 1,000 | 80 | ~80 | ~3 min |
+| 10,000 | 200 | ~200 | ~7 min |
+
+Dominated by the 1.2–2.8 s inter-request pacing (~2 s mean); the ≤20 s start jitter is noise
+at every row. Only the first row is today's reality, and it bills as one minute.
 
 ### Alert delivery
 APNs HTTP/2 with an ES256 JWT (`iss`=team, `kid`=key, cached ~50 min), `apns-push-type: alert`,
@@ -454,11 +467,13 @@ Fan-out rules, each with a reason:
   caller knows is about the *payload* rather than any one row — today the missing
   `error_reason` column alone.
 - The fan-out is capped twice: `PER_ID_FALLBACK_BUDGET_SECONDS` (100 s) of total wall clock,
-  and never past `FANOUT_DEADLINE_SECONDS` (600 s) **from process start**, so the up-to-240 s
-  jitter counts against it rather than stacking on top. The arithmetic closes against
-  `timeout-minutes: 15` (900 s): 120 s setup + 600 s deadline + 180 s shutdown reserve. A
-  worst-case run gets no fan-out at all — reaching the summary row and the pruning matters more
-  than isolating one row.
+  and never past `FANOUT_DEADLINE_SECONDS` (600 s) **from process start**, so the preflight and
+  the up-to-20 s jitter count against it rather than stacking on top. The arithmetic closes
+  against `timeout-minutes: 15` (900 s): 120 s setup + 600 s deadline + 180 s shutdown reserve.
+  Since the jitter came down from 240 s, even a worst case — full jitter plus a fully spent
+  480 s poll budget, 500 s of the 600 — reaches the fan-out with ~100 s left; a run slow enough
+  to arrive past the deadline still gets none at all, because reaching the summary row and the
+  pruning matters more than isolating one row.
 
 ### Exit status
 
@@ -544,7 +559,7 @@ A summary INSERT that itself fails is the one unrepresentable case — there is 
 - [x] `test_delta_detection` — unchanged availability → no alert; new opening → alert
 - [x] `test_alert_cooldown` — (site,date) alerted <6 h ago → suppressed; >6 h → re-alerted
 - [x] `test_expiry` — watch past `end_date` → marked expired, excluded from polling
-- [x] `test_jitter_bounds` — inter-request delays within [1.2, 2.8]s; start delay within [0, 240]s
+- [x] `test_jitter_bounds` — inter-request delays within [1.2, 2.8]s; start delay within [0, 20]s
 - [x] `test_apns_jwt` — ES256, correct `iss`/`kid`; cached within run, refreshed after 50 min
 - [x] `test_apns_410_cleanup` — 410 → token row deleted
 - [x] `test_env_routing` — sandbox token → sandbox host; production → production host
@@ -701,7 +716,8 @@ as its own `campassist-monitor` task (captain, 2026-07-26):
 
 | Decision | Choice | Why |
 |---|---|---|
-| Polling cadence | Centralized Actions cron, private repo, every 30 min with jitter | 2,000-min free tier; jitter desynchronizes from the cron tick |
+| Polling cadence | Centralized Actions cron, private repo, every 30 min | 2,000-min free tier |
+| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stays inside the 1-minute billing floor and keeps the desync for an exact-wall-clock external trigger |
 | Scale-up path | Self-hosted runner (unlimited free, residential IP) or public repo | avoids paying, and a residential IP is less likely to be flagged |
 | Alerting (v1) | APNs push with a direct booking link — nothing else | free programmatic SMS no longer exists; carrier email gateways are defunct |
 | DB writes | Delta-only via `state_hash`, one summary row/cycle, 30-day pruning | naive per-watch writing blew the free tier ~6× |

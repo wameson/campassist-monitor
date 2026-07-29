@@ -584,10 +584,13 @@ def test_fanout_deadline_fits_inside_the_job_timeout():
         + monitor.FANOUT_DEADLINE_SECONDS
         + monitor.SHUTDOWN_RESERVE_SECONDS
     ) <= monitor.JOB_TIMEOUT_SECONDS
+    # since the jitter came down to 20 s, a worst-case jitter + a fully spent
+    # poll budget still reaches the fan-out with room left, where the 240 s
+    # jitter used to arrive past the deadline with none
     assert (
         monitor.START_JITTER_MAX_SECONDS + monitor.CYCLE_TIME_BUDGET_SECONDS
-        > monitor.FANOUT_DEADLINE_SECONDS
-    )  # a worst-case jitter + poll phase leaves no fan-out room at all
+        <= monitor.FANOUT_DEADLINE_SECONDS
+    )
 
 
 def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
@@ -615,9 +618,12 @@ def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
 
 
 def test_run_anchors_the_fanout_deadline_to_process_start():
-    # the start jitter main() sleeps counts against the fan-out, so a run that
-    # started late gets no fan-out at all — reaching the summary row and the
-    # pruning matters more than isolating one row
+    # everything since process start — the preflight, the start jitter, the poll
+    # phase — counts against the fan-out, so a run that got there late enough
+    # gets no fan-out at all: reaching the summary row and the pruning matters
+    # more than isolating one row. The 20 s jitter can no longer cause that on
+    # its own (see test_fanout_deadline_fits_inside_the_job_timeout); a slow
+    # Supabase or a stalled preflight still can, which is what this pins.
     clock = Clock(monitor.FANOUT_DEADLINE_SECONDS + 100)
     db, _ = pool(4, fail_on=fails_watch_patch("w0", "w1", "w2", "w3",
                                               columns=("last_checked_at",)))
