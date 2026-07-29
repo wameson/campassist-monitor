@@ -61,9 +61,9 @@ campassist-monitor (GitHub, PRIVATE)
 **This table only holds because the job stays inside the 1-minute billing floor.** Billing is
 per job, rounded up to the whole minute, so the ~1 min/run figure is a *floor*, not an
 estimate — and until 2026-07-28 reality missed it by 2.9×. A 226-run measurement found the
-median job at 141 s against ~10 s of real work: the 240 s start jitter was a mean of 120 s of
-billed `time.sleep()` per run — 92% of the monitor's Actions minutes — which would have put an
-honest `*/30` at **~4,154 min/mo**. At a GitHub Free account's default $0 spending limit that
+median job at 141 s — its `Run monitor` step ~130 s of that — against ~10 s of real work: the
+240 s start jitter was a mean of 120 s of billed `time.sleep()` per run, i.e. 92% of that
+~130 s monitor step, which would have put an honest `*/30` at **~4,154 min/mo**. At a GitHub Free account's default $0 spending limit that
 is not a bill, it is every private-repo Action stopping until the next billing cycle. Cutting
 the jitter to 20 s (`START_JITTER_MAX_SECONDS`) restored the floor. **The rule that keeps this
 table true: nothing may push a no-change cycle past ~60 s of wall clock.**
@@ -237,12 +237,19 @@ midnight. A watch straddling the horizon is served for its in-horizon nights alo
 
 | Users | Unique campgrounds | Requests/cycle | Runtime incl. jitter |
 |---|---|---|---|
-| 100 | 20 | ~20 | <1 min |
+| 100 | 20 | ~20 | ~1 min, at the floor |
 | 1,000 | 80 | ~80 | ~3 min |
 | 10,000 | 200 | ~200 | ~7 min |
 
 Dominated by the 1.2–2.8 s inter-request pacing (~2 s mean); the ≤20 s start jitter is noise
-at every row. Only the first row is today's reality, and it bills as one minute.
+at every row. Today's poll set is far smaller than the first row — a jitter-free job measures
+11–25 s end to end — and it is that cycle, not the projection, that bills as one minute. The
+first row has no margin left: 20 poll units is ~19 gaps × ~2 s ≈ 38 s of pacing, plus request
+time, plus a 0–20 s jitter — a ~58 s mean and a ~68 s worst case against the same 60 s billing
+floor the minutes table above depends on. **Past roughly 20 poll units the binding cost of a
+no-change cycle is the per-request pacing, not the start jitter**, so that floor is the thing
+to watch as the pool grows. This is an observation about the budget: `INTER_REQUEST_DELAY_RANGE`
+is politeness toward the providers, is not a cost lever, and stays as it is.
 
 ### Alert delivery
 APNs HTTP/2 with an ES256 JWT (`iss`=team, `kid`=key, cached ~50 min), `apns-push-type: alert`,

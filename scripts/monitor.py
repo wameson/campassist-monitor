@@ -209,13 +209,17 @@ PER_ID_FALLBACK_MAX = 50
 # whole cycle's fan-out spend is at most 100 s plus the one PATCH still in
 # flight (30 s, db.py) — across every fan-out site together, not per site.
 #
-# Since the jitter came down to 20 s, the worst case reaches the fan-out with
-# room to spare rather than already past the deadline: 20 s of jitter plus a
-# fully spent CYCLE_TIME_BUDGET_SECONDS (480 s) is 500 s of the 600 s, so even
-# the slowest cycle keeps ~100 s of fan-out — the isolation the deadline used
-# to spend first. The deadline still binds, and still yields to the summary row
-# and the pruning when it does; it just no longer binds on a healthy run.
-# test_fanout_deadline_fits_inside_the_job_timeout holds that arithmetic.
+# Since the jitter came down to 20 s, the slowest *poll phase* reaches the
+# fan-out with room to spare rather than already past the deadline: 20 s of
+# jitter plus a fully spent CYCLE_TIME_BUDGET_SECONDS (480 s) is 500 s of the
+# 600 s, leaving ~100 s of per-row isolation where 240 s of jitter used to
+# arrive with none. That covers the jitter and the poll phase only — the
+# preflight above is charged against the same 600 s, so a cycle slow enough
+# there can still arrive past the deadline and get no fan-out at all, the trade
+# README.md and PLAN.md hedge the same way. The deadline still binds, and still
+# yields to the summary row and the pruning when it does; it just no longer
+# binds on a healthy run. test_fanout_deadline_fits_inside_the_job_timeout
+# holds the jitter-plus-poll term of that arithmetic, not the whole worst case.
 JOB_TIMEOUT_SECONDS = 900.0
 JOB_SETUP_RESERVE_SECONDS = 120.0
 SHUTDOWN_RESERVE_SECONDS = 180.0
