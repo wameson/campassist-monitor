@@ -67,6 +67,25 @@ CREATE TABLE sent_alerts (
     UNIQUE(watch_id, site_id, date)
 );
 
+CREATE TABLE alert_history (
+    -- One row per DELIVERED push (an APNs 200), written in the same step and on
+    -- the same condition as watches.last_found_at, so the badge and the app's
+    -- Alert History can never disagree. This is the app's read-facing source of
+    -- truth for delivered alerts; sent_alerts stays dedup bookkeeping (per
+    -- site+date, aggressively pruned, never read by the app) and is a different
+    -- grain. Columns mirror the push payload the app already parses (apns.py):
+    -- campground_name + start_date/end_date + opening count. Dates are DATE
+    -- (timezone-independent calendar days) and are stored verbatim from the
+    -- watch — no timezone shift.
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    watch_id        UUID REFERENCES watches(id) ON DELETE CASCADE,
+    campground_name TEXT NOT NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NOT NULL,
+    site_count      INT NOT NULL,        -- openings this push announced (len of fresh)
+    delivered_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE run_summaries (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     ran_at        TIMESTAMPTZ DEFAULT NOW(),
@@ -80,11 +99,16 @@ CREATE TABLE run_summaries (
 ALTER TABLE watches       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE device_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sent_alerts   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alert_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_summaries ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "own watches"  ON watches       FOR ALL    USING (user_id = auth.uid());
 CREATE POLICY "own token"    ON device_tokens FOR ALL    USING (user_id = auth.uid());
 CREATE POLICY "read own alerts" ON sent_alerts FOR SELECT
+    USING (watch_id IN (SELECT id FROM watches WHERE user_id = auth.uid()));
+-- Same owner scoping as sent_alerts: an anon user reads ONLY their own delivered
+-- alerts, joined through the watch's owner. Never opened to all.
+CREATE POLICY "read own alert history" ON alert_history FOR SELECT
     USING (watch_id IN (SELECT id FROM watches WHERE user_id = auth.uid()));
 CREATE POLICY "read summaries" ON run_summaries FOR SELECT USING (true);
 -- Backend writes via service-role key (bypasses RLS)

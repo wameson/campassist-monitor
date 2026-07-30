@@ -22,7 +22,7 @@ from providers.going_to_camp import ATTRIBUTES_URL, EQUIPMENT_URL, RESOURCES_URL
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-TABLES = ("watches", "device_tokens", "sent_alerts", "run_summaries")
+TABLES = ("watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries")
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

@@ -141,7 +141,7 @@ path from it (SSRF).
 ### 1. Supabase
 
 1. Create a free project at [supabase.com](https://supabase.com) (any region).
-2. Open **SQL Editor**, paste the entire contents of [`supabase/schema.sql`](supabase/schema.sql), and run it once. This creates `watches`, `device_tokens`, `sent_alerts`, and `run_summaries` with row-level security enabled.
+2. Open **SQL Editor**, paste the entire contents of [`supabase/schema.sql`](supabase/schema.sql), and run it once. This creates `watches`, `device_tokens`, `sent_alerts`, `alert_history`, and `run_summaries` with row-level security enabled.
 3. Enable **Anonymous Sign-In**: Dashboard → **Authentication → Sign In / Providers → Allow anonymous sign-ins** → toggle on. The iOS app signs every device in anonymously so `auth.uid()` is real and the RLS policies work.
 4. Collect two values for the secrets below:
    - **Project URL** (Settings → API → Project URL) → `SUPABASE_URL`

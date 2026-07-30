@@ -363,6 +363,25 @@ def alert_rows(watch: dict, openings: list[dict], now: datetime) -> list[dict]:
     ]
 
 
+def history_row(watch: dict, openings: list[dict], now: datetime) -> dict:
+    """The app's read-facing record of one DELIVERED push (alert_history).
+
+    One row per delivered alert, mirroring the push payload the app parses
+    (apns.send_alert): the campground name, the watch's requested window, and the
+    opening count this push announced. `start_date`/`end_date` are the watch's
+    stored DATE strings verbatim — the same values apns.py interpolates into the
+    body — so no timezone shift is introduced. `site_count` is `len(openings)`,
+    the fresh openings this push was for, matching the body's "N site(s) open"."""
+    return {
+        "watch_id": watch["id"],
+        "campground_name": watch["campground_name"],
+        "start_date": watch["start_date"],
+        "end_date": watch["end_date"],
+        "site_count": len(openings),
+        "delivered_at": iso_now(now),
+    }
+
+
 # --- failure containment --------------------------------------------------
 
 def rejection_reason(response, *, safe: bool) -> str:
@@ -1105,6 +1124,23 @@ def run(
                         # every cycle until the drift is fixed.
                         record_failures(
                             unattributed_failure(watch_id, exc), "alert", blocking=False
+                        )
+                    try:
+                        # The app's server-truth Alert History: one row per
+                        # delivered push, in the same step and condition as
+                        # last_found_at below, so badge and history cannot
+                        # disagree. Purely additive — a failure here (e.g. an
+                        # unapplied 0005) is reported but UNRATED and never blocks
+                        # the row's own state_hash/last_found_at write, so a
+                        # missing alert_history table cannot redden the run or
+                        # stop a single push.
+                        db.insert("alert_history", history_row(watch, fresh, now))
+                    except Exception as exc:
+                        record_failures(
+                            unattributed_failure(watch_id, exc),
+                            "alert",
+                            blocking=False,
+                            rated=False,
                         )
         except Exception as exc:  # sent_alerts / APNs: not this watch's row
             # Table-scoped, like the delivery failure above: the watch was

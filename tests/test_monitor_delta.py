@@ -5,7 +5,16 @@ from datetime import timedelta
 
 import apns as apns_module
 import monitor
-from helpers import NOW, FakeAPNs, FakeDB, FakeHTTP, FakeResponse, availability_payload, make_watch
+from helpers import (
+    NOW,
+    FakeAPNs,
+    FakeDB,
+    FakeHTTP,
+    FakeResponse,
+    availability_payload,
+    make_watch,
+    postgrest_error,
+)
 
 QUIET = dict(rng=random.Random(0), sleep=lambda s: None, now_fn=lambda: NOW)
 
@@ -103,6 +112,117 @@ def test_retryable_apns_failure_keeps_hash_and_retries():
     assert [w for w, _ in apns.alerts] == ["w1"] and summary["alerts_sent"] == 1
     assert db.tables["watches"][0]["state_hash"] != "stale-hash"
     assert len(db.tables["sent_alerts"]) == 1
+
+
+# --- server-truth Alert History (alert_history) ---------------------------
+#
+# One alert_history row is written per DELIVERED push, in the same step and on
+# the same condition (delivered) as watches.last_found_at, so the app can render
+# history from the same fact the "Site Found" badge is derived from. These tests
+# pin: a delivered alert writes exactly one row with the right fields; a
+# non-delivered or suppressed alert writes none; and a failing history write is
+# purely additive — it never blocks the row's own writes or reddens the run.
+
+def _delivery_db():
+    return FakeDB({
+        "watches": [make_watch(state_hash="stale-hash")],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+    })
+
+
+def test_delivered_alert_writes_one_history_row():
+    db = _delivery_db()
+    payload = availability_payload({"100": {"2026-08-10": "Available", "2026-08-11": "Available"}})
+
+    summary, apns = run_cycle(db, payload)
+    assert summary["alerts_sent"] == 2
+
+    # exactly one history row, in the same cycle last_found_at was set
+    watch = db.tables["watches"][0]
+    assert watch["last_found_at"] is not None
+    assert len(db.tables["alert_history"]) == 1
+    row = db.tables["alert_history"][0]
+    assert row["watch_id"] == "w1"
+    assert row["campground_name"] == "Upper Pines"
+    # dates are the watch's DATE strings verbatim — no timezone shift (Issue 1)
+    assert row["start_date"] == "2026-08-10"
+    assert row["end_date"] == "2026-08-12"
+    # site_count is the fresh openings this push announced
+    assert row["site_count"] == 2
+    assert row["delivered_at"] == monitor.iso_now(NOW)
+
+
+def test_history_row_is_written_only_when_last_found_at_is():
+    # No-change cycle, cooldown-suppressed, and both APNs failures all leave
+    # last_found_at unset — and must therefore leave alert_history untouched.
+
+    # (a) no delta -> no push, no history
+    db = FakeDB({
+        "watches": [make_watch()],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+    })
+    quiet = availability_payload({"100": {"2026-08-10": "Reserved"}})
+    run_cycle(db, quiet)          # seeds hash
+    run_cycle(db, quiet)          # unchanged
+    assert db.tables["alert_history"] == []
+
+    # (b) opening within the cooldown -> push suppressed, no history
+    db = FakeDB({
+        "watches": [make_watch(state_hash="stale-hash")],
+        "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+        "sent_alerts": [{
+            "id": "a1", "watch_id": "w1", "site_id": "100", "date": "2026-08-10",
+            "sent_at": monitor.iso_now(NOW - timedelta(hours=1)),
+        }],
+    })
+    summary, apns = run_cycle(db, availability_payload({"100": {"2026-08-10": "Available"}}))
+    assert apns.alerts == [] and summary["alerts_sent"] == 0
+    assert db.tables["alert_history"] == []
+
+    # (c) retryable and (d) permanent APNs failures -> delivered is False, no history
+    for result in (apns_module.RETRYABLE_FAILURE, apns_module.PERMANENT_FAILURE):
+        db = _delivery_db()
+        payload = availability_payload({"100": {"2026-08-10": "Available"}})
+        summary, _ = run_cycle(db, payload, FakeAPNs(result=result))
+        assert summary["alerts_sent"] == 0
+        assert db.tables["watches"][0]["last_found_at"] is None
+        assert db.tables["alert_history"] == []
+
+
+def test_failed_history_write_is_additive_and_does_not_redden_the_run():
+    # A rejected alert_history insert (e.g. an unapplied 0005) must not block the
+    # watch's own state_hash/last_found_at write, and must not turn the run red:
+    # the write is contained, non-blocking and UNRATED.
+    def fail_history_insert(call):
+        if call[0] == "insert" and call[1] == "alert_history":
+            return postgrest_error(400, "relation \"alert_history\" does not exist", code="PGRST205")
+        return None
+
+    db = FakeDB(
+        {
+            "watches": [make_watch(state_hash="stale-hash")],
+            "device_tokens": [{"user_id": "u1", "apns_token": "tok", "environment": "production"}],
+        },
+        fail_on=fail_history_insert,
+    )
+    payload = availability_payload({"100": {"2026-08-10": "Available"}})
+
+    summary, apns = run_cycle(db, payload)
+
+    # the push still landed and the badge fact was still written
+    assert [w for w, _ in apns.alerts] == ["w1"]
+    watch = db.tables["watches"][0]
+    assert watch["last_found_at"] is not None
+    assert watch["state_hash"] != "stale-hash"
+    assert db.tables["alert_history"] == []          # the insert failed
+    assert len(db.tables["sent_alerts"]) == 1         # dedup row still written
+    # the failure is still reported (so an unapplied migration is visible)...
+    assert summary["watch_errors"] == 1
+    # ...but it is unrated and non-erroring: the watch is not moved to error and
+    # the run stays green.
+    assert db.tables["watches"][0]["status"] == "monitoring"
+    assert summary["systemic_failure"] is False
+    assert monitor.exit_code(summary) == 0
 
 
 def test_permanent_apns_failure_advances_hash():

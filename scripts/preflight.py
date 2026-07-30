@@ -120,6 +120,19 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         "sent_at":  (HALT, None),   # written, and the retention prune filters on it
         "id":       (WARN, None),   # monitor never reads or writes it
     },
+    "alert_history": {
+        # All WARN: the monitor writes this table but never reads it, and the
+        # insert is fully contained (non-blocking, unrated, unattributed), so an
+        # unapplied 0005 keeps monitoring and keeps delivering — see the note
+        # below. WARN is also what lets 0005 merge before it is applied.
+        "watch_id":        (WARN, "0005_alert_history.sql"),
+        "campground_name": (WARN, "0005_alert_history.sql"),
+        "start_date":      (WARN, "0005_alert_history.sql"),
+        "end_date":        (WARN, "0005_alert_history.sql"),
+        "site_count":      (WARN, "0005_alert_history.sql"),
+        "delivered_at":    (WARN, "0005_alert_history.sql"),
+        "id":              (WARN, None),  # monitor never reads or writes it
+    },
     "run_summaries": {
         "watches_checked":    (HALT, None),   # inserted in run()'s summary row
         "campgrounds_polled": (HALT, None),   # inserted in run()'s summary row
@@ -168,6 +181,16 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          also read, `.get`-tolerantly, in `monitor.error_reason_census`.
 #                          Classifying it HALT would invert the blast radius: the cycle would
 #                          stop entirely over a column that only annotates an error.
+#   alert_history.*        every column is WARN because the whole table is write-only for
+#                          the monitor and the write is fully contained. `run`'s DELIVERED
+#                          block inserts one history row via `db.insert("alert_history", …)`
+#                          inside its own try/except, recording a non-blocking, UNRATED,
+#                          unattributed cycle failure on rejection (`record_failures(…,
+#                          rated=False, blocking=False)`). So a live DB on which 0005 is not
+#                          yet applied keeps monitoring, keeps delivering pushes, and keeps
+#                          setting last_found_at — only the history rows go unwritten until
+#                          the migration is applied. Classifying it HALT would halt every
+#                          cycle over a table that only feeds the app's read-facing history.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read
