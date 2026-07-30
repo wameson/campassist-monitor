@@ -328,6 +328,92 @@ def available_sites(current: dict[str, dict]) -> list[dict]:
     return openings
 
 
+# --- flexible-date match (Phase 16) ---------------------------------------
+#
+# Provider-agnostic, and layered on top of the shared availability shape after
+# extract_relevant, so both providers get it with no per-provider code. A
+# flexible watch — watches.date_mode = 'flexible' — asks for "any N-night window
+# inside [start_date, end_date)" rather than one fixed stay. The DATE bounds are
+# REUSED: start_date is the earliest check-in, end_date the latest check-out, so
+# poll_plan and extract_relevant already produce every candidate night. All this
+# layer does is drop open nights that are not part of a fully-open consecutive
+# run long enough to hold a window, so the watch alerts only when a stay fits.
+#
+# flex_min_nights is the gate; flex_max_nights does not narrow the alert set (a
+# run of R >= min nights already holds a min-length window covering every one of
+# its nights, and a longer allowed window can only add more). See PLAN.md
+# "Phase 16".
+
+def flex_min_nights(watch: dict) -> int | None:
+    """The shortest qualifying run (in nights) for a FLEXIBLE watch, or None for
+    a fixed watch — the degenerate single-window case the rest of the cycle
+    already handles byte-identically.
+
+    Read `.get`-tolerantly so a build (or a live row) that predates the Phase 16
+    columns reads as fixed: `date_mode` absent → 'fixed' → None. A flexible watch
+    whose `flex_min_nights` is unset falls back to 1 (any open night in the range
+    qualifies) — the permissive default never over-suppresses an opening."""
+    if str(watch.get("date_mode") or "fixed") != "flexible":
+        return None
+    raw = watch.get("flex_min_nights")
+    try:
+        nights = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return nights if nights >= 1 else 1
+
+
+def qualifying_nights(days: list, min_nights: int) -> set:
+    """The dates that belong to a maximal run of >= `min_nights` consecutive
+    calendar days. A run shorter than `min_nights` holds no window, so none of
+    its nights qualify; a run at least that long holds a `min_nights`-length
+    window covering every night in it, so all of them do."""
+    ordered = sorted(set(days))
+    keep: set = set()
+    if not ordered:
+        return keep
+    run = [ordered[0]]
+    for d in ordered[1:]:
+        if (d - run[-1]).days == 1:
+            run.append(d)
+        else:
+            if len(run) >= min_nights:
+                keep.update(run)
+            run = [d]
+    if len(run) >= min_nights:
+        keep.update(run)
+    return keep
+
+
+def apply_flex_window(current: dict[str, dict], watch: dict) -> dict[str, dict]:
+    """Reduce a flexible watch's open-site state to only the nights that sit
+    inside a fully-open qualifying window, so a lone open night in a range never
+    fires a watch that wants a multi-night stay.
+
+    A FIXED watch (the common case) is returned **unchanged, same object** — the
+    hash, openings, alert and dedup downstream are byte-identical to before
+    Phase 16. So is a flexible watch with a one-night floor, and a flexible watch
+    every one of whose runs already qualifies (content-identical). This adds no
+    Supabase writes: it runs inside the per-watch containment in `run`, purely on
+    the in-memory shape, before the state_hash delta check — so an unchanged
+    qualifying window hashes the same and does not re-alert, and a newly-formed
+    one changes the hash and fires exactly once."""
+    min_nights = flex_min_nights(watch)
+    if min_nights is None or min_nights <= 1:
+        return current
+    reduced: dict[str, dict] = {}
+    for site_id, cs in current.items():
+        keep = qualifying_nights([as_date(d) for d in cs["dates"]], min_nights)
+        if not keep:
+            continue
+        reduced[site_id] = {
+            "campsite_id": cs["campsite_id"],
+            "site": cs["site"],
+            "dates": [d for d in cs["dates"] if as_date(d) in keep],
+        }
+    return reduced
+
+
 # --- alert dedup ----------------------------------------------------------
 
 def filter_unalerted(
@@ -1070,6 +1156,11 @@ def run(
             current = provider.extract_relevant(polled.get(provider.name, {}), watch, today)
             if current is None:
                 continue  # poll failed for this watch's units; keep old hash
+            # Flexible watches (Phase 16): keep only nights inside a fully-open
+            # qualifying window. Provider-agnostic and a no-op for fixed watches
+            # (returned unchanged), so fixed behaviour is byte-identical and the
+            # hash/alert path below is untouched.
+            current = apply_flex_window(current, watch)
             new_hash = state_hash(current)
             if new_hash == watch.get("state_hash"):
                 continue
