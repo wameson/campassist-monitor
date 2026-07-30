@@ -4,8 +4,9 @@ ES256 JWT signed with the .p8 key: iss = team id, kid = key id.
 Apple rejects tokens older than 60 minutes and throttles refreshes
 under 20 minutes, so the JWT is cached and refreshed after 50 minutes.
 Each device token routes to the sandbox or production APNs host based
-on its stored environment; a 410 response means the token is dead and
-its device_tokens row is deleted.
+on its stored environment; a 410 (Unregistered), or a 400 naming the
+token itself as dead, means the token is dead and its device_tokens
+row is deleted.
 """
 
 from __future__ import annotations
@@ -51,6 +52,17 @@ CONFIG_FAILURE_REASONS = frozenset({
     "MissingProviderToken",
     "BadTopic",
     "TopicDisallowed",
+})
+
+# APNs `reason` strings on a 400 that name *this device's token* as dead rather
+# than a transient or pool-wide fault: the token is invalid as of now and will
+# never deliver, so its row is pruned (the app re-registers a fresh token on its
+# next launch). A 410 Unregistered is the canonical form of the same signal and
+# always prunes regardless of body; these cover the 400 restatement Apple can
+# return for a token that is bad for this environment/topic pairing.
+DEAD_TOKEN_REASONS = frozenset({
+    "Unregistered",
+    "BadDeviceToken",
 })
 
 
@@ -127,10 +139,11 @@ class APNsClient:
         self, watch: dict, openings: list[dict], db, failures: list[BaseException] | None = None
     ) -> str:
         """Push an availability alert for a watch. Returns a delivery outcome:
-        DELIVERED; PERMANENT_FAILURE (a per-device rejection — 410 Unregistered
-        with the token row deleted, 400 BadDeviceToken / DeviceTokenNotForTopic
-        or any other unenumerated 4xx, no device token, or a user-supplied token
-        so malformed the push URL cannot be built); CONFIG_FAILURE (a pool-wide
+        DELIVERED; PERMANENT_FAILURE (a per-device rejection — a dead device
+        token whose row is pruned [410 Unregistered, or a 400 naming the token
+        itself: BadDeviceToken / Unregistered], a 400 DeviceTokenNotForTopic or
+        any other unenumerated 4xx, no device token, or a user-supplied token so
+        malformed the push URL cannot be built); CONFIG_FAILURE (a pool-wide
         provider/config fault — 403 Expired/Invalid/MissingProviderToken, 400
         BadTopic / TopicDisallowed); or RETRYABLE_FAILURE (5xx, 429, or a
         transport-level error).
@@ -173,9 +186,22 @@ class APNsClient:
             return RETRYABLE_FAILURE
         if resp.status_code == 200:
             return DELIVERED
-        if resp.status_code == 410:
+        reason = apns_reason(resp)
+        if resp.status_code == 410 or (
+            resp.status_code == 400 and reason in DEAD_TOKEN_REASONS
+        ):
+            # Prune this one dead token so it is not retried and stops counting
+            # as a live recipient. device_tokens.user_id is the PRIMARY KEY, so
+            # this deletes exactly this user's token row and no other user's;
+            # nothing else in the pool is touched. Keyed the same way as the
+            # rest of the alert path — no extra per-watch write on a no-change
+            # cycle (a cycle only reaches here when it has an alert to send).
             db.delete("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
-            return PERMANENT_FAILURE
+            # A 410 is a clean prune, not an operator-facing failure, so it is
+            # reported to neither audience. A 400 rejection is still surfaced
+            # below for parity with every other 4xx (unrated all the same).
+            if resp.status_code == 410:
+                return PERMANENT_FAILURE
         if failures is not None:
             failures.append(
                 httpx.HTTPStatusError(
@@ -186,6 +212,6 @@ class APNsClient:
             )
         if resp.status_code == 429 or resp.status_code >= 500:
             return RETRYABLE_FAILURE
-        if apns_reason(resp) in CONFIG_FAILURE_REASONS:
+        if reason in CONFIG_FAILURE_REASONS:
             return CONFIG_FAILURE
         return PERMANENT_FAILURE

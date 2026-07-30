@@ -93,6 +93,59 @@ def test_apns_410_cleanup(signing_key):
     ]
 
 
+@pytest.mark.parametrize("reason", ["BadDeviceToken", "Unregistered"])
+def test_apns_400_dead_token_pruned(signing_key, reason):
+    # Apple can restate a dead token as a 400 (BadDeviceToken, or Unregistered)
+    # instead of a 410. It is the same per-device signal: prune the token row so
+    # it is not retried, exactly like the 410 path.
+    _, pem = signing_key
+    client = make_client(pem, handler=lambda request: httpx.Response(400, json={"reason": reason}))
+    db = token_db()
+    failures = []
+
+    outcome = client.send_alert(make_watch(), OPENINGS, db, failures=failures)
+
+    assert outcome == apns.PERMANENT_FAILURE
+    assert db.tables["device_tokens"] == []
+    assert db.calls_of("delete", "device_tokens") == [
+        ("delete", "device_tokens", {"user_id": "eq.u1"})
+    ]
+    # unlike a 410 (a clean prune), a 400 rejection is still surfaced to the
+    # caller so it renders in the operator annotation like every other 4xx
+    assert len(failures) == 1 and isinstance(failures[0], httpx.HTTPStatusError)
+
+
+def test_apns_400_dead_token_prunes_only_this_user(signing_key):
+    # device_tokens.user_id is the PK: pruning this user's dead token leaves
+    # every other user's token untouched.
+    _, pem = signing_key
+    client = make_client(pem, handler=lambda request: httpx.Response(400, json={"reason": "BadDeviceToken"}))
+    db = FakeDB({"device_tokens": [
+        {"user_id": "u1", "apns_token": "deadtoken", "environment": "production"},
+        {"user_id": "u2", "apns_token": "livetoken", "environment": "production"},
+    ]})
+
+    client.send_alert(make_watch(user_id="u1"), OPENINGS, db)
+
+    assert db.tables["device_tokens"] == [
+        {"user_id": "u2", "apns_token": "livetoken", "environment": "production"},
+    ]
+
+
+def test_apns_400_config_fault_does_not_prune_token(signing_key):
+    # a pool-wide config fault (BadTopic) is NOT a dead token: rotating a
+    # credential fixes it, so the token row must survive to deliver afterward.
+    _, pem = signing_key
+    client = make_client(pem, handler=lambda request: httpx.Response(400, json={"reason": "BadTopic"}))
+    db = token_db()
+
+    outcome = client.send_alert(make_watch(), OPENINGS, db)
+
+    assert outcome == apns.CONFIG_FAILURE
+    assert db.tables["device_tokens"] != []
+    assert db.calls_of("delete", "device_tokens") == []
+
+
 @pytest.mark.parametrize(
     "environment, expected_host",
     [("sandbox", "api.sandbox.push.apple.com"), ("production", "api.push.apple.com")],

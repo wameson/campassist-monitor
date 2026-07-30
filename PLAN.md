@@ -295,7 +295,12 @@ is politeness toward the providers, is not a cost lever, and stays as it is.
 ### Alert delivery
 APNs HTTP/2 with an ES256 JWT (`iss`=team, `kid`=key, cached ~50 min), `apns-push-type: alert`,
 `apns-priority: 10`, `apns-topic`=bundle id, host routed by `device_tokens.environment`.
-A `410` deletes the dead token row.
+A `410` (Unregistered) deletes the dead token row; so does a `400` naming the token itself
+dead (`BadDeviceToken` / `Unregistered`, `apns.DEAD_TOKEN_REASONS`) — the app re-registers a
+fresh token on next launch (Phase 15). Both are keyed on `device_tokens.user_id` (the PK), so
+the prune removes exactly that one user's token and no other's, and only when a push was being
+sent (no per-watch write on a no-change cycle). A `410` is a clean prune reported to neither
+audience; a `400` still surfaces to the operator like every other 4xx (unrated all the same).
 
 The rest of the 4xx space splits by **who can fix it**:
 
@@ -619,6 +624,7 @@ A summary INSERT that itself fails is the one unrepresentable case — there is 
 - [x] `test_jitter_bounds` — inter-request delays within [1.2, 2.8]s; start delay within [0, 20]s
 - [x] `test_apns_jwt` — ES256, correct `iss`/`kid`; cached within run, refreshed after 50 min
 - [x] `test_apns_410_cleanup` — 410 → token row deleted
+- [x] `test_apns_400_dead_token_pruned` — 400 `BadDeviceToken`/`Unregistered` → token row deleted (Phase 15), only that user's, config faults (`BadTopic`) spared
 - [x] `test_env_routing` — sandbox token → sandbox host; production → production host
 - [x] `test_apns_headers` — `apns-push-type: alert`, `apns-priority: 10`, `apns-topic` present
 - [x] `test_parser_defensive` — missing/renamed JSON fields → partial parse, no crash (fixture-driven)
