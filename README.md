@@ -20,7 +20,7 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 |---|---|
 | `scripts/monitor.py` | One monitoring cycle, provider-neutral: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), per-watch failure containment + threshold-gated exit status, retention pruning, run summary |
 | `scripts/providers/` | One conformer per `watches.provider` value — the poll/parse/normalize/booking-link strategy (see [Providers](#providers)) |
-| `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
+| `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, dead-token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
 | `scripts/preflight.py` | Read-only schema-drift guard run before each cycle (see [Database migrations](#database-migrations)) |
 | `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
@@ -354,14 +354,18 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   stamped `last_checked_at`.
 - **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
-  means the device token is dead and its row is deleted. The rest of the 4xx
-  space is split by *who can fix it*:
-  - A **per-device** rejection (400 `BadDeviceToken`/`DeviceTokenNotForTopic`,
-    a reason code we don't enumerate, a missing token row, or a device token so
-    malformed the push URL can't be built) is one device's problem, not the
-    cycle's. It is given up on (no retry, the hash still advances), recorded and
-    surfaced like any other failure, but left **out of the rate** that decides
-    the run's exit status — a single dead token can't turn the schedule red.
+  (Unregistered), or a 400 naming the token itself dead (`BadDeviceToken` /
+  `Unregistered`), means the device token is dead and its row is deleted —
+  keyed on `device_tokens.user_id` (the PK), so exactly that one user's token
+  goes and no other's, and the app re-registers a fresh token on next launch.
+  The rest of the 4xx space is split by *who can fix it*:
+  - A **per-device** rejection (400 `BadDeviceToken` [now pruned] /
+    `DeviceTokenNotForTopic`, a reason code we don't enumerate, a missing token
+    row, or a device token so malformed the push URL can't be built) is one
+    device's problem, not the cycle's. It is given up on (no retry, the hash
+    still advances), recorded and surfaced like any other failure, but left
+    **out of the rate** that decides the run's exit status — a single dead
+    token can't turn the schedule red.
   - A **pool-wide provider/config** fault (403 `ExpiredProviderToken`/
     `InvalidProviderToken`/`MissingProviderToken`, 400 `BadTopic`/
     `TopicDisallowed` — an expired or wrong signing key, or a wrong bundle id)
