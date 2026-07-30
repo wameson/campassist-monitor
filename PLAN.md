@@ -99,11 +99,50 @@ shape, abridged:
 |---|---|---|
 | `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site |
 | `device_tokens` | `user_id` (PK), `apns_token`, `environment`, `updated_at` | `environment ∈ production/sandbox` — per-token APNs host routing |
-| `sent_alerts` | `id`, `watch_id`, `site_id`, `date`, `sent_at` | `UNIQUE(watch_id, site_id, date)` — the dedup key |
+| `sent_alerts` | `id`, `watch_id`, `site_id`, `date`, `sent_at` | `UNIQUE(watch_id, site_id, date)` — the dedup key; **never read by the app** |
+| `alert_history` | `id`, `watch_id`, `campground_name`, `start_date`, `end_date`, `site_count`, `delivered_at` | **the app's server-truth Alert History** — one row per DELIVERED push; RLS scoped to the owning user like `sent_alerts` |
 | `run_summaries` | `id`, `ran_at`, `watches_checked`, `campgrounds_polled`, `alerts_sent`, `duration_ms`, `errors` | **world-readable** (`USING (true)`) — see Rendering channels |
 
-RLS is on for all four; the app reads its own rows via `auth.uid()`, the backend writes with
+RLS is on for all five; the app reads its own rows via `auth.uid()`, the backend writes with
 the service-role key.
+
+#### `alert_history` — the app-facing contract (Issue 2, server-truth Alert History)
+
+This table is the **frozen contract** the follow-on app task (`alert-history-app-render`)
+builds against. The "Site Found" badge is `watches.last_found_at`, set only on an APNs
+`DELIVERED`; the app's old Alert History was local `NotificationRecord`s written only when the
+device foregrounded/tapped a push, so a delivered-but-not-tapped alert lit the badge yet left
+history empty. `alert_history` closes that: the monitor writes one row **in the same step and
+on the same condition** it sets `last_found_at` (`monitor.run`, the `DELIVERED` block), so
+badge and history can never disagree.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `UUID` | PK |
+| `watch_id` | `UUID` | FK → `watches(id)` `ON DELETE CASCADE` |
+| `campground_name` | `TEXT` | the push title's campground, verbatim from the watch |
+| `start_date` | `DATE` | the watch's requested window start, **verbatim** — timezone-independent calendar day, no shift |
+| `end_date` | `DATE` | the watch's requested window end, same |
+| `site_count` | `INT` | openings this push announced (`len(fresh)`) — the body's "N site(s) open" |
+| `delivered_at` | `TIMESTAMPTZ` | when the push was delivered (`iso_now`) |
+
+**RLS predicate the app queries** (mirrors `sent_alerts`' `read own alerts`, `SELECT` only):
+
+```sql
+CREATE POLICY "read own alert history" ON alert_history FOR SELECT
+    USING (watch_id IN (SELECT id FROM watches WHERE user_id = auth.uid()));
+```
+
+An anon user reads **only their own** delivered alerts, joined through the owning watch. The
+table is never opened to all. Dates are `DATE` and stored verbatim from the watch, so the app
+must treat them as timezone-independent calendar days (do **not** re-introduce the Issue 1
+UTC-vs-local shift on read).
+
+**Retention:** not pruned in this build (unlike `sent_alerts`/`run_summaries`) — history is
+meant to persist for the user, and adding a per-cycle prune would spend the last slot of the
+≤5-write no-change budget. Delivered-alert volume is low (one row per delivered push, deduped
+by the alert cooldown), so growth is bounded in practice; a retention prune can be added later
+if needed.
 
 ### Migrations
 
@@ -113,6 +152,7 @@ the service-role key.
 | `0002_watches_provider.sql` | `provider`, `provider_ref` | `WARN` (read-tolerant / app-only) |
 | `0003_watches_include_ada_only.sql` | `include_ada_only` | `WARN` (read via `.get`) |
 | `0004_watches_error_reason.sql` | `error_reason` | `WARN` (write proves tolerance) |
+| `0005_alert_history.sql` | `alert_history` table + RLS policy | `WARN` (write-only, fully contained — an unapplied migration keeps monitoring) |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
 deliberate.** There is no auto-apply anywhere: not in CI, not in the monitor, not behind a
@@ -273,6 +313,15 @@ If a push is delivered but its `sent_alerts` dedup row is rejected, the `state_h
 written anyway — otherwise the identical push repeats every cycle, because the rows that
 would suppress it are exactly the ones that failed to write. An occasional missed re-alert
 beats a repeating push.
+
+On a `DELIVERED` push the monitor also inserts one `alert_history` row (the app's server-truth
+Alert History; see the schema section), in the **same step and on the same condition** it sets
+`watches.last_found_at`, so the badge and the app's history are derived from one fact and can
+never disagree. That insert is purely additive: it is contained in its own `try`, and a failure
+(e.g. an unapplied `0005`) records a **non-blocking, unrated** cycle failure — it never blocks
+the row's own `state_hash`/`last_found_at` write, never errors the watch, and never reddens the
+run. So a live DB missing `alert_history` keeps monitoring and keeps delivering; only the
+history rows go unwritten until the migration is applied.
 
 ### Retention
 `sent_alerts` and `run_summaries` rows older than 30 days are pruned every run, before the
