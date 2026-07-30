@@ -20,7 +20,7 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 |---|---|
 | `scripts/monitor.py` | One monitoring cycle, provider-neutral: jittered polling, dedupe, delta detection, alert cooldown, watch lifecycle (expiry + erroring), per-watch failure containment + threshold-gated exit status, retention pruning, run summary |
 | `scripts/providers/` | One conformer per `watches.provider` value — the poll/parse/normalize/booking-link strategy (see [Providers](#providers)) |
-| `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, 410 token cleanup) |
+| `scripts/apns.py` | APNs HTTP/2 client (ES256 JWT auth, sandbox/production routing, dead-token cleanup) |
 | `scripts/db.py` | Thin Supabase PostgREST client (service-role key) |
 | `scripts/preflight.py` | Read-only schema-drift guard run before each cycle (see [Database migrations](#database-migrations)) |
 | `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
