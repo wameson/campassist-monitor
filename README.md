@@ -497,11 +497,19 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo
   activity; `keepalive.yml` commits a timestamp monthly to prevent that.
 
-## Deploying to AWS Lambda (Phase 17)
+## Deploying to AWS Lambda (dormant — superseded by Azure)
 
-The plan of record moves the scheduler off GitHub Actions onto **AWS Lambda +
-EventBridge Scheduler** (PLAN.md "Phase 17 (campassist-monitor backend)"). The
-business logic is unchanged; a thin entrypoint shim (`lambda_function.py`,
+> **Superseded (2026-07-31).** The plan of record is no longer AWS Lambda. Two
+> Lambda invocations from `us-west-2` were refused by GoingToCamp's Azure Front
+> Door WAF (8 × HTTP 403) while GitHub Actions polled fine, so Phase 17 now
+> targets a scheduled **Azure Container Apps Job** — see PLAN.md "Phase 17
+> (campassist-monitor backend) — Hosting migration". The AWS artifacts described
+> below (`lambda_function.py`, its tests, `make lambda-zip`, `deploy.yml`) are
+> kept in the repo **dormant**, slated for removal only after Azure cutover; do
+> not deploy this path — the WAF refuses it. The rest of this section documents
+> those dormant artifacts as-built.
+
+The business logic is unchanged; a thin entrypoint shim (`lambda_function.py`,
 handler `lambda_function.handler`) adapts the CLI to Lambda by loading secrets
 from SSM, forwarding a fresh per-invocation process-start anchor, and turning a
 non-zero cycle exit into a Lambda invocation error (so systemic failures surface
@@ -541,19 +549,22 @@ never-expire). It fails clearly if its config is absent, so set:
 | Variable | `LOG_RETENTION_DAYS` | optional; defaults to `30` |
 
 The Lambda function, execution role, EventBridge schedule, CloudWatch alarm, SNS
-topic and its email subscription are the operator's one-time console setup
-(PLAN.md Phase A) — this repo half creates no AWS resources and performs no
-cutover. The GitHub Actions cron in `monitor.yml` keeps running unchanged until
-the operator stages the cutover (PLAN.md Phases B/C).
+topic and its email subscription would have been the operator's one-time console
+setup — this repo half creates no AWS resources and performs no cutover, and that
+AWS cutover is no longer planned (see the superseded note above). The GitHub
+Actions cron in `monitor.yml` keeps running unchanged as the live host.
 
 ## Upgrade path: self-hosted runner
 
 > **Plan of record is a host migration, not this route.** The captain has decided
-> (2026-07-31) to move the monitor off GitHub Actions onto AWS Lambda + EventBridge
-> Scheduler — see PLAN.md "Phase 17 (campassist-monitor backend)". That fixes the real
-> defect (GitHub's `schedule` cron drifts to 1–3 h) and makes 15-min polling trivial;
-> the self-hosted-runner and public-repo options below were considered and rejected as
-> the scale path. They remain the incumbent Actions host's fallback until Phase 17 ships.
+> (2026-07-31) to move the monitor off GitHub Actions onto a scheduled **Azure
+> Container Apps Job** — see PLAN.md "Phase 17 (campassist-monitor backend)". That
+> fixes the real defect (GitHub's `schedule` cron drifts to 1–3 h) and makes 15-min
+> polling trivial. But it is **gated on a Phase 0 egress probe**: GoingToCamp's WAF
+> already refused the earlier AWS target (8×403) and Azure egress is itself untested,
+> so if Azure is refused too the fallback is Actions with an external exact-time
+> trigger, or a self-hosted **residential** runner like the one below — never another
+> cloud. Until the migration ships, these options remain the incumbent host's fallback.
 
 When the private-repo free tier (2,000 min/month) gets tight, or if
 recreation.gov starts blocking GitHub's datacenter IPs, register any always-on
