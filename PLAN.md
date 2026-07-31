@@ -97,7 +97,7 @@ shape, abridged:
 
 | Table | Columns | Notes |
 |---|---|---|
-| `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site |
+| `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `date_mode`, `flex_min_nights`, `flex_max_nights`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site; `date_mode ∈ fixed/flexible` (Phase 16) |
 | `device_tokens` | `user_id` (PK), `apns_token`, `environment`, `updated_at` | `environment ∈ production/sandbox` — per-token APNs host routing |
 | `sent_alerts` | `id`, `watch_id`, `site_id`, `date`, `sent_at` | `UNIQUE(watch_id, site_id, date)` — the dedup key; **never read by the app** |
 | `alert_history` | `id`, `watch_id`, `campground_name`, `start_date`, `end_date`, `site_count`, `delivered_at` | **the app's server-truth Alert History** — one row per DELIVERED push; RLS scoped to the owning user like `sent_alerts` |
@@ -153,6 +153,7 @@ if needed.
 | `0003_watches_include_ada_only.sql` | `include_ada_only` | `WARN` (read via `.get`) |
 | `0004_watches_error_reason.sql` | `error_reason` | `WARN` (write proves tolerance) |
 | `0005_alert_history.sql` | `alert_history` table + RLS policy | `WARN` (write-only, fully contained — an unapplied migration keeps monitoring) |
+| `0006_watches_flexible_dates.sql` | `date_mode`, `flex_min_nights`, `flex_max_nights` | `WARN` (read via `.get` with a `'fixed'`/None default — unmigrated DB reads every watch as fixed) |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
 deliberate.** There is no auto-apply anywhere: not in CI, not in the monitor, not behind a
@@ -223,6 +224,16 @@ Two `WARN` classifications and the citations that earn them:
   `message` alone because `details`/`hint` echo row values), then drops it for the cycle. That
   attempt also vetoes the per-id fan-out for exactly that signature, so an unapplied `0004`
   costs one extra write total. An unmigrated DB still errors watches and still monitors.
+- `date_mode` / `flex_min_nights` / `flex_max_nights` — the Phase 16 flexible-date columns,
+  read only through `flex_min_nights(watch)` in `monitor.run`: `str(watch.get("date_mode") or
+  "fixed")` and `watch.get("flex_min_nights")`, every read `.get` with a default. Absent
+  `date_mode` reads `'fixed'`, so an unmigrated DB treats every watch as a fixed stay over
+  `[start_date, end_date)` — byte-identical to the pre-Phase-16 monitor, never halting and
+  never suppressing an opening differently. The nights columns are read only *after*
+  `date_mode` already reports `'flexible'`, which an unmigrated DB never does. The monitor
+  never writes any of the three. **Standing condition** (same as `include_ada_only`): the
+  tolerance depends on the `watches` fetch naming no `select` list — a named select would
+  400 the whole read. A read that ever subscripts one of these belongs in the `HALT` set.
 
 **A missing table** takes the highest severity of its columns — all four halt today.
 
@@ -765,6 +776,95 @@ as its own `campassist-monitor` task (captain, 2026-07-26):
 
 ---
 
+## Phase 16 — Flexible-date / flexible-length watches *(scout B6)*
+
+**What it adds:** today a watch is one fixed stay. A *flexible* watch asks for **"any N-night
+window inside a date range"** and the monitor alerts when **any** qualifying consecutive-night
+window inside the range is fully available. This is backend-owned: these three `watches`
+columns and the match logic in `monitor.run`. The camp-assist app builds its `WatchDTO` to the
+contract below.
+
+### The column / DTO contract (frozen — the app builds to this)
+
+The range bounds **reuse the existing `start_date` / `end_date`** rather than adding new window
+columns. Both are already `NOT NULL` `DATE` (timezone-independent calendar days — no shift),
+and reusing them means the poll horizon, each provider's `poll_plan`, and `extract_relevant`'s
+date filter already cover the whole range with **no provider changes**, and a fixed watch stays
+byte-identical. Three columns are added (`supabase/migrations/0006_watches_flexible_dates.sql`):
+
+| Column | Type | Default | Nullable | Meaning |
+|---|---|---|---|---|
+| `date_mode` | `TEXT` `CHECK IN ('fixed','flexible')` | `'fixed'` | no | The discriminator. `'fixed'` = one stay. `'flexible'` = any window in the range. |
+| `flex_min_nights` | `INT` `CHECK (… >= 1)` | `NULL` | yes | **Flexible only.** Shortest qualifying window, in nights. **The alert gate.** `NULL` in fixed mode. |
+| `flex_max_nights` | `INT` `CHECK (… >= 1)` | `NULL` | yes | **Flexible only.** Longest window the user will take, in nights. **Advisory** (app display/booking); does **not** narrow alerts. `NULL` in fixed mode. |
+
+**How `start_date` / `end_date` are read by mode:**
+
+- **fixed** (`date_mode` absent, `NULL`, or `'fixed'`) — `start_date` = check-in, `end_date` =
+  check-out; the stay is the nights `[start_date, end_date)`, exactly as before this phase.
+- **flexible** (`date_mode = 'flexible'`) — `start_date` = **earliest** check-in and `end_date`
+  = **latest** check-out of the search range. The nights considered are `[start_date, end_date)`.
+  A length-`L` window with check-in `a` occupies nights `[a, a+L)` and qualifies when
+  `a >= start_date` **and** `a + L <= end_date`.
+
+**On the wire (what `WatchDTO` sends/reads):** a fixed watch is unchanged — it may omit the
+three new keys entirely (they default). A flexible watch sends
+`date_mode: "flexible"`, `flex_min_nights: <int ≥ 1>`, `flex_max_nights: <int ≥ 1>`
+(`flex_max_nights == flex_min_nights` for a fixed-length flexible window), and uses
+`start_date` / `end_date` as the range bounds. Dates stay `DATE` strings (`YYYY-MM-DD`),
+timezone-independent, verbatim. The app validates `flex_min_nights <= flex_max_nights` and a
+window that fits the range; the monitor tolerates a bad pair by simply not firing.
+
+### The match logic (`monitor.run`, provider-agnostic)
+
+Layered on the shared availability shape **after** `extract_relevant` and **before** the
+`state_hash` delta check, so both providers get it with no per-provider code
+(`monitor.apply_flex_window` → `qualifying_nights`):
+
+- **The gate is `flex_min_nights`.** A site's open nights are grouped into maximal runs of
+  consecutive calendar days; a run shorter than `flex_min_nights` holds no window and is
+  dropped, a run at least that long holds a `flex_min_nights`-length window covering every one
+  of its nights, so all of them are kept. The reduced shape flows into the existing hash /
+  `available_sites` / dedup / alert path unchanged.
+- **`flex_max_nights` does not narrow the alert set**, by construction: a run long enough for
+  the minimum already contains a minimum-length window covering each of its nights, and a
+  longer allowed window can only add more. It is advisory for the app (how long a stay to
+  offer). "Consider each valid length" reduces to "gate on the minimum."
+- **Fixed is the degenerate case, kept byte-identical.** `apply_flex_window` returns the input
+  **unchanged (same object)** for a fixed watch (and for a flexible watch with a one-night
+  floor), so the hash, openings, and alert are identical to before Phase 16.
+- **Write budget & containment unchanged.** The reduction is pure in-memory work inside the
+  per-watch containment, adds **no** Supabase writes (`test_flexible_write_budget`), and runs
+  before the delta check — so an unchanged qualifying window hashes the same and does not
+  re-alert, while a newly-formed or grown one changes the hash and fires exactly once
+  (`test_flexible_delta_does_not_re_alert_an_unchanged_window`).
+
+### Build
+
+- [x] `date_mode` / `flex_min_nights` / `flex_max_nights` in `supabase/schema.sql`, the
+  idempotent `0006_watches_flexible_dates.sql`, and the three `WARN` entries in
+  `preflight.REQUIRED` with the tolerance citation. **Apply `0006` by hand to the live DB
+  BEFORE the app half (`phase16-flexible-dates-app`) ships**, then the manifest entry is
+  already merged (WARN, so ordering is safe either way). *(`supabase/schema.sql`,
+  `supabase/migrations/0006_watches_flexible_dates.sql`, `preflight.py` REQUIRED + citation.)*
+- [x] `monitor.apply_flex_window` / `qualifying_nights` / `flex_min_nights`, hooked into
+  `run` right after `extract_relevant`. Provider-agnostic; no provider file changed.
+
+### Tests
+
+- [x] Fires when **any** qualifying window opens; does **not** fire when no run reaches the
+  floor; min/max variants; a stray out-of-window night is dropped while the run alerts.
+  *(`tests/test_monitor_flex.py`.)*
+- [x] Fixed watch byte-identical: `apply_flex_window` is identity for a fixed watch, and the
+  existing fixed-watch suite is untouched. *(`test_apply_flex_window_is_identity_for_fixed_watch`
+  + the whole pre-existing suite.)*
+- [x] Write budget respected; delta detection prevents re-alerting an unchanged window.
+  *(`test_flexible_write_budget`, `test_flexible_delta_does_not_re_alert_an_unchanged_window`.)*
+- [x] Manifest/`schema.sql` agree and the flex columns are pinned `WARN`+`0006`.
+  *(`test_preflight_manifest_matches_schema_sql`, `test_flexible_date_columns_are_warn_and_carry_0006`.)*
+
+---
+
 ## Backend bugs and incidents
 
 | Date | Issue | Status |
@@ -791,6 +891,8 @@ as its own `campassist-monitor` task (captain, 2026-07-26):
 | GoingToCamp posture | Keyless GET + one read-only pricing POST; never drive a browser | `/api/*` is open, the SPA is WAF captcha-gated, and browsers are what trip it |
 | ADA-only filtering | GoingToCamp only, per-watch opt-in, default off | rec.gov publishes only a wider "accessible" flag that would hide ~2.75 bookable sites per restricted one |
 | Re-arming errored watches | Deliberately not automatic (captain, 2026-07-27) | reason data first; a blanket retry re-polls known-dead watches forever |
+| Flexible-date range bounds | Reuse `start_date`/`end_date`, add only `date_mode` + nights (Phase 16) | avoids provider special-casing (poll horizon / `poll_plan` / `extract_relevant` already cover the range) and keeps fixed watches byte-identical; separate window columns would duplicate the already-`NOT NULL` bounds |
+| Flexible-date alert gate | `flex_min_nights` only; `flex_max_nights` advisory | a run long enough for the minimum already contains a min-length window covering every night, so the maximum can only add availability, never suppress it |
 | Multi-campground per watch | Not in v1 | — |
 
 ---

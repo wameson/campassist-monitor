@@ -287,6 +287,19 @@ def make_watch(**overrides) -> dict:
     return watch
 
 
+def make_flex_watch(min_nights: int, max_nights: int | None = None, **overrides) -> dict:
+    """A flexible-date watch (Phase 16): date_mode='flexible', with
+    start_date/end_date reused as the search range bounds. `max_nights` defaults
+    to `min_nights` (a fixed-length flexible window)."""
+    watch = make_watch(
+        date_mode="flexible",
+        flex_min_nights=min_nights,
+        flex_max_nights=max_nights if max_nights is not None else min_nights,
+    )
+    watch.update(overrides)
+    return watch
+
+
 def make_gtc_watch(**overrides) -> dict:
     """A going_to_camp watch on the park and dates the fixtures were captured
     from: Alta Lake (resourceLocationId -2147483647, rootMapId -2147483396),

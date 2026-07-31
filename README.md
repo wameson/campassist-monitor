@@ -278,6 +278,14 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   hours after UTC midnight. A watch entirely beyond the horizon is polled
   once the horizon reaches it, and one straddling it is served — hashed and
   alerted on — for its in-horizon nights alone.
+- **Flexible-date watches:** a watch with `date_mode='flexible'` (Phase 16)
+  reuses `start_date`/`end_date` as a search *range* and alerts when **any**
+  fully-open consecutive-night window of at least `flex_min_nights` nights fits
+  inside it — "any N-night window in `<range>`" rather than one fixed stay.
+  `flex_max_nights` is advisory (app display/booking) and does not narrow
+  alerts. A fixed watch (the default, `date_mode='fixed'`) is unchanged. The
+  match is provider-agnostic (`monitor.apply_flex_window`, after
+  `extract_relevant`); see PLAN.md "Phase 16" for the column/DTO contract.
 - **Watch lifecycle:** the backend expires watches whose end date has
   passed (`status='expired'`) and errors watches with malformed campground
   ids (`status='error'`, once), whose `provider_ref` their provider cannot

@@ -32,8 +32,28 @@ CREATE TABLE watches (
                                                      -- search excludes them. Read only by
                                                      -- going_to_camp's extract_relevant — see
                                                      -- migrations/0003 and README "Providers"
-    start_date   DATE NOT NULL,
-    end_date     DATE NOT NULL,
+    start_date   DATE NOT NULL,                       -- fixed mode: check-in. flexible mode:
+                                                     -- earliest check-in of the search range.
+    end_date     DATE NOT NULL,                       -- fixed mode: check-out (the stay is the
+                                                     -- nights [start_date, end_date)). flexible
+                                                     -- mode: latest check-out of the search range.
+    date_mode    TEXT NOT NULL DEFAULT 'fixed'        -- 'fixed' = one stay [start_date, end_date).
+                 CHECK (date_mode IN ('fixed','flexible')),  -- 'flexible' = any consecutive
+                                                     -- flex_min_nights..flex_max_nights-night window
+                                                     -- inside [start_date, end_date). See Phase 16
+                                                     -- in PLAN.md and migrations/0006. Read only via
+                                                     -- watch.get(...) with a 'fixed' default, so an
+                                                     -- unmigrated DB treats every watch as fixed.
+    flex_min_nights INT                              -- flexible mode: shortest qualifying window
+                 CHECK (flex_min_nights IS NULL OR flex_min_nights >= 1),  -- (nights). NULL in fixed
+                                                     -- mode. This is the alert gate: the monitor
+                                                     -- fires when a site has a fully-open run of at
+                                                     -- least this many consecutive nights.
+    flex_max_nights INT                              -- flexible mode: longest window the user will
+                 CHECK (flex_max_nights IS NULL OR flex_max_nights >= 1),  -- take (nights). NULL in
+                                                     -- fixed mode. Advisory for the app's display /
+                                                     -- booking; does not further restrict alerts
+                                                     -- (more consecutive availability only helps).
     status       TEXT NOT NULL DEFAULT 'monitoring'
                  CHECK (status IN ('monitoring','paused','expired','error')),
     error_reason TEXT,                               -- why status='error', from the monitor's own

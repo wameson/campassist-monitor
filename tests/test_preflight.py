@@ -419,6 +419,33 @@ def test_include_ada_only_is_warn_and_carries_its_migration():
     assert f"supabase/migrations/{migration}" in message
 
 
+def test_flexible_date_columns_are_warn_and_carry_0006():
+    # The Phase 16 flexible-date columns are read only via `watch.get(...)` with
+    # a 'fixed'/None default (monitor.flex_min_nights), so an unmigrated DB reads
+    # every watch as fixed and keeps monitoring — WARN, not HALT. WARN is also
+    # what lets 0006 merge before it is applied by hand.
+    parsed = parse_schema_sql(SCHEMA_SQL.read_text())["watches"]
+    for column in ("date_mode", "flex_min_nights", "flex_max_nights"):
+        severity, migration = preflight.REQUIRED["watches"][column]
+        assert severity == preflight.WARN, column
+        assert migration == "0006_watches_flexible_dates.sql", column
+        assert column in parsed, column  # fresh install and migrated DB agree
+
+    migration_sql = (
+        SCHEMA_SQL.parent / "migrations" / "0006_watches_flexible_dates.sql"
+    ).read_text()
+    assert "ADD COLUMN IF NOT EXISTS date_mode" in migration_sql
+    assert "DEFAULT 'fixed'" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS flex_min_nights" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS flex_max_nights" in migration_sql
+
+    # a WARN-only drift keeps monitoring
+    drift = preflight.Drift(
+        "watches", "date_mode", preflight.WARN, "0006_watches_flexible_dates.sql"
+    )
+    assert preflight.drift_message([drift]).startswith("::warning::")
+
+
 def test_every_manifest_column_is_classified():
     for table, columns in preflight.REQUIRED.items():
         for column, (severity, migration) in columns.items():

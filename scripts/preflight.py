@@ -101,6 +101,9 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         "provider_ref":          (WARN, "0002_watches_provider.sql"),
         "include_ada_only":      (WARN, "0003_watches_include_ada_only.sql"),
         "error_reason":          (WARN, "0004_watches_error_reason.sql"),
+        "date_mode":             (WARN, "0006_watches_flexible_dates.sql"),
+        "flex_min_nights":       (WARN, "0006_watches_flexible_dates.sql"),
+        "flex_max_nights":       (WARN, "0006_watches_flexible_dates.sql"),
         "campground_state":      (WARN, None),
         "created_at":            (WARN, None),
     },
@@ -181,6 +184,21 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          also read, `.get`-tolerantly, in `monitor.error_reason_census`.
 #                          Classifying it HALT would invert the blast radius: the cycle would
 #                          stop entirely over a column that only annotates an error.
+#   watches.date_mode, watches.flex_min_nights, watches.flex_max_nights
+#                          the Phase 16 flexible-date columns, read only through
+#                          `flex_min_nights(watch)` in monitor.run: `str(watch.get("date_mode") or
+#                          "fixed")` and `watch.get("flex_min_nights")`, each `.get` with a default
+#                          (`flex_max_nights` is app-only — the monitor never reads it at all). An
+#                          absent `date_mode` reads as 'fixed',
+#                          so an unmigrated live DB treats every watch as a fixed stay over
+#                          [start_date, end_date) — byte-identical to the pre-Phase-16 monitor,
+#                          never halting and never suppressing an opening differently. The nights
+#                          column is read only after date_mode already says 'flexible', which an
+#                          unmigrated DB never reports. They stay WARN only while every read is `.get`
+#                          with a default; a read that ever subscripts one belongs in the HALT set.
+#                          Same standing condition as include_ada_only: the tolerance depends on the
+#                          `watches` fetch naming no `select` list (a named select 400s the whole
+#                          read). All three are app-written; the monitor never writes them.
 #   alert_history.*        every column is WARN because the whole table is write-only for
 #                          the monitor and the write is fully contained. `run`'s DELIVERED
 #                          block inserts one history row via `db.insert("alert_history", …)`
