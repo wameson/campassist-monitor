@@ -1049,10 +1049,25 @@ def run(
     # on another site that happens to name the same id.
     not_found: dict[str, set[str]] = {}
     availability: dict[PollUnit, dict | None] = {}
+    # A cycle that runs out of poll budget mid-plan leaves the remaining parks
+    # unpolled: their watches do not fire this cycle. That is a completed miss,
+    # not a transient the next cycle heals, and it belongs to no single watch —
+    # the plan is shared across every user. So it goes through record_cycle_failure
+    # (systemic by definition, red run, both audiences via a safe aggregate
+    # label), never a bare errors.append that would leave the run green. There is
+    # deliberately no tolerant threshold: the budget only trips once the serial
+    # poll work already exceeds one cycle's budget, so any skip already means the
+    # fleet (or a stalled upstream) is over capacity — a K>0 threshold would just
+    # re-hide the silent-miss it took a two-day outage to learn about. The count
+    # is also surfaced on the result (polls_skipped), mirroring the errored-watch
+    # census, with no added read or write.
+    polls_skipped = 0
     for i, unit in enumerate(plan):
         if budget_exhausted():
-            errors.append(
-                f"time budget exhausted: skipped {len(plan) - i} remaining poll(s)"
+            polls_skipped = len(plan) - i
+            record_cycle_failure(
+                f"time budget exhausted: skipped {polls_skipped} remaining poll(s) "
+                f"of {len(plan)} planned — fleet exceeds one cycle's poll budget"
             )
             break
         name, key = unit
@@ -1394,6 +1409,12 @@ def run(
         # signal is the count line the census put on `errors`, which is what
         # turns a silent green run into one that says three watches are dead.
         "watches_errored": watches_errored,
+        # Parks the poll budget ran out before reaching, so their watches were
+        # not served this cycle. Non-zero means the run went systemic above
+        # (record_cycle_failure), so this is the machine-readable companion to
+        # that failure line — surfaced like watches_errored, never a persisted
+        # run_summaries column, so the write budget is untouched.
+        "polls_skipped": polls_skipped,
         # Full-detail rendering (watch UUIDs + PostgREST details) for the
         # operator-only Action annotation; never persisted to run_summaries.
         "errors_detail": "; ".join(detail_errors) or None,

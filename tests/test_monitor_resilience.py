@@ -393,6 +393,66 @@ def test_watches_the_poll_budget_never_reached_are_out_of_the_rate():
     assert result["watch_errors"] == 1
 
 
+def test_time_budget_skip_makes_the_run_systemic():
+    # A cycle that runs out of poll budget mid-plan knowingly leaves parks
+    # unpolled: their watches do not fire this cycle. That is a completed miss,
+    # not a transient the next cycle heals, so the run must go red instead of
+    # reporting itself healthy — the silent-green skip was a latent correctness
+    # defect (fleet grows past one cycle's capacity, monitor quietly stops
+    # polling cold parks, every run stays green). No watch is errored: an
+    # overrun is a cycle condition, never a fault pinned to a watch's own row.
+    clock = Clock()
+    watches = [make_watch(id=f"w{i}", user_id=f"u{i}", campground_id=f"c{i}") for i in range(3)]
+    db = FakeDB({"watches": watches})
+
+    result = monitor.run(
+        db,
+        FakeAPNs(),
+        FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        rng=random.Random(0),
+        sleep=lambda s: clock.tick(1000),  # the first inter-request delay blows the budget
+        now_fn=lambda: NOW,
+        monotonic=clock,
+        time_budget_seconds=100,
+    )
+
+    # the skip count is surfaced like the errored-watch census, and the run is red
+    assert result["polls_skipped"] == 2
+    assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
+    # it reaches the operator failure channel, not just the world-readable warning
+    assert "time budget exhausted" in result["cycle_errors"]
+    assert monitor.failure_annotation(result) is not None
+    assert "time budget exhausted" in result["errors"] and "skipped 2" in result["errors"]
+    # a cycle condition never errors an individual watch's own row
+    assert all(r["status"] == "monitoring" for r in db.tables["watches"])
+    # end-of-cycle bookkeeping still ran, and no extra writes were added
+    assert len(db.calls_of("insert", "run_summaries")) == 1
+
+
+def test_all_polls_completing_stays_green():
+    # The companion to the above: when the budget is not exhausted nothing is
+    # skipped, polls_skipped is 0, and a fully-polled cycle stays green exactly
+    # as before — the fix must not turn a healthy cycle red.
+    clock = Clock()
+    watches = [make_watch(id=f"w{i}", user_id=f"u{i}", campground_id=f"c{i}") for i in range(3)]
+    db = FakeDB({"watches": watches})
+
+    result = monitor.run(
+        db,
+        FakeAPNs(),
+        FakeHTTP(lambda cg: FakeResponse(200, OPEN_PAYLOAD)),
+        rng=random.Random(0),
+        sleep=lambda s: clock.tick(1),  # every poll fits inside the budget
+        now_fn=lambda: NOW,
+        monotonic=clock,
+        time_budget_seconds=100,
+    )
+
+    assert result["polls_skipped"] == 0
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    assert "time budget exhausted" not in (result["errors"] or "")
+
+
 def test_failing_to_mark_a_watch_errored_is_systemic():
     # the end-of-cycle status='error' write is the last chance to surface a
     # broken watch; losing it for the whole set must not pass silently
