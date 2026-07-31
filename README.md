@@ -497,87 +497,49 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo
   activity; `keepalive.yml` commits a timestamp monthly to prevent that.
 
-## Deploying to AWS Lambda (dormant — superseded by Azure)
+## Scheduling: fixing the `schedule` drift (Phase 17)
 
-> **Superseded (2026-07-31).** The plan of record is no longer AWS Lambda. Two
-> Lambda invocations from `us-west-2` were refused by GoingToCamp's Azure Front
-> Door WAF (8 × HTTP 403) while GitHub Actions polled fine, so Phase 17 now
-> targets a scheduled **Azure Container Apps Job** — see PLAN.md "Phase 17
-> (campassist-monitor backend) — Hosting migration". The AWS artifacts described
-> below (`lambda_function.py`, its tests, `make lambda-zip`, `deploy.yml`) are
-> kept in the repo **dormant**, slated for removal only after Azure cutover; do
-> not deploy this path — the WAF refuses it. The rest of this section documents
-> those dormant artifacts as-built.
+The poll runs on GitHub Actions, but GitHub's `schedule` cron is best-effort and
+**drifts 1–3 hours** in practice (measured 2026-07-31), so alerts lag openings.
+Phase 17 (documentation only — nothing shipped) fixes this by moving the
+**trigger** to AWS while the **poll stays on GitHub Actions** — the one egress
+path GoingToCamp's WAF accepts:
 
-The business logic is unchanged; a thin entrypoint shim (`lambda_function.py`,
-handler `lambda_function.handler`) adapts the CLI to Lambda by loading secrets
-from SSM, forwarding a fresh per-invocation process-start anchor, and turning a
-non-zero cycle exit into a Lambda invocation error (so systemic failures surface
-on the `Errors` metric — the same loud-failure contract the CLI keeps).
+- An **AWS EventBridge Scheduler** fires on the exact wall clock and calls
+  `monitor.yml`'s `workflow_dispatch` via a ~15-line Lambda (reads a
+  single-repo, `Actions: Read and write` fine-grained PAT from an SSM
+  SecureString; POSTs the dispatch; logs the HTTP status). AWS never talks to
+  GoingToCamp.
+- `schedule` stays as an **offset backstop**, and a CloudWatch heartbeat alarm
+  plus a `run_summaries.ran_at` freshness check catch a silently-stopped trigger.
+- A later step **flips the repo public** (after the backend is complete, gated on
+  a full-history secret scan) to take Actions minutes to $0.
 
-**Build the deployment zip** (no Docker; cross-compiles the Linux wheels on any
-host):
+See PLAN.md "Phase 17 (campassist-monitor backend) — AWS-triggered GitHub
+Actions" for the full plan, cost table, token scope, and cutover/rollback.
 
-```bash
-make lambda-zip     # -> build/monitor-lambda.zip  (~5.6 MB zipped / ~19 MB unzipped)
-```
+**Two earlier plans that tried to move the poll *itself* off Actions were both
+refused by the WAF** — AWS Lambda (8×403) and Azure Container Apps Jobs (probe
+403). Their dormant artifacts still sit in the repo and are **orphaned** by the
+Phase 17 design (the poll never moves to AWS): `lambda_function.py` and its tests
+(the SSM→env / `SystemExit`→invocation-error shim), `make lambda-zip`, and
+`deploy.yml` (OIDC build-and-push of the Lambda zip). They are slated for removal
+in a follow-up cleanup — **do not deploy them; the WAF refuses that path.** The
+new trigger Lambda is a separate, unrelated ~15-line function, not this shim.
 
-`boto3` is provided by the Lambda `python3.12` runtime and is deliberately not
-bundled, so the runtime dependency cap is untouched.
+## Fallback: self-hosted runner
 
-**Secrets — SSM Parameter Store.** The shim reads the same six values the Actions
-workflow passes, but from SSM `SecureString` parameters named `<prefix><NAME>`.
-The prefix defaults to `/campassist-monitor/` and is overridable per-deploy via
-the `SSM_PARAM_PREFIX` env var. The operator creates these six parameters by hand
-(values never live in the repo):
-
-`/campassist-monitor/SUPABASE_URL`, `…/SUPABASE_SERVICE_KEY`, `…/APNS_KEY_ID`,
-`…/APNS_TEAM_ID`, `…/APNS_BUNDLE_ID`, `…/APNS_P8_KEY`.
-
-**Automated redeploy on merge — `.github/workflows/deploy.yml`.** A `push`-to-main
-workflow (never `schedule` — schedule drift is the bug being fixed) builds the zip
-and runs `aws lambda update-function-code`, authenticated via **GitHub OIDC** to a
-short-lived IAM role scoped to `lambda:UpdateFunctionCode` — no long-lived AWS keys
-in secrets. It also sets CloudWatch log retention (Lambda's default is
-never-expire). It fails clearly if its config is absent, so set:
-
-| Kind | Name | Value |
-|---|---|---|
-| Secret | `AWS_DEPLOY_ROLE_ARN` | ARN of the OIDC deploy role (`lambda:UpdateFunctionCode`) |
-| Variable | `LAMBDA_FUNCTION_NAME` | the function name |
-| Variable | `AWS_REGION` | e.g. `us-east-1` |
-| Variable | `LOG_RETENTION_DAYS` | optional; defaults to `30` |
-
-The Lambda function, execution role, EventBridge schedule, CloudWatch alarm, SNS
-topic and its email subscription would have been the operator's one-time console
-setup — this repo half creates no AWS resources and performs no cutover, and that
-AWS cutover is no longer planned (see the superseded note above). The GitHub
-Actions cron in `monitor.yml` keeps running unchanged as the live host.
-
-## Upgrade path: self-hosted runner
-
-> **Plan of record is a host migration, not this route.** The captain has decided
-> (2026-07-31) to move the monitor off GitHub Actions onto a scheduled **Azure
-> Container Apps Job** — see PLAN.md "Phase 17 (campassist-monitor backend)". That
-> fixes the real defect (GitHub's `schedule` cron drifts to 1–3 h) and makes 15-min
-> polling trivial. But it is **gated on a Phase 0 egress probe**: GoingToCamp's WAF
-> already refused the earlier AWS target (8×403) and Azure egress is itself untested,
-> so if Azure is refused too the fallback is Actions with an external exact-time
-> trigger, or a self-hosted **residential** runner like the one below — never another
-> cloud. Until the migration ships, these options remain the incumbent host's fallback.
-
-When the private-repo free tier (2,000 min/month) gets tight, or if
-recreation.gov starts blocking GitHub's datacenter IPs, register any always-on
-home machine as a self-hosted runner — **unlimited free minutes on private
-repos** and a residential IP:
+If GitHub's own runner egress is ever refused by GoingToCamp (it is accepted
+today, which is why the poll stays there), or the private-repo free tier gets
+tight before the public flip, register any always-on home machine as a
+self-hosted runner — **unlimited free minutes on private repos** and a
+residential IP:
 
 1. Repo → **Settings → Actions → Runners → New self-hosted runner**, follow the
    3-command install on the machine (macOS/Linux/Windows, ~10 minutes).
 2. Run it as a service so it survives reboots (`./svc.sh install && ./svc.sh start`).
 3. In `.github/workflows/monitor.yml`, change `runs-on: ubuntu-latest` to
    `runs-on: self-hosted`.
-4. Optionally tighten the cron to `*/15 * * * *` — minutes are free on
-   self-hosted runners.
 
-Alternative: make the repo public (unlimited hosted minutes), at the cost of
-the monitoring code being visible.
+This is a fallback only. The plan of record is the AWS trigger plus the public-repo
+flip (Phase 17), which is what actually takes running cost to $0.

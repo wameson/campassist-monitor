@@ -49,20 +49,24 @@ campassist-monitor (GitHub, PRIVATE)
   CampAssist iOS app (camp-assist repo) — anonymous sign-in, RLS-scoped
 ```
 
-> **Target topology (Phase 17).** A scheduled **Azure Container Apps Job** runs this same
-> pipeline unchanged (a Dockerfile `CMD`, no shim); secrets become built-in container secrets and
-> a failed run pages via an Azure Monitor metric alert → email. The diagram above is the
-> **current** GitHub Actions host, which Phase 17 retires (captain, 2026-07-31) — **gated on the
-> Phase 0 egress probe passing**, since GoingToCamp's Azure Front Door WAF refused the earlier AWS
-> Lambda target (8×403) and Azure egress is itself untested.
+> **Phase 17 changes the *trigger*, not this topology.** The poll keeps running on GitHub
+> Actions — the one egress path proven to reach GoingToCamp — but stops being fired by GitHub's
+> best-effort `schedule` cron (which drifts 1–3 h). Instead an **AWS EventBridge Scheduler fires
+> on the exact wall clock and calls `monitor.yml`'s `workflow_dispatch`** (captain, 2026-07-31).
+> AWS never talks to GoingToCamp; the diagram above — the poll, Supabase, APNs, the six secrets in
+> GitHub Actions Secrets — is unchanged. Two earlier plans that tried to move the *poll itself* off
+> Actions (AWS Lambda, then Azure Container Apps Jobs) were both refused by GoingToCamp's Azure
+> Front Door WAF; see Phase 17 "Approaches tried and rejected." A later step flips the repo public
+> to take Actions minutes to $0.
 
 ### GitHub Actions minutes budget (private repo, 2,000 free min/month)
 
-> **Current host.** This section is the **GitHub Actions** deployment, which **Phase 17 retires**
-> for a scheduled **Azure Container Apps Job**. The per-minute-rounding arithmetic below is
-> Actions-specific — the Azure cost model is in Phase 17 — but it is kept because Actions is the
-> live host until that migration ships (and it remains the fallback if the Phase 0 egress probe
-> fails), and because the jitter measurement it carries is durable evidence that outlives the host.
+> **The poll stays on GitHub Actions, so this budget stays live.** Phase 17 moves only the
+> *trigger* to AWS; the job that spends these minutes does not move. The budget therefore binds
+> until the **repo is flipped public** (Phase 17's late step), at which point standard-runner
+> minutes become **free at any cadence** and the ≈$7/mo interim cost goes to $0. The
+> per-minute-rounding arithmetic below is Actions-specific and remains load-bearing until that
+> flip.
 
 | Item | Consumption |
 |---|---|
@@ -80,36 +84,36 @@ median job at 141 s — its `Run monitor` step ~130 s of that — against ~10 s 
 Free account's default $0 spending limit that is not a bill, it is every private-repo Action
 stopping until the next billing cycle. Cutting the jitter to 20 s (`START_JITTER_MAX_SECONDS`)
 restored the floor. **The rule that keeps this table true — nothing may push a no-change cycle
-past ~60 s of wall clock — is a GitHub Actions artifact and retires with the host.** Actions
-bills per job rounded up to the whole minute, so a cycle that touches 61 s bills two; that
-rounding is the whole reason the ~60 s line matters. It has **no billing meaning on the
-Phase 17 Azure Container Apps target**, which bills per second and sits far inside a permanent free
-grant. What replaces it there is not a cost cliff at all but the in-code cycle **time** budget
-(`CYCLE_TIME_BUDGET_SECONDS`, 480 s) — a coverage/correctness limit with no tight host timeout
-racing it (Container Apps' `replicaTimeout` is generous), described in Phase 17. The 226-run
-measurement and the 240 s→20 s jitter finding above stay valid as evidence about the incumbent
-and the per-request pacing floor, and `START_JITTER_MAX_SECONDS` stays at 20 s regardless —
-Phase 17 explains why an exact scheduler *restores* its rationale.
+past ~60 s of wall clock — is a live GitHub Actions constraint,** because the poll stays on
+Actions. Actions bills per job rounded up to the whole minute, so a cycle that touches 61 s
+bills two; that rounding is the whole reason the ~60 s line matters, and it keeps mattering
+until the repo goes public (Phase 17), which makes minutes free and dissolves the floor as a
+*cost* concern. What remains after that is the in-code cycle **time** budget
+(`CYCLE_TIME_BUDGET_SECONDS`, 480 s) — a coverage/correctness limit, not a billing one — racing
+only GitHub's own `timeout-minutes: 15` (900 s), unchanged. The 226-run measurement and the
+240 s→20 s jitter finding above are durable evidence about the per-request pacing floor, and
+`START_JITTER_MAX_SECONDS` stays at 20 s regardless — Phase 17 explains why an exact scheduler
+*restores* the jitter's desync rationale.
 
-**Why 30 min and not 15 (on Actions):** the budget above. Two escape hatches were considered
-when it bound — (1) a **self-hosted runner** on an always-on home machine (unlimited free
-minutes on private repos, plus a residential IP a provider won't flag); (2) making the repo
-**public** (free, unmetered Actions). Both were rejected: neither fixes the reason the cadence
-actually hurts — GitHub's `schedule` trigger is best-effort and drifts to **1–3 h** regardless
-of minutes or repo visibility (measured; see Phase 17). The captain chose migration to a real
-scheduler instead (2026-07-31). Both hatches survive only as the incumbent's fallback, not the
-plan.
+**Why 30 min and not 15:** the budget above (captain, 2026-07-31). On the private repo, 15 min
+is ≈$27/mo vs ≈$7 at 30, and it doubles request volume against a WAF already refusing one of our
+egress paths. The other lever the cadence question raised — GitHub's `schedule` trigger being
+best-effort and drifting to **1–3 h** regardless of minutes or repo visibility (measured; see
+Phase 17) — is fixed by Phase 17's AWS trigger, not by cadence. Once the repo is public (Phase
+17's late step) minutes are free at any cadence, so 15 min becomes a pure latency/politeness
+call and can be revisited then. A self-hosted **residential** runner survives only as a fallback
+if GitHub's own egress is ever refused — not the plan.
 
 ### Stack
 
 | Layer | Choice | Why |
 |---|---|---|
-| Scheduling | **Current:** Actions cron `*/30 * * * *` + keep-alive. **Target (Phase 17):** Azure Container Apps Job cron (`*/15` after cutover) | the current cron fits the private-repo free tier but drifts 1–3 h; the target fires on the exact minute |
+| Scheduling | **Trigger:** Actions `schedule` cron `*/30` today (drifts 1–3 h); Phase 17 moves the trigger to an **AWS EventBridge Scheduler** → `workflow_dispatch` (exact wall clock), keeping `schedule` as an offset backstop. **Execution:** GitHub Actions, unchanged | GitHub's `schedule` is best-effort; an exact scheduler fires on the minute while the poll stays on the only accepted egress |
 | Language | Python 3.12 | available on Actions and in a `python:3.12-slim` container, no build step |
 | HTTP | `httpx[http2]` | HTTP/2 is required for APNs |
 | APNs auth | `PyJWT` + `cryptography` | ES256 JWT signed with the `.p8` key |
 | DB | Supabase REST, service-role key | free tier; bypasses RLS server-side |
-| Secrets | **Current:** GitHub Actions Secrets. **Target (Phase 17):** Azure Container Apps built-in container secrets | `.p8` key + Supabase service key; the same six secrets on either host — not Azure Key Vault (unnecessary) |
+| Secrets | GitHub Actions Secrets (unchanged) | `.p8` key + Supabase service key; the six poll secrets stay on Actions. Phase 17's trigger adds one AWS-side secret — a GitHub PAT in an SSM SecureString — which never touches the poll |
 
 **Runtime dependencies are capped at those three.** Anything needing a fourth needs a
 decision, not a `pip install` — the cap is what keeps the monitor's failure surface small and
@@ -910,352 +914,345 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ---
 
-## Phase 17 (campassist-monitor backend) — Hosting migration: GitHub Actions → Azure Container Apps Jobs
+## Phase 17 (campassist-monitor backend) — AWS-triggered GitHub Actions (fix the scheduler drift)
 
-**Documentation only — nothing here has shipped.** Every checkbox below is deliberately unticked;
-no cloud resource has been provisioned and the live `monitor.yml` cron is untouched. This section
-*replaces* an earlier **AWS Lambda + EventBridge Scheduler** plan that direct evidence invalidated
-(see "Why the AWS plan is dead"). The AWS artifacts that plan already produced stay in the repo
-dormant — their disposition is under "The AWS work already in the repo."
+**Documentation only — nothing here has shipped.** Every checkbox is deliberately
+unticked; no cloud resource has been provisioned and the live `monitor.yml` cron is
+untouched.
 
-**Sequencing — and a numbering caveat.** This is **this repo's** backend Phase 17, and it is a
-**distinct phase from camp-assist's Phase 17** (the GoingToCamp *jurisdiction expansion*). The
-two repos' phase numbers diverge here — hosting is inserted ahead of the expansion — so the
-heading carries a repo qualifier, the same disambiguation the existing "Phase 13a (backend half)"
-uses. **This hosting migration precedes camp-assist's Phase 17**: the captain sequenced hosting
-first (2026-07-31) because expansion adds parks, parks consume cycle wall clock, and the
-cycle-time ceiling is the constraint both this migration and the budget re-derivation address —
-so the host is settled before more parks land on it. camp-assist's own roadmap ordering (and any
-renumbering there) is handled by `campassist-roadmap-lambda-before-p17`. Bare "Phase 17"
-references below are always **this** phase; the expansion is only ever named "camp-assist's
-Phase 17."
+**This is a reliability fix, not a cost fix, and the poll does not move.** The
+`*/30 * * * *` Actions cron does not fire as configured: a 2026-07-31 measurement of the
+20 most-recent scheduled runs found gaps of **1–3 hours** — ~12–13 runs/day, not the
+intended 48 — because GitHub's `schedule` trigger is best-effort and is delayed or dropped
+under load. Alerts therefore lag openings by hours, and catching a cancellation fast is the
+whole product. The fix is to stop relying on GitHub's `schedule`: an **AWS EventBridge
+Scheduler fires on the exact wall clock and calls `monitor.yml`'s `workflow_dispatch`**,
+while the poll itself keeps running on GitHub Actions — the one egress path proven to reach
+GoingToCamp. **AWS never talks to GoingToCamp; it only tells GitHub when to run.**
 
-**This is a reliability fix, not a cost fix.** The `*/30 * * * *` Actions cron does not fire as
-configured. A 2026-07-31 measurement of the 20 most-recent scheduled runs found gaps of
-**1–3 hours** — ~12–13 runs/day, not the intended 48 — because GitHub's `schedule` trigger is
-best-effort and is delayed or dropped under load, independent of repo visibility or the minutes
-budget. Alerts therefore lag openings by hours, and catching a cancellation fast is the whole
-product. The current host behaves as GitHub documents; the defect is the **scheduler**, so the
-fix is a host change, not a code change. (Cost is a non-issue either way — see the $0 position.)
+**Sequencing and a numbering caveat.** This is **this repo's** backend Phase 17, distinct
+from **camp-assist's Phase 17** (the GoingToCamp *jurisdiction expansion*). The two repos'
+phase numbers diverge here; the heading carries a repo qualifier, the same disambiguation
+"Phase 13a (backend half)" uses. Fixing the scheduler precedes the expansion — a drifting
+trigger only gets worse as more parks are added. Bare "Phase 17" below always means **this**
+phase; the expansion is only ever named "camp-assist's Phase 17."
 
-### Why the AWS plan is dead
+### Approaches tried and rejected — why AWS triggers but GitHub polls
 
-The prior Phase 17 chose AWS Lambda + EventBridge. **Direct evidence killed it.** Two consecutive
-Lambda invocations from `us-west-2` returned **8 × HTTP 403 — every one a GoingToCamp park** —
-while GitHub Actions polled the same six campgrounds successfully in the same window
-(`alerts_sent: 138`, zero 403s). The mechanism is established, not inferred to the point that
-matters: GoingToCamp sits behind **Azure Front Door** (confirmed by the `x-azure-ref` response
-header), whose bot manager refuses sources on **Microsoft's threat-intelligence and IP-reputation
-feeds**; AWS publishes all its egress ranges (the EC2 range *includes* Lambda), and those ranges
-are heavily represented on such feeds. GitHub's hosted runners are themselves on Azure, which is
-exactly why the incumbent works — an Azure client reaching Azure Front Door. **The captain
-declined to probe other AWS regions**, reasoning correctly that even a working region would be a
-**reputation-based accept that could flip with no notice and no config change on either side** —
-a materially worse risk profile than the structural Azure-on-Azure path. Full evidence:
-`monitor-egress-options/report.md` and `monitor-serverless-15min/report.md` (both 2026-07-31).
+The monitor's home has been re-planned three times; each off-Actions target was abandoned on
+egress. The record is kept **compressed** — not the three plans in full — because "trigger
+from AWS, poll from GitHub" is a genuinely surprising design that only makes sense against
+this history:
 
-### The caveat this plan carries honestly — Azure egress is untested
+- **Render (a hosted cron/worker).** The first off-Actions plan; superseded before egress
+  became the deciding evidence.
+- **AWS Lambda running the poll itself.** Killed by **direct evidence**: two consecutive
+  Lambda invocations from `us-west-2` returned **8 × HTTP 403 — every one a GoingToCamp
+  park** (confirmed twice), while GitHub Actions polled the same campgrounds successfully in
+  the same window (`alerts_sent: 138`, zero 403s).
+- **Azure Container Apps Jobs running the poll itself.** The on-hypothesis successor
+  ("GitHub's runners are on Azure, so an Azure job's egress should pass too") — but the
+  **Phase 0 egress probe returned 403** from the actual Container Apps pool. Azure's
+  *general* egress pool is not GitHub's *specific* published Azure subset, and the WAF
+  refused it.
 
-**Azure is the *on-hypothesis* host, but its acceptance by GoingToCamp is unproven, and an accept
-would itself be reputation-based, not structural.** "GitHub runners are on Azure" is **not** proof
-that an arbitrary Azure tenant's egress passes: GitHub Actions egresses from a *specific published
-subset* of Azure ranges, whereas a Container Apps Job egresses from the region's **general Azure
-pool** — a different set of addresses. If the WAF's accept were specifically GitHub's ranges, or
-if some Azure pools sit on the reputation feed and others do not, an Azure job could **still 403**.
-The captain has been told this and is proceeding anyway; this plan records the risk rather than
-implying Azure is safe. **The two egress paths *proven* to reach GoingToCamp are GitHub Actions
-and residential** — nothing else. So the fallback if Azure is refused too is **not another cloud**:
-it is to keep polling on GitHub Actions and fix only the broken trigger, driving `monitor.yml` from
-an external exact-time `workflow_dispatch` call (measured to fire in ~1 s and escape the `schedule`
-throttle — `monitor-egress-options/report.md`), or, if sub-30-min cadence at $0 is required, a
-self-hosted runner on the captain's residential IP (confirmed 200 to GoingToCamp). Both are the
-prior scout's already-analysed options; both keep egress on a proven-accepted network.
+**The mechanism.** GoingToCamp sits behind **Azure Front Door** (confirmed by the
+`x-azure-ref` response header), whose bot manager refuses source networks on Microsoft's
+threat-intelligence / IP-reputation feeds. AWS's published egress ranges are heavily
+represented on those feeds; Azure's general Container Apps pool was refused too. **GitHub's
+hosted runners egress from a specific Azure range the WAF does *not* refuse** — an Azure
+client reaching Azure Front Door — which is exactly why the incumbent poll works and why the
+poll must not move off it. The two egress paths *proven* to reach GoingToCamp are **GitHub
+Actions and a residential IP** — nothing else.
 
-### Phase 0 — the egress probe comes first (the gate)
+**So Path A keeps the proven egress and moves only the trigger.** The trigger path talks only
+to `api.github.com`; the 403 that killed both migrations cannot apply to it. Full evidence:
+`monitor-egress-options/report.md`, `monitor-serverless-15min/report.md`,
+`monitor-azure-cost/report.md`, and the arch/cost report `monitor-aws-trigger-arch/report.md`
+(all 2026-07-31).
 
-**The AWS plan's fatal flaw was that it sequenced the egress question *last*: everything was built,
-then the very first real request revealed the 8×403. This plan does not repeat that shape.** Before
-any permanent resource is created, a **throwaway egress probe** must pass:
+### The architecture — Path A (Scheduler → Lambda → workflow_dispatch)
 
-- [ ] **Deploy nothing permanent.** Run one polite, keyless single `GET` to GoingToCamp
-  (`https://washington.goingtocamp.com/api/resourceLocation`, browser UA + `Accept` only — the same
-  posture the monitor uses) **from the actual Azure Container Apps Jobs pool** in the target region
-  (a one-shot job, or a one-off `az container create … --command-line "curl -s -o /dev/null -w
-  '%{http_code}' <URL>"` in the same region). Read the status. Delete it.
-- [ ] **A 403 (with an `x-azure-ref` header) stops the whole migration.** It means Azure egress is
-  refused too, and the serverless approach is dead on constraint 1; fall back to the GitHub Actions
-  + external-trigger path (above). Do **not** build the Dockerfile, the registry, the job, or the
-  deploy workflow before this probe is green.
-- [ ] **A 200 (~200 KB body) clears the gate — but does not make Azure durable.** The accept is
-  reputation-based (§ above), so proceed *and* wire a periodic re-probe and keep the Actions
-  fallback wired, because the feed can move this pool to "blocked" with zero notice. Treat a
-  one-time 200 as "works until it doesn't," not as proof.
+```
+AWS account 852845753034  (talks only to api.github.com — never to GoingToCamp)
+  EventBridge Scheduler   cron */30, exact wall clock
+      └─▶ Lambda (trigger hop, ~15 lines: read PAT, POST dispatch, log HTTP status)
+              ├── reads the GitHub PAT from an SSM SecureString at invoke
+              └── emits Invocations metric ─▶ CloudWatch alarm (Sum<1) ─▶ SNS email
+                     │
+                     ▼  POST /repos/wameson/campassist-monitor/actions/workflows/monitor.yml/dispatches
+  GitHub Actions   runs monitor.yml   (the poll, unchanged)
+      └─▶ polls GoingToCamp FROM GitHub's accepted Azure runner range (200 OK)
+```
 
-An Azure Cloud Shell `curl` is a cheaper first screen, but its egress may come from a different
-managed pool than the Jobs runtime, so a Cloud Shell 200 is *encouraging, not conclusive* — confirm
-with the actual Container Apps pool before trusting it. This gate is ~5 minutes and ~$0, and it is
-the single most important step in the phase.
+**Path B — a scheduled EventBridge *Rule → API destination* with no Lambda — was considered
+and rejected.** Its token would live in an EventBridge **Connection → AWS Secrets Manager at
+≈$0.40/secret/mo** (the single line item that would make the AWS side non-zero), and its
+delivery is opaque (a `FailedInvocations` metric + a DLQ) — the wrong trade for a system
+whose entire failure mode is *silent* missing. Path A's ~15-line Lambda logs every attempt
+and GitHub's exact HTTP status, and keeps the token in **SSM (free)**.
+(`monitor-aws-trigger-arch/report.md` §4.)
 
-### Target architecture
+### Cost — ~$7/mo interim, $0 once public; the AWS side is $0 forever
 
-A **scheduled Azure Container Apps Job** runs the same pipeline unchanged:
+**The money decision is repo visibility, not AWS.** The AWS trigger is $0 at every cadence,
+this year and next — every service on the path sits inside a **permanent** free tier
+(EventBridge Scheduler 14 M invocations/mo; Lambda 1 M req + 400,000 GB-s/mo; SSM Standard
+parameters; CloudWatch 10 alarms + 5 GB logs/mo; SNS 1,000 emails/mo), and the trigger's
+usage (≤ 2,922 invocations/mo, ~36 GB-s) rounds to $0 even at list price. **No ECR-style
+year-two trap:** no container registry, no NAT gateway, no data-transfer line.
 
-- **Trigger — the Container Apps Job's built-in cron** (`*/15 * * * *` after cutover; see
-  "Cadence" and the parallel-proof caveat before enabling 15 min). Azure's job scheduler fires on
-  the exact wall clock, down to the minute — no best-effort `schedule` drift. Jobs scale to zero
-  between runs, so there is no idle charge.
-- **Compute — Azure Container Apps Jobs**, **0.25 vCPU / 0.5 GiB** (the minimum valid combo;
-  the monitor's ~131 MB peak fits inside 0.5 GiB). It runs `scripts/monitor.py` **unchanged** from
-  a ~10-line Dockerfile (`python:3.12-slim`, `pip install -r requirements.txt`, `CMD ["python",
-  "scripts/monitor.py"]`). The existing `raise SystemExit(exit_code(result))` maps **natively** to
-  job semantics — non-zero exit → execution **Failed** → alert — so **no entrypoint shim is
-  needed** (unlike Lambda). `replicaTimeout` defaults to 1,800 s and is raisable, so the ~500 s
-  worst-case cycle (480 s budget + ≤20 s jitter) has generous headroom and there is no tight
-  ceiling to design against.
-- **Image registry — a *free* registry (GitHub Container Registry or Docker Hub), never Azure
-  Container Registry.** ACR has **no free tier and no 12-month grace — ~$5/mo from day one,
-  forever.** Container Apps can pull from any registry; a **private GHCR image within existing
-  GitHub limits** is $0 and does not expose the provider-parsing source (same class of decision as
-  "make the repo public"). This is $0-choice #1 (see "The three choices that keep it $0").
-- **Secrets — Container Apps built-in container secrets**, **not Azure Key Vault.** The same six
-  secrets the workflow passes today (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `APNS_KEY_ID`,
-  `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `APNS_P8_KEY`) go straight into the job definition at $0; the
-  multiline `.p8` PEM travels fine as a secret value — same shape as today's `APNS_P8_KEY`, no
-  code change to the secret contract and no SSM-style loader shim (that was Lambda-specific). Key
-  Vault would be pennies (~$0.05/mo) but is unnecessary; this is $0-choice #3.
-- **Logs — `--logs-destination none`.** Azure Container Apps **defaults** to shipping console + system
-  logs to a Log Analytics workspace, billed at $2.30/GB after a 5 GB/mo allowance *shared across the
-  whole billing account* — the classic bill surprise for this workload. Setting the environment's
-  log destination to `none` disables stored log data while **keeping the real-time Log stream** for
-  live debugging, and the durable run record is the monitor's own `run_summaries` row anyway. This is
-  $0-choice #2.
-- **Failure → a human.** A systemic cycle's non-zero exit becomes a **Failed job execution** → an
-  **Azure Monitor metric alert** on the failed-execution metric → an **action group email**
-  (both within free tiers: 10 metric time-series + 1,000 emails/mo). This is operator-only; the
-  **user-facing camp alerts still go over APNs, unchanged**. The loud-failure contract holds: a
-  systemic run must stay loud — a non-zero exit must reach a human.
+The only cost is GitHub Actions minutes on a **private** repo:
 
-### The three choices that keep it $0 — get any one wrong and it is $5–15/mo
+| Cost line | 30 min · private | 15 min · private | public (any cadence) |
+|---|---:|---:|---:|
+| GitHub Actions poll (`monitor.yml`) | **≈ $7/mo** | **≈ $27/mo** | **$0** |
+| └ range across 2.0–3.0 billed-min/run | $6–$14 | $23–$41 | $0 |
+| └ if the account is **Pro** (3,000 free min) | ≈ $1/mo | ≈ $21/mo | $0 |
+| AWS trigger path | $0 | $0 | $0 |
+| **Total (Free plan, measured)** | **≈ $7/mo** | **≈ $27/mo** | **$0** |
 
-Compute is genuinely free here (~62 % of one permanent free grant at 15 min: 180,000 vCPU-s ÷
-0.25 vCPU ≫ this workload), and it **stays** free — the grant is a standing monthly allowance, not
-a 12-month trial benefit, so **month 13 costs exactly what month 1 costs**. The whole cost question
-is the three easy-to-miss line items, each of which must be chosen correctly:
+Figures use the **measured** average of **2.2 billed min/run** (n = 15 recent `monitor.yml`
+runs: 94–125 s wall clock, mean ~109 s; GitHub bills **per job, rounded up to the whole
+minute**, at the **verified $0.006/min** Linux rate — a correction from the stale $0.008
+prior monitor reports used) over **1,461 runs/mo** at 30 min (30.44-day month). Two honest
+caveats sit behind the private figures: the account's **Free-vs-Pro plan could not be read**
+from the worktree token (Pro's 3,000 free min drops the 30-min case to ≈$1); and the
+free-minute pool is **shared** across the owner's private repos (~+$2/mo if the ~375 min/mo
+prior estimate holds). The **public** column is a hard $0 — public repos get unlimited
+standard-runner minutes — and touches none of that math. Source:
+`monitor-aws-trigger-arch/report.md` §§1–3.
 
-| # | Choice | $0 option | The trap if you get it wrong |
-|---|---|---|---|
-| 1 | **Image registry** | GHCR / Docker Hub (free) | **Azure Container Registry** — no free tier, no grace → **~$5/mo from day 1, forever** |
-| 2 | **Logs** | `--logs-destination none` | Default Log Analytics ingestion at $2.30/GB (shared 5 GB) — the classic surprise |
-| 3 | **Secrets** | Built-in container secrets | Azure Key Vault (pennies, but unnecessary) |
+**The captain's decisions (2026-07-31):** **30 minutes for now** — not 15, because on the
+private repo it is ~$7 vs ~$27/mo, and 15 min doubles request volume against a WAF already
+refusing our other egress; and **flip the repo public *after* the backend implementation is
+complete**, at which point minutes become free and the ~$7/mo goes to **$0**. The ~$7/mo is
+the **accepted interim cost** until that flip.
 
-Get all three right → **$0/mo at 15 minutes, year one and year two alike**. Get any one wrong →
-$5–15/mo. Source: `monitor-azure-cost/report.md` (2026-07-31).
+### The GitHub token — scope, storage, blast radius
 
-### What changes in the repo, and what does not
+- **The auto `GITHUB_TOKEN` cannot do this** — by design it cannot trigger
+  `workflow_dispatch`, so a real credential must live on the AWS side.
+- **Minimal scope:** a **fine-grained PAT**, scoped to the **single repo**
+  `wameson/campassist-monitor`, repository permission **Actions: Read and write** (what the
+  "Create a workflow dispatch event" REST endpoint requires), with an **expiry** (e.g. 90
+  days). **Not** a classic PAT — that needs the broad `repo` scope. *Caveat (report §8):* the
+  endpoint may additionally want **Contents: Read** to resolve the ref; start with
+  Actions:write only and add Contents:read only if the dispatch 403s.
+- **Storage:** an **SSM Parameter Store SecureString** (KMS-encrypted with the free
+  AWS-managed key), read by the Lambda at invoke. Rotation = update the SecureString in
+  place; the Lambda picks up the new value on its next run, no redeploy.
+- **Blast radius if it leaks:** start or cancel workflow runs in **this one repo** — nothing
+  else. A fine-grained single-repo Actions:write PAT **cannot read code, read Actions
+  secrets, push commits, or edit workflows.** The blast radius is "waste some minutes on one
+  repo," not "exfiltrate the Supabase service key." A GitHub App installed on the one repo
+  (auto-rotating installation tokens) is strictly better still and a fair future hardening,
+  not required for launch.
 
-**Business logic does not move.** `scripts/monitor.py`, `scripts/providers/*`, `scripts/apns.py`,
-`scripts/db.py`, `scripts/common.py`, `scripts/preflight.py`, and `requirements.txt` are
-untouched. The provider seam, the write/time budgets, the containment/exit-status rules, and the
-schema-drift guard all run as-is. Secret loading via `SupabaseClient.from_env()` /
-`APNsClient.from_env()` is unchanged — the container secrets are injected as environment variables
-before `python scripts/monitor.py` runs, so `*.from_env()` reads them exactly as it does on Actions.
+### Duplicate-dispatch control — EventBridge is at-least-once
 
-**No entrypoint shim is needed — the CLI entrypoint *is* the contract.** The Container Apps Job runs
-`python scripts/monitor.py` directly. `main()` ends in `raise SystemExit(exit_code(result))` (and
-preflight HALT raises `SystemExit(1)` before that): a non-zero exit code makes the job execution
-**Failed**, which drives the alert; a zero exit is a **Succeeded** execution. This is the loud-failure
-contract expressed natively, with nothing to get wrong — no `SystemExit`→error translation, no
-`boto3`/SSM loader. It also **sidesteps the warm-container stale-anchor trap the Lambda shim existed
-to fix**: each job execution is a **fresh container process**, so `PROCESS_STARTED` is captured anew
-at import every run and the fan-out deadline is never stale. (The two-line `main(process_started=…)`
-plumbing added for the Lambda shim is harmless and stays — the CLI path uses its import-time default,
-byte-for-byte unchanged.)
+EventBridge Scheduler delivers **at least once**, and the monitor has **no run-level lock or
+lease** (the cycle just selects `status=eq.monitoring` — no `FOR UPDATE`, no lease column). A
+duplicate dispatch is **prevented**, and even an escaped one is harmless:
 
-**The AWS work already in the repo — recommended disposition: keep dormant, remove in a follow-up.**
-The prior Phase 17 landed `lambda_function.py` (the SSM→env / `SystemExit`→error shim), its tests in
-`tests/test_lambda_function.py`, the `make lambda-zip` build, and the OIDC `deploy.yml`. **Do not
-delete any of it in this documentation pass.** Recommended disposition: leave it in place, dormant,
-and remove it as a separate reversible cleanup **only after Azure cutover completes (Phase C)**. The
-justification: the migration is not committed until the Phase 0 egress probe is green, and if Azure is
-refused the fallback is a *scheduler* change on Actions, not more serverless — so tearing out a
-working, tested, host-agnostic-adjacent entrypoint before the replacement host is proven would be
-premature churn for no benefit, and the shim costs nothing sitting unused. The cloud resources the
-captain already built on AWS are likewise **left dormant, not deleted**; the AWS Free Plan self-closes
-at 6 months and deletes them on its own, so no teardown action is required.
+- **Prevent:** set the Scheduler schedule's **`MaximumRetryAttempts` to 0**, so a single tick
+  never re-fires on its own retry path (a missed tick is covered by the next tick and the
+  `schedule` backstop; aggressive retry only buys duplicate minutes). The Lambda POSTs exactly
+  once per invoke.
+- **Contain (belt-and-suspenders):** `monitor.yml` already declares
+  `concurrency: { group: monitor, cancel-in-progress: false }`. Because **both** the AWS
+  trigger and the `schedule` backstop fire the **same workflow on the same host**, that one
+  concurrency group serializes **every** run regardless of which trigger started it — a
+  duplicate queues behind the in-flight run and starts only after it commits. **No lock is
+  needed:** a cycle is capped at `CYCLE_TIME_BUDGET_SECONDS` (480 s) + ≤20 s jitter ≈ 500 s,
+  comfortably inside the 1,800 s (30 min) gap, so runs never overlap. A no-change cycle also
+  **writes nothing** (the ≤5-write budget / hash compare), and real re-alerts are deduped by
+  `sent_alerts`, so the worst case of a double-fire is a few wasted Actions minutes, never bad
+  data.
 
-**`deploy.yml` is AWS-specific and is replaced, not kept.** Today's `deploy.yml` builds the Lambda zip
-and pushes it via GitHub OIDC → a scoped IAM role (`lambda:UpdateFunctionCode`). Its Azure replacement
-**builds the container image and pushes it to the free registry** (GHCR/Docker Hub) on merge, and — if
-the job is pinned to an immutable tag or digest — triggers a job image update. **It must stay
-`push`-triggered (merge to `main`), never `schedule`** — the whole point of the migration is to leave
-GitHub's best-effort `schedule` behind; a build/deploy workflow on `push` is immune to that drift
-because drift only affects `schedule`. It must also fail clearly when its registry/credential config is
-absent, the same contract the AWS `deploy.yml` had.
+### Failure visibility — the silent-miss class, designed for explicitly
 
-**`START_JITTER_MAX_SECONDS` stays at 20 s — do not change the constant.** Its own comment keeps
-the jitter *because the trigger is planned to move to an external cron that fires at exact
-wall-clock times, which restores the desync rationale* — **this migration is that move.** Under
-GitHub's `schedule` trigger the jitter bought little (GitHub's throttling already spread delivery
-across the hour); the Azure Container Apps Job cron fires predictably on the exact minute, so the
-jitter again does real work desynchronizing the first provider request from the tick. And the
-GitHub-specific cost pressure that forced it down from 240 s to 20 s (per-minute billing rounding)
-does not exist on Container Apps (per-second billing, and the workload is far inside the free grant),
-so there is no cost reason to touch it either. An earlier suggestion to *drop* the jitter on migration
-is explicitly wrong and is corrected here.
+**If the trigger silently stops firing, the monitor silently stops — and no Actions failure
+email is ever sent, because no run happens.** This is the same silent-miss class as the
+budget-exhaustion bug: a normal Actions failure email covers a run that *runs and fails*, not
+a *trigger that never fires*. Three complementary layers, all within free tiers:
 
-### Ordered migration steps
+1. **Keep `schedule` as a low-frequency backstop.** Leave a `schedule` entry (at `*/30`, or
+   thinned to hourly), **offset** (e.g. minute `:07`) so it rarely coincides with the
+   exact-time trigger. If the AWS trigger dies, the monitor **degrades to today's best-effort
+   cadence, not to zero.** (This is also why the repo change is nearly nil — see below.)
+2. **AWS heartbeat alarm.** A CloudWatch alarm on the trigger Lambda's `Invocations` metric —
+   `Sum < 1` over a window (e.g. 45 min), **treat-missing-data = breaching** → SNS email.
+   Catches "Scheduler stopped invoking." One of the 10 always-free alarms.
+3. **Best detector — `run_summaries.ran_at` freshness.** The monitor already writes a
+   world-readable `ran_at` every cycle. A staleness check ("no successful run in > X min")
+   catches **every** trigger-failure cause at once — Scheduler, Lambda, token expiry, GitHub
+   outage — regardless of *why* the trigger stopped. This belongs in the iOS operator view
+   and/or a tiny external check, and is the single most robust silent-miss guard.
 
-The monitor writes to a **live Supabase** and sends **real APNs pushes**, and there is **no
-run-level lock or lease** — the cycle just selects `status=eq.monitoring` with no `FOR UPDATE`
-and no lease column. So any overlap between two schedulers races on shared state. The cutover is
-staged around that, and it begins with the egress gate.
+### What changes in the repo — almost nothing — and dispositions
 
-**Phase 0 — the egress probe (the gate — see "Phase 0" above):**
+- **`monitor.yml` needs no edit to function.** It **already** declares `workflow_dispatch`
+  and the `concurrency` guard. The `schedule` trigger **stays** as the offset backstop (do
+  not remove it — it is failure-visibility layer 1); the AWS trigger is added *alongside* it,
+  not in place of it. No code, no schema, no secret-contract change. The SSRF posture is
+  intact — the trigger's only URL is the hardcoded `api.github.com` dispatch endpoint;
+  nothing is derived from any client-writable value.
+- **`keepalive.yml` stays.** It exists to stop GitHub auto-disabling the *scheduled* workflow
+  after 60 idle days, and the `schedule` backstop is retained, so it is still needed. (It
+  would become removable only if `schedule` were ever dropped entirely; `workflow_dispatch`
+  is not subject to the 60-day rule.)
+- **`lambda_function.py`, `tests/test_lambda_function.py`, and `make lambda-zip` are now
+  fully orphaned.** They were the shim for running the *poll itself* inside AWS Lambda — the
+  plan the 8×403 killed. Path A runs a **new, unrelated ~15-line trigger Lambda** (deployed
+  operator-side, not built from this shim), and the poll never moves to AWS, so nothing in
+  the repo ever calls this shim again. **Recommended disposition: keep dormant now, remove in
+  a separate follow-up cleanup** (not in this documentation pass) — a reversible deletion once
+  Path A is live. While the shim remains, its tests stay green and the `lambda_function`
+  import name on `pytest.ini`'s `sys.path` stays accurate.
+- **`deploy.yml` is orphaned the same way.** It builds the Lambda zip and pushes it via GitHub
+  OIDC → a scoped `lambda:UpdateFunctionCode` role, for the dead polling Lambda.
+  **Recommended disposition: remove in the same follow-up cleanup.** The trigger Lambda is ~15
+  lines the operator deploys once from the console/CLI; its code changes almost never, so it
+  needs no per-merge repo deploy workflow, and `deploy.yml` has no successor to become. Do not
+  delete it in this pass.
 
-- [ ] Run the throwaway keyless GET from the actual Azure Container Apps pool. **403 → stop, the
-  migration is dead, fall back to the Actions + external-trigger path. 200 → proceed** (and wire a
-  re-probe, because the accept is reputation-fragile). Build nothing permanent until this is green.
+### The AWS resources the captain already built
 
-**Phase A — stand it up, no traffic:**
+The captain provisioned AWS resources for the dead Lambda-*polling* plan. Against Path A:
 
-- [ ] Build the Dockerfile image and push it to the **free** registry (GHCR/Docker Hub).
-- [ ] Create the Container Apps environment with **`--logs-destination none`**, then the Job
-  (0.25 vCPU / 0.5 GiB, `replicaTimeout` comfortably above 500 s), its 6 **built-in container
-  secrets** with the real values, the **Azure Monitor metric alert** on the failed-execution
-  metric, and the **action-group email** with a confirmed address. Create the job **with no cron
-  schedule attached yet.**
-- [ ] Trigger one manual execution and read the live Log stream: preflight passes, the JSON summary
-  prints, exit is clean. This exercises secrets, **egress**, and the exit-code→execution-status path
-  end-to-end with no schedule attached.
+| Resource | Reusable for Path A? | Note |
+|---|---|---|
+| **Execution role** | **reusable, re-scoped** | the trigger Lambda needs only SSM `GetParameter` (the PAT) + CloudWatch Logs — narrower than the polling role |
+| **SSM parameters** (the 6 monitor secrets: Supabase + APNs) | **orphaned** | the trigger polls nothing and needs none of them; Path A needs **one new** SSM SecureString: the GitHub PAT |
+| **Lambda function** | **shell reusable, code replaced** | the polling handler is discarded; the ~15-line trigger handler takes its place |
+| **CloudWatch alarm** | **reusable, re-pointed** | from the polling Lambda's `Errors` metric to the trigger Lambda's `Invocations` heartbeat (§ Failure visibility) |
+| **SNS topic + email subscription** | **reusable as-is** | same "email the operator" purpose |
+| **EventBridge schedule** | **reusable, re-targeted** | now targets the trigger Lambda; set `MaximumRetryAttempts = 0` |
 
-**Phase B — parallel proof (the dangerous window):**
+Any resource left orphaned costs nothing (all inside permanent free tiers) and can be deleted
+at leisure.
 
-- [ ] Attach the Job's cron **at the current 30-min cadence, staggered 15 minutes** from the GitHub
-  cron (GitHub at `:00/:30`, the Job at `:15/:45`), and **leave the GitHub cron running**. **Do not
-  enable the 15-min target cadence yet** (see "Cadence" — 15 min is turned on only in Phase C, once
-  GitHub is retired, because a second scheduler at 15 min would collide with GitHub's `:00/:30`).
-- [ ] Run both for several days; compare each side's `run_summaries` rows (both write there):
-  confirm the Job fires on time, polls the same units, and matches `campgrounds_polled` /
-  `alerts_sent` / `errors`.
+### Cutover and rollback — and why the double-alert risk does *not* apply here
 
-**Phase C — cut over:**
+The earlier Azure plan carried a sharp **double-alert** warning: two schedulers (GitHub cron
++ Azure job) on **two separate hosts**, no shared lock, so a genuinely concurrent overlap
+could make both runs send the same push — which is why that plan needed a staggered
+parallel-proof window. **That risk does not apply to Path A**, and the reason is structural:
+the AWS trigger and the `schedule` backstop both fire the **same `monitor.yml` on the same
+GitHub host**, where `concurrency: group: monitor` serializes **all** runs regardless of
+trigger source. Two triggers can never produce two *concurrent* runs — the later one queues
+and starts only after the first commits, at which point the committed `state_hash` /
+`sent_alerts` rows dedup it correctly. A single execution host with a concurrency group is
+exactly what the Azure two-host plan lacked. So Path A needs **no staggered parallel-proof
+window**; the trigger can be added while `schedule` keeps running, with the concurrency guard
+doing the serialization for free.
 
-- [ ] After several clean on-time Job days, disable the GitHub `schedule` trigger (comment out the
-  `cron:`). **Keep `monitor.yml` in the repo** as the rollback path.
-- [ ] With GitHub retired and the Job now the **sole** scheduler, raise the Job cron to the target
-  **`*/15`** — safe because there is no second scheduler left to overlap with.
+**Rollback is instant and zero-risk:** disable or delete the EventBridge schedule. The
+`schedule` backstop cron is still running and simply resumes as the sole trigger — the
+incumbent path never stops, so there is no cutover window and no data migration.
 
-**The double-alert risk during overlap — the single most dangerous step.** The monitor has two
-dedup layers — `state_hash` (per watch) and the `sent_alerts` 6 h cooldown (per `watch_id,
-site_id, date`) — and **both are check-then-write with no locking**. They dedup across
-**serialized** runs (a later run reads the earlier run's committed hash and sees "no delta") but
-**neither protects two truly concurrent runs** (both read the pre-alert state, both send, both
-write). GitHub's `concurrency: group: monitor` guard only serializes GitHub against itself; it
-does nothing against a separate Azure scheduler. **The staggered schedule is the only thing that
-makes the parallel proof safe:** a cycle is capped at the 480 s budget (+ ≤20 s jitter ≈ 500 s),
-and a 15-min stagger at a 30-min cadence = 900 s > 500 s, so the second run always starts after
-the first has finished and committed — the two schedulers never overlap, and the shared Supabase
-turns them into correct dedup. A genuinely new opening appearing *between* the staggered runs is
-alerted once by whichever sees it first — correct, not a duplicate. **This is why Phase B holds
-the Job at 30-min/staggered and 15 min is deferred to Phase C:** at 15 min a second scheduler
-would coincide with GitHub's ticks and both could send. A hard cut-over without the staggered
-proof, or enabling 15 min while GitHub is still live, is what is unsafe.
+### Ordered implementation steps
 
-**Rollback.** The monitor is stateless and idempotent against the shared Supabase, so rollback is
-instant with no data migration. During Phase B: disable the Job's schedule (one action) — the
-GitHub cron is still live, so monitoring never stops. After Phase C: re-enable the `cron:` and
-disable the Job schedule — one commit / one toggle, because the workflow file was kept. Keep the
-disabled workflow in the repo for weeks after cutover; deleting it is a separate later cleanup.
+**Phase A — stand up the trigger (no cutover):**
 
-### Cadence — a free knob between ~9 and 30 minutes; the captain wants 15
+- [ ] Mint the fine-grained PAT (single repo, Actions: Read and write, 90-day expiry) and
+  store it as an SSM SecureString.
+- [ ] Create the trigger Lambda (~15 lines: read the PAT from SSM,
+  `POST …/monitor.yml/dispatches`, log the HTTP status), its re-scoped execution role, the
+  CloudWatch `Invocations` heartbeat alarm, and the SNS email (confirm the subscription).
+- [ ] Invoke the Lambda manually once; confirm it returns GitHub's `204` and a `monitor.yml`
+  run appears. This exercises the PAT, the SSM read, and the dispatch path end-to-end with no
+  schedule attached.
 
-**15 minutes costs exactly the same as 30 — both are $0.** Container Apps Jobs at 0.25 vCPU only
-leaves the free grant when average-run-seconds × runs/month exceeds 720,000 s, i.e. below roughly a
-**~9-minute** cadence; anything from ~9 to 30 minutes is inside the permanent free grant. So cadence
-buys **detection latency, not money** — the captain's choice of 15 is free. Two honest notes carried
-from the analysis (`monitor-serverless-15min/report.md`): 15 min does **not** raise per-cycle
-capacity — a cycle is still capped at the 480 s budget (~40 parks) and simply repeats twice as often;
-and 15 min doubles daily request volume against GoingToCamp (~1,900 → ~3,800/day), which is low
-absolute volume but spends politeness margin on a WAF that is already refusing one of our paths, so it
-is defensible on the accepted network but not free of exposure. Enable 15 min **only in Phase C**, per
-the double-alert rule above.
+**Phase B — turn on the exact-time trigger alongside the backstop:**
 
-### Operator by hand vs automated
+- [ ] Attach the EventBridge schedule at **`*/30`** (exact wall clock),
+  `MaximumRetryAttempts = 0`, and **leave `monitor.yml`'s `schedule` cron running** as the
+  offset backstop. The `concurrency` guard serializes the two sources; **no stagger is
+  required** (see above).
+- [ ] Run for several days; confirm from `run_summaries.ran_at` that runs now land on the
+  exact minute (no 1–3 h drift), and that the heartbeat alarm and email fire when the schedule
+  is briefly disabled.
 
-| By hand (one-time operator) | Automated / scripted |
-|---|---|
-| Open the Azure account; note the **hard spending cap is trial-only** (see "$0 position") — a pay-as-you-go subscription is required past the 30-day trial and has no hard cap; card required | Container **image build + push** to the free registry (GHCR/Docker Hub) on merge |
-| **Run the Phase 0 egress probe first** and read the status — the gate for everything below | Job **image-tag/digest update** on merge — a small `push`-triggered deploy workflow (replaces `deploy.yml`), immune to the cron-drift bug (drift only affects `schedule`), authed to the registry (and, if it pokes Azure, a scoped credential / federated identity) |
-| Create the 6 **built-in container secrets** with the real values (values never live in the repo or IaC) | — |
-| Create the Container Apps environment (`--logs-destination none`), the Job, its cron schedule, the metric alert + action-group email (console is fine for one job) | — |
-| Confirm the action-group email subscription (Azure emails a link) | — |
-| Set a Cost-Management **Budget + action** as a delayed, DIY backstop (there is no native hard cap on pay-as-you-go — see "$0 position") | — |
+**Phase C — thin the backstop (optional):**
 
-### The $0 position, honestly
+- [ ] Once the AWS trigger is proven, optionally thin the `schedule` cron to hourly (keeping
+  it as a backstop, **not** removing it — it is the trigger-down safety net). Do **not** drop
+  `schedule` entirely: that also makes `keepalive.yml` load-bearing to remove and gives up
+  layer 1 of failure visibility.
 
-On the free-registry + `logs none` + built-in-secrets path, **month 13 costs exactly what month 1
-costs: $0** — every grant this workload touches is a **permanent** monthly allowance (Container Apps'
-180,000 vCPU-s + 360,000 GiB-s; 100 GB egress; 10 metric time-series; 1,000 emails), not a 12-month
-new-account benefit, and this workload sits at **~62 % of the binding axis** (vCPU-seconds at 15 min),
-with every other meter well under it. The three easy-to-miss line items are each driven to $0 by the
-three choices above (free registry not ACR; `--logs-destination none` not default Log Analytics;
-built-in secrets not Key Vault); get any one wrong and it is $5–15/mo. Source:
-`monitor-azure-cost/report.md`.
+**Phase D — flip the repository public (the $0 step — gated on a secret scan):**
 
-**The hard spending cap — plainly, because the captain asked plainly.** Azure's hard spending limit
-**exists but only on credit-based subscriptions** (the $200 30-day trial, Visual Studio) — there it
-genuinely disables/de-allocates resources when the credit is exhausted. It is **not available on
-pay-as-you-go and cannot be enabled**, and you **must** be on pay-as-you-go to run past the 30-day
-trial. So Azure hard-caps you for **30 days and then that protection evaporates**; for ongoing
-production Azure is **no better than AWS on this axis** — the closest equivalent is a DIY
-Cost-Management-Budget → action → shutdown, which is soft and lagged on both clouds. This is not
-softened: the belief "Azure gives a hard cap AWS doesn't" is true for the trial and false for
-production. The practical runaway risk is low regardless, because the workload sits entirely inside
-permanent free grants — but the captain should not adopt Azure *for* a hard cap that lasts 30 days.
+*Do this only after the backend implementation is complete (captain, 2026-07-31).* Flipping
+public takes the running cost from ~$7/mo to **$0** and makes cadence a free knob again.
 
-### The scaling ceiling (why hosting is settled before more parks land)
+- [ ] **Full git-history secret scan FIRST.** Making a repository public exposes its **entire
+  history, not just its current state** — a secret that was ever committed and later removed
+  stays readable in old commits. Scan the whole history (e.g. `gitleaks detect` / `trufflehog`
+  over all refs) before the flip.
+- [ ] **Any hit is a blocker requiring credential rotation, not merely removal from history.**
+  Rewriting history does not help once a commit has been fetched, cloned, or indexed; the
+  exposed credential (the Supabase service key, the APNs `.p8`, any PAT) must be **rotated**.
+- [ ] **The flip is irreversible.** Once public and cloned or indexed, the history cannot be
+  taken back. Confirm the scan is clean and every flagged secret rotated before flipping.
+- [ ] Flip visibility. Actions minutes are now free at any cadence; revisit 15-min polling on
+  its merits (§ Cadence), no longer on price.
 
-Cost is not the limit; **wall-clock time is.** The monitor polls serially with per-request
-politeness pacing, so distinct parks-under-watch consume cycle seconds, and the **in-code cycle
-time budget (`CYCLE_TIME_BUDGET_SECONDS`, 480 s) is the governor** — it stops polling long before
-the vCPU-seconds money wall, and Container Apps Jobs imposes no tight host timeout to race against
-(the `replicaTimeout` default is 1,800 s and raisable, unlike Lambda's hard 900 s wall). The exact
-parks-per-cycle figure is being re-derived alongside `CYCLE_TIME_BUDGET_SECONDS`
-(`monitor-cycle-budget-rederive`) and is stated qualitatively here rather than pinned. The
-sequencing point: broad coverage is *free forever on cost* but *not reachable at a 15/30-min cadence
-on the serial design* — it needs an architectural change (shard by host, tiered cadence, or per-host
-async), each of which also stays free. That is exactly why the captain settled the host before
-camp-assist's Phase 17 (the jurisdiction expansion) adds parks. (The behaviour of a cycle that
-*hits* the budget — today it degrades by silently skipping and exiting green — is owned by
-`monitor-silent-skip-goes-green`, not this phase.)
+### Cadence — 30 min now, a free knob once public
+
+**30 minutes now** (captain, 2026-07-31): on the private repo it is ~$7/mo vs ~$27 at 15 min,
+and 15 min doubles daily request volume against GoingToCamp (~1,900 → ~3,800/day) — low
+absolute volume, but it spends politeness margin on a WAF already refusing one of our egress
+paths. 15 min does **not** raise per-cycle capacity (a cycle is still capped at the 480 s
+budget, ~40 parks, and simply repeats twice as often — past ~40 parks the fix is sharding,
+orthogonal to cadence). Once the repo is public (Phase D), 15 min costs the same $0 as 30
+min, so cadence becomes a **latency/politeness** call, not a money one, and can be revisited
+then. Source: `monitor-aws-trigger-arch/report.md` §6.
+
+### The scaling ceiling is unchanged by this phase
+
+The poll host does **not** change, so nothing here moves the ~40-parks-per-cycle ceiling: the
+governor is still the in-code `CYCLE_TIME_BUDGET_SECONDS` (480 s) against GitHub Actions'
+`timeout-minutes: 15` (900 s), exactly as today. Broad coverage still needs an architectural
+change (shard by host, tiered cadence, per-host async), owned by the cycle-budget
+re-derivation (`monitor-cycle-budget-rederive`) and camp-assist's Phase 17 — not this trigger
+work.
 
 ### Build
 
-- [ ] `Dockerfile` (`python:3.12-slim`, `pip install -r requirements.txt`, `CMD ["python",
-  "scripts/monitor.py"]`). `requirements.txt` unchanged; **no entrypoint shim** — the CLI's
-  `SystemExit(exit_code(result))` is the job's success/fail contract directly.
-- [ ] Deploy workflow to **replace `deploy.yml`**: builds the image and pushes it to the **free**
-  registry (GHCR/Docker Hub) on merge to `main`, then updates the Job's image tag/digest.
-  **`push`-triggered, never `schedule`** (the cron-drift bug only affects `schedule`). Fails clearly
-  when its registry/credential config is absent.
-- [ ] Container Apps environment (`--logs-destination none`) + Job (0.25 vCPU / 0.5 GiB, generous
-  `replicaTimeout`) + built-in container secrets + metric alert + action-group email — an operator
-  stand-up (Phase A), optionally captured as IaC; the console is fine for one job.
+- [ ] Trigger Lambda (~15 lines: SSM `GetParameter` for the PAT,
+  `POST …/monitor.yml/dispatches`, log the HTTP status) + re-scoped execution role — an
+  operator stand-up, no repo code. `requirements.txt`, `monitor.py`, and the whole poll
+  pipeline are **untouched**.
+- [ ] EventBridge schedule (`*/30`, exact wall clock, `MaximumRetryAttempts = 0`) targeting
+  the Lambda; SSM SecureString holding the fine-grained PAT; CloudWatch `Invocations`
+  heartbeat alarm; SNS topic + confirmed email.
+- [ ] `monitor.yml`: **no change required** — `workflow_dispatch` + `concurrency` already
+  present; `schedule` retained as the offset backstop.
 
 ### Tests
 
-- [ ] The offline suite (`pytest`) stays fully offline and **unchanged** — the business logic does
-  not move, so its coverage of `monitor.py` / providers / budgets / containment / exit-status carries
-  over as-is with no Azure calls.
+- [ ] The offline suite (`pytest`) stays fully offline and **unchanged** — no business logic
+  moves, so its coverage of `monitor.py` / providers / budgets / containment / exit-status
+  carries over as-is.
 - [ ] The dormant AWS shim tests (`tests/test_lambda_function.py`) **stay green** while
-  `lambda_function.py` remains in the repo; they are removed together with the shim in the post-Phase-C
-  cleanup, not in this migration.
-- [ ] The exit-code → execution-status mapping is a **host behaviour**, verified in the Phase A manual
-  execution (clean exit → Succeeded; forced non-zero → Failed → alert), not an offline test — no shim
-  to unit-test.
-- [ ] Live gates are manual, not offline tests: the **Phase 0 egress probe**, the Phase A manual
-  execution, and the Phase B staggered-parallel `run_summaries` comparison. The suite makes no cloud
-  calls.
+  `lambda_function.py` remains in the repo; both are removed together in the post-Path-A
+  cleanup, not here.
+- [ ] Live gates are manual, not offline tests: the Phase A manual invoke (`204` + a real
+  run), the Phase B on-time-run confirmation from `run_summaries.ran_at`, and the
+  heartbeat-alarm firing test. The suite makes no cloud calls.
+
+### Validate (operator gates)
+
+- [ ] Manual Lambda invoke returns GitHub `204` and a `monitor.yml` run appears *(needs the
+  live PAT + AWS resources — not exercisable from a clone)*.
+- [ ] After Phase B, `run_summaries.ran_at` shows runs on the exact minute, no 1–3 h drift
+  *(same)*.
+- [ ] Disabling the EventBridge schedule fires the heartbeat alarm and the SNS email within
+  the alarm window *(same)*.
+- [ ] Phase D: the full-history secret scan is clean (or all hits rotated) before the
+  irreversible public flip *(operator judgement — the gate is a blocker, not a test)*.
 
 ---
 
@@ -1273,10 +1270,10 @@ camp-assist's Phase 17 (the jurisdiction expansion) adds parks. (The behaviour o
 
 | Decision | Choice | Why |
 |---|---|---|
-| Polling cadence | Centralized cron (Actions `*/30` today; Azure Container Apps Job `*/15` after Phase 17 cutover) | 2,000-min Actions free tier / the exact scheduler fixes the drift; 15 min costs the same as 30 (both $0 on Azure) |
-| Hosting | Migrate to a scheduled **Azure Container Apps Job** (captain, 2026-07-31); free registry (GHCR/Docker Hub), `logs none`, built-in container secrets — see Phase 17. **Supersedes the earlier AWS Lambda choice**, killed by an 8×403 from GoingToCamp's Azure Front Door WAF (2026-07-31) | the Actions `schedule` cron drifts to 1–3 h, a reliability defect only a real scheduler fixes; AWS refused (WAF blocks AWS ranges), so egress must be on an Azure-like network — **gated on the Phase 0 probe, since Azure egress is itself untested and reputation-based** |
-| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock trigger Phase 17 introduces — so it is **not** dropped on migration |
-| Actions scale-up path (superseded) | Self-hosted runner or public repo were the Actions-era escape hatches | both considered and rejected — neither fixes GitHub's best-effort `schedule` drift; migration to Azure Container Apps Jobs chosen instead (see Hosting / Phase 17). A self-hosted **residential** runner survives only as the fallback if the Phase 0 Azure egress probe fails |
+| Polling cadence | 30 min for now (captain, 2026-07-31); the poll stays on GitHub Actions | on the private repo 15 min is ≈$27/mo vs ≈$7 at 30, and doubles request volume against the WAF; once the repo is public (Phase 17), any cadence is $0 and 15 min is revisited on latency, not price |
+| Hosting / trigger | **Path A — AWS EventBridge Scheduler → ~15-line Lambda → GitHub `workflow_dispatch`** (captain, 2026-07-31); the poll keeps running on **GitHub Actions**, only the trigger moves — see Phase 17. **Supersedes two abandoned poll-migration plans**: AWS Lambda running the poll (8×403 from GoingToCamp's Azure Front Door WAF) and Azure Container Apps Jobs (Phase 0 probe 403) | GitHub's `schedule` cron drifts 1–3 h, which only a real scheduler fixes; the WAF refuses AWS and general-Azure egress but not GitHub's runner range, so the poll must stay on Actions; the AWS trigger never touches GoingToCamp, so its 403 risk is nil |
+| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock AWS trigger Phase 17 introduces — so it is **not** dropped |
+| Repo visibility | Flip **public after the backend implementation is complete** (captain, 2026-07-31), gated on a full-history secret scan | takes Actions minutes to $0; the interim ≈$7/mo at 30 min is accepted. Irreversible once cloned/indexed, so any historical secret must be rotated, not merely removed — see Phase 17 Phase D. A self-hosted **residential** runner survives only as a fallback if GitHub's own egress is ever refused |
 | Alerting (v1) | APNs push with a direct booking link — nothing else | free programmatic SMS no longer exists; carrier email gateways are defunct |
 | DB writes | Delta-only via `state_hash`, one summary row/cycle, 30-day pruning | naive per-watch writing blew the free tier ~6× |
 | Watch expiry | Backend-owned (`status='expired'`) | client-side expiry cannot be trusted to run |
@@ -1296,16 +1293,16 @@ camp-assist's Phase 17 (the jurisdiction expansion) adds parks. (The behaviour o
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| GitHub `schedule` drift | Alerts lag openings by **1–3 h** in practice (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — the Azure Container Apps Job cron fires on the exact minute; self-hosted runner / public repo do not fix it |
-| Private-repo minute budget | ~1,800/2,000 min/month used on Actions | the budget table; **moot after Phase 17** — Azure Container Apps Jobs bills per-second at ~62% of a permanent free grant, no per-run-minute rounding |
+| GitHub `schedule` drift | Alerts lag openings by **1–3 h** in practice (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — an AWS EventBridge Scheduler fires on the exact minute and calls `workflow_dispatch`; the poll stays on Actions |
+| Private-repo minute budget | ~1,800/2,000 min/month used on Actions | the budget table; binds until Phase 17's **public-repo flip** makes standard-runner minutes free — the interim ≈$7/mo at 30 min is accepted |
 | Unofficial provider APIs | Could change, break, or block | defensive parsing, captured fixtures, jitter, backoff, residential-IP fallback |
-| GoingToCamp's Azure Front Door WAF blocks source networks by IP reputation | **Already confirmed against AWS** (8×403 from Lambda, 2026-07-31), which killed the AWS Phase 17. Actions (Azure) is accepted; **the Phase 17 Azure Container Apps egress is untested and its accept would be reputation-based, not structural** — it could flip with no notice | keep to plain `httpx` GET + browser UA + pacing, never a browser; the provider seam contains the blast radius to GTC; **the Phase 0 egress probe gates the migration** and a periodic re-probe + the Actions fallback stay wired after cutover |
+| GoingToCamp's Azure Front Door WAF blocks source networks by IP reputation | **Confirmed twice** — 8×403 from AWS Lambda and a 403 from the Azure Container Apps probe (both 2026-07-31), which killed both poll-migration plans. GitHub's Azure runner range is accepted, which is why the poll stays there; the AWS trigger never sends a packet to GoingToCamp, so it is unaffected | keep to plain `httpx` GET + browser UA + pacing, never a browser; the provider seam contains the blast radius to GTC; the residential-runner fallback stays available if the runner range is ever refused |
 | Supabase free tier pauses after 7 idle days | n/a — the cron hits it every 30 min | inherent keep-alive |
 | Constraint drift is invisible to the preflight | `UNIQUE(watch_id, site_id, date)` unverified | out of scope; both incidents to date were missing columns |
 
 ## Backlog (backend)
 
-- 15-min polling — trivial once on the Phase 17 Azure Container Apps Job (an exact cron, same $0 as 30 min); enabled at Phase C cutover per the double-alert rule; the self-hosted-runner route is superseded by that migration
+- 15-min polling — free once the repo is public (Phase 17's late step); on the private repo it is ≈$27/mo vs ≈$7 at 30 min, so it is deferred. The AWS trigger already fires on an exact cron, so no scheduler work is needed to enable it
 - A retry policy for errored watches, classified on `error_reason` (data first — see Decisions)
 - Moving past-date errored rows to `expired` in the expiry pass (tidier census, but it costs
   writes and mixes two concerns)
