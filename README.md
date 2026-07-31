@@ -499,6 +499,13 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 
 ## Upgrade path: self-hosted runner
 
+> **Plan of record is a host migration, not this route.** The captain has decided
+> (2026-07-31) to move the monitor off GitHub Actions onto AWS Lambda + EventBridge
+> Scheduler — see PLAN.md "Phase 17 (campassist-monitor backend)". That fixes the real
+> defect (GitHub's `schedule` cron drifts to 1–3 h) and makes 15-min polling trivial;
+> the self-hosted-runner and public-repo options below were considered and rejected as
+> the scale path. They remain the incumbent Actions host's fallback until Phase 17 ships.
+
 When the private-repo free tier (2,000 min/month) gets tight, or if
 recreation.gov starts blocking GitHub's datacenter IPs, register any always-on
 home machine as a self-hosted runner — **unlimited free minutes on private
