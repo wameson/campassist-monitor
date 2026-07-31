@@ -1460,7 +1460,13 @@ def exit_code(result: dict) -> int:
     return 1 if result.get("systemic_failure") else 0
 
 
-def main() -> None:
+def main(process_started: float | None = PROCESS_STARTED) -> None:
+    # `process_started` is plumbing, not policy: the default is the import-time
+    # anchor the CLI entrypoint has always used, so `python scripts/monitor.py`
+    # behaves exactly as before. A long-lived host (the Lambda shim on a warm
+    # container) forwards a *fresh* reading each invocation, because run() binds
+    # its own process_started default once at import and this is the only path
+    # that reaches it — see lambda_function.py and PLAN.md Phase 17.
     rng = random.Random()
     db = SupabaseClient.from_env()
     # Schema-drift guard, deliberately ahead of the jitter sleep: a run halted by
@@ -1479,7 +1485,7 @@ def main() -> None:
 
     apns = APNsClient.from_env()
     with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
-        result = run(db, apns, http, rng=rng)
+        result = run(db, apns, http, rng=rng, process_started=process_started)
     print(json.dumps(result), flush=True)
     for annotation in (error_annotation(result), failure_annotation(result)):
         if annotation:
