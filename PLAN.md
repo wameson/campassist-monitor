@@ -907,14 +907,19 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ---
 
-## Phase 17 — Hosting migration: GitHub Actions → AWS Lambda + EventBridge Scheduler
+## Phase 17 (campassist-monitor backend) — Hosting migration: GitHub Actions → AWS Lambda + EventBridge Scheduler
 
-**Sequencing.** This backend infra phase lands **before** the GoingToCamp jurisdiction expansion
-(the provider/coverage growth tracked as Phase 17 in camp-assist's `PLAN.md`, reordered there by
-`campassist-roadmap-lambda-before-p17`). The captain sequenced hosting first (2026-07-31):
-expansion adds parks, parks consume cycle wall clock, and the cycle-time ceiling is the
-constraint both this migration and the budget re-derivation address — so the host is settled
-before more parks land on it.
+**Sequencing — and a numbering caveat.** This is **this repo's** backend Phase 17, and it is a
+**distinct phase from camp-assist's Phase 17** (the GoingToCamp *jurisdiction expansion*). The
+two repos' phase numbers diverge here — hosting is inserted ahead of the expansion — so the
+heading carries a repo qualifier, the same disambiguation the existing "Phase 13a (backend half)"
+uses. **This hosting migration precedes camp-assist's Phase 17**: the captain sequenced hosting
+first (2026-07-31) because expansion adds parks, parks consume cycle wall clock, and the
+cycle-time ceiling is the constraint both this migration and the budget re-derivation address —
+so the host is settled before more parks land on it. camp-assist's own roadmap ordering (and any
+renumbering there) is handled by `campassist-roadmap-lambda-before-p17`. Bare "Phase 17"
+references below are always **this** phase; the expansion is only ever named "camp-assist's
+Phase 17."
 
 **This is a reliability fix, not a cost fix.** The `*/30 * * * *` Actions cron does not fire as
 configured. A 2026-07-31 measurement of the 20 most-recent scheduled runs found gaps of
@@ -1079,7 +1084,8 @@ re-derived alongside `CYCLE_TIME_BUDGET_SECONDS` (`monitor-cycle-budget-rederive
 qualitatively here rather than pinned. The sequencing point: broad coverage is *free forever on
 cost* but *not reachable at a 30-min cadence on the serial design* — it needs an architectural
 change (shard by host, tiered cadence, or per-host async), each of which also stays free. That is
-exactly why the captain settled the host before the jurisdiction expansion adds parks. (The
+exactly why the captain settled the host before camp-assist's Phase 17 (the jurisdiction
+expansion) adds parks. (The
 behaviour of a cycle that *hits* the budget — today it degrades by silently skipping and exiting
 green — is owned by `monitor-silent-skip-goes-green`, not this phase.)
 
