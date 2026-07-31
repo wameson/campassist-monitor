@@ -186,13 +186,14 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          stop entirely over a column that only annotates an error.
 #   watches.date_mode, watches.flex_min_nights, watches.flex_max_nights
 #                          the Phase 16 flexible-date columns, read only through
-#                          `flex_spec(watch)` in monitor.run: `str(watch.get("date_mode") or
-#                          "fixed")` and `watch.get("flex_min_nights")` / `.get("flex_max_nights")`,
-#                          every one `.get` with a default. An absent `date_mode` reads as 'fixed',
+#                          `flex_min_nights(watch)` in monitor.run: `str(watch.get("date_mode") or
+#                          "fixed")` and `watch.get("flex_min_nights")`, each `.get` with a default
+#                          (`flex_max_nights` is app-only — the monitor never reads it at all). An
+#                          absent `date_mode` reads as 'fixed',
 #                          so an unmigrated live DB treats every watch as a fixed stay over
 #                          [start_date, end_date) — byte-identical to the pre-Phase-16 monitor,
 #                          never halting and never suppressing an opening differently. The nights
-#                          columns are read only after date_mode already says 'flexible', which an
+#                          column is read only after date_mode already says 'flexible', which an
 #                          unmigrated DB never reports. They stay WARN only while every read is `.get`
 #                          with a default; a read that ever subscripts one belongs in the HALT set.
 #                          Same standing condition as include_ada_only: the tolerance depends on the
