@@ -70,30 +70,34 @@ campassist-monitor (GitHub, PRIVATE)
 
 | Item | Consumption |
 |---|---|
-| Monitor cron every 30 min (~1 min/run, billed rounded up) | ~1,440 min/mo |
+| Monitor cron every 30 min (**measured 2.2 billed min/run**, rounded up; 1,461 runs/mo) | ~3,214 min/mo |
 | Backend pytest CI (ubuntu 1×, ~2 min/PR) | ~40 min/mo |
 | iOS unit tests on merge to main (macOS **10×**) | ~320 min/mo |
-| **Total** | **~1,800 / 2,000** |
+| **Total vs 2,000 free** | **over — the ≈$7/mo interim overage (Phase 17 cost table)** |
 
-**This table only holds because the job stays inside the 1-minute billing floor.** Billing is
-per job, rounded up to the whole minute, so the ~1 min/run figure is a *floor*, not an
-estimate — and until 2026-07-28 reality missed it by 2.9×. A 226-run measurement found the
-median job at 141 s — its `Run monitor` step ~130 s of that — against ~10 s of real work: the
-240 s start jitter was a mean of 120 s of billed `time.sleep()` per run, i.e. 92% of that
-~130 s monitor step, which would have put an honest `*/30` at **~4,154 min/mo**. At a GitHub
-Free account's default $0 spending limit that is not a bill, it is every private-repo Action
-stopping until the next billing cycle. Cutting the jitter to 20 s (`START_JITTER_MAX_SECONDS`)
-restored the floor. **The rule that keeps this table true — nothing may push a no-change cycle
-past ~60 s of wall clock — is a live GitHub Actions constraint,** because the poll stays on
-Actions. Actions bills per job rounded up to the whole minute, so a cycle that touches 61 s
-bills two; that rounding is the whole reason the ~60 s line matters, and it keeps mattering
-until the repo goes public (Phase 17), which makes minutes free and dissolves the floor as a
-*cost* concern. What remains after that is the in-code cycle **time** budget
-(`CYCLE_TIME_BUDGET_SECONDS`, 480 s) — a coverage/correctness limit, not a billing one — racing
-only GitHub's own `timeout-minutes: 15` (900 s), unchanged. The 226-run measurement and the
-240 s→20 s jitter finding above are durable evidence about the per-request pacing floor, and
-`START_JITTER_MAX_SECONDS` stays at 20 s regardless — Phase 17 explains why an exact scheduler
-*restores* the jitter's desync rationale.
+**The measured billed cost is ~2.2 min/run, and that gap above the 1-minute floor is the whole
+≈$7/mo.** Billing is per job, rounded up to the whole minute; a no-change cycle runs ~94–125 s
+(measured, n=15; mean ~109 s), so most runs bill 2 min and roughly one in four bills 3 —
+averaging **2.2 billed min/run** (Phase 17 cost table). Over 1,461 runs/mo that is ~3,214 min,
+past the 2,000 free tier by ~1,214, i.e. the ≈$7/mo the public flip (Phase 17) erases.
+
+This is *after* the jitter fix, which averted a far worse bill: until 2026-07-28 a 226-run
+measurement found the median job at 141 s — its `Run monitor` step ~130 s of that — against
+~10 s of real work, because the 240 s start jitter was a mean of 120 s of billed `time.sleep()`
+per run (92% of that ~130 s step), which would have put an honest `*/30` at **~4,154 min/mo**.
+At a GitHub Free account's default $0 spending limit that is not a bill — it is every
+private-repo Action stopping until the next billing cycle. Cutting the jitter to 20 s
+(`START_JITTER_MAX_SECONDS`) removed that 2.9× blowup; the residual ~2.2 min/run is real pacing
+plus setup, not sleep, and it is the modest overage above. **The constraint this leaves
+standing — nothing may push a no-change cycle materially higher, because per-job rounding bills
+every extra whole minute of wall clock — is a live GitHub Actions concern only while the poll
+stays on Actions, and dissolves as a *cost* concern when the repo goes public (Phase 17).** What
+remains after that is the in-code cycle **time** budget (`CYCLE_TIME_BUDGET_SECONDS`, 480 s) — a
+coverage/correctness limit, not a billing one — racing only GitHub's own `timeout-minutes: 15`
+(900 s), unchanged. The 226-run measurement and the 240 s→20 s jitter finding stay valid as
+durable evidence about the per-request pacing floor, and `START_JITTER_MAX_SECONDS` stays at
+20 s regardless — Phase 17 explains why an exact scheduler *restores* the jitter's desync
+rationale.
 
 **Why 30 min and not 15:** the budget above (captain, 2026-07-31). On the private repo, 15 min
 is ≈$27/mo vs ≈$7 at 30, and it doubles request volume against a WAF already refusing one of our
@@ -342,14 +346,16 @@ midnight. A watch straddling the horizon is served for its in-horizon nights alo
 | 10,000 | 200 | ~200 | ~7 min |
 
 Dominated by the 1.2–2.8 s inter-request pacing (~2 s mean); the ≤20 s start jitter is noise
-at every row. Today's poll set is far smaller than the first row — a jitter-free job measures
-11–25 s end to end — and it is that cycle, not the projection, that bills as one minute. The
-first row has no margin left: 20 poll units is ~19 gaps × ~2 s ≈ 38 s of pacing, plus request
-time, plus a 0–20 s jitter — a ~58 s mean and a ~68 s worst case against the same 60 s billing
-floor the minutes table above depends on. **Past roughly 20 poll units the binding cost of a
-no-change cycle is the per-request pacing, not the start jitter**, so that floor is the thing
-to watch as the pool grows. This is an observation about the budget: `INTER_REQUEST_DELAY_RANGE`
-is politeness toward the providers, is not a cost lever, and stays as it is.
+at every row. Today's poll set is far smaller than the first row — the poll cycle itself
+measures 11–25 s end to end — but the *billed* job also carries GitHub Actions' fixed overhead
+(checkout + `setup-python` + `pip install`), which is why the whole job lands at ~109 s and
+bills ~2 min (the minutes table above). The scaling point is where the *growth* comes from:
+20 poll units is ~19 gaps × ~2 s ≈ 38 s of pacing plus request time, and **past roughly 20 poll
+units the binding growth term of a no-change cycle is the per-request pacing, not the start
+jitter** — under per-job rounding each additional whole minute of wall clock is another billed
+minute, so pacing is the thing to watch as the pool grows. This is an observation about the
+budget: `INTER_REQUEST_DELAY_RANGE` is politeness toward the providers, is not a cost lever, and
+stays as it is.
 
 ### Alert delivery
 APNs HTTP/2 with an ES256 JWT (`iss`=team, `kid`=key, cached ~50 min), `apns-push-type: alert`,
@@ -1294,7 +1300,7 @@ work.
 | Limitation | Impact | Mitigation |
 |---|---|---|
 | GitHub `schedule` drift | Alerts lag openings by **1–3 h** in practice (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — an AWS EventBridge Scheduler fires on the exact minute and calls `workflow_dispatch`; the poll stays on Actions |
-| Private-repo minute budget | ~1,800/2,000 min/month used on Actions | the budget table; binds until Phase 17's **public-repo flip** makes standard-runner minutes free — the interim ≈$7/mo at 30 min is accepted |
+| Private-repo minute budget | Measured ~2.2 billed min/run → the monitor alone runs ~3,214 min/mo, over the 2,000 free tier | the budget table; binds until Phase 17's **public-repo flip** makes standard-runner minutes free — the interim ≈$7/mo at 30 min is accepted |
 | Unofficial provider APIs | Could change, break, or block | defensive parsing, captured fixtures, jitter, backoff, residential-IP fallback |
 | GoingToCamp's Azure Front Door WAF blocks source networks by IP reputation | **Confirmed twice** — 8×403 from AWS Lambda and a 403 from the Azure Container Apps probe (both 2026-07-31), which killed both poll-migration plans. GitHub's Azure runner range is accepted, which is why the poll stays there; the AWS trigger never sends a packet to GoingToCamp, so it is unaffected | keep to plain `httpx` GET + browser UA + pacing, never a browser; the provider seam contains the blast radius to GTC; the residential-runner fallback stays available if the runner range is ever refused |
 | Supabase free tier pauses after 7 idle days | n/a — the cron hits it every 30 min | inherent keep-alive |
