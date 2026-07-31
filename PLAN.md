@@ -49,7 +49,18 @@ campassist-monitor (GitHub, PRIVATE)
   CampAssist iOS app (camp-assist repo) — anonymous sign-in, RLS-scoped
 ```
 
+> **Target topology (Phase 17).** EventBridge Scheduler invokes a Lambda that runs this same
+> pipeline unchanged; secrets move to SSM Parameter Store and a failed run pages via a
+> CloudWatch alarm. The diagram above is the **current** GitHub Actions host, which Phase 17
+> retires (captain, 2026-07-31).
+
 ### GitHub Actions minutes budget (private repo, 2,000 free min/month)
+
+> **Current host.** This section is the **GitHub Actions** deployment, which **Phase 17 retires**
+> for AWS Lambda + EventBridge Scheduler. The per-minute-rounding arithmetic below is
+> Actions-specific — Lambda's cost model is in Phase 17 — but it is kept because Actions is the
+> live host until that migration ships, and because the jitter measurement it carries is durable
+> evidence that outlives the host.
 
 | Item | Consumption |
 |---|---|
@@ -66,23 +77,36 @@ median job at 141 s — its `Run monitor` step ~130 s of that — against ~10 s 
 ~130 s monitor step, which would have put an honest `*/30` at **~4,154 min/mo**. At a GitHub
 Free account's default $0 spending limit that is not a bill, it is every private-repo Action
 stopping until the next billing cycle. Cutting the jitter to 20 s (`START_JITTER_MAX_SECONDS`)
-restored the floor. **The rule that keeps this table true: nothing may push a no-change cycle
-past ~60 s of wall clock.**
+restored the floor. **The rule that keeps this table true — nothing may push a no-change cycle
+past ~60 s of wall clock — is a GitHub Actions artifact and retires with the host.** Actions
+bills per job rounded up to the whole minute, so a cycle that touches 61 s bills two; that
+rounding is the whole reason the ~60 s line matters. It has **no billing meaning on the
+Phase 17 Lambda target**, which bills per millisecond with no rounding floor. What replaces it
+there is not a cost cliff at all but the in-code cycle **time** budget measured against Lambda's
+900 s hard timeout — a coverage/correctness limit, described in Phase 17. The 226-run
+measurement and the 240 s→20 s jitter finding above stay valid as evidence about the incumbent
+and the per-request pacing floor, and `START_JITTER_MAX_SECONDS` stays at 20 s regardless —
+Phase 17 explains why an exact scheduler *restores* its rationale.
 
-**Why 30 min and not 15:** the budget above. Escape hatches when it is hit, in order:
-(1) **self-hosted runner** on an always-on home machine — unlimited free minutes on private
-repos *and* a residential IP a provider won't flag; (2) make the repo public.
+**Why 30 min and not 15 (on Actions):** the budget above. Two escape hatches were considered
+when it bound — (1) a **self-hosted runner** on an always-on home machine (unlimited free
+minutes on private repos, plus a residential IP a provider won't flag); (2) making the repo
+**public** (free, unmetered Actions). Both were rejected: neither fixes the reason the cadence
+actually hurts — GitHub's `schedule` trigger is best-effort and drifts to **1–3 h** regardless
+of minutes or repo visibility (measured; see Phase 17). The captain chose migration to a real
+scheduler instead (2026-07-31). Both hatches survive only as the incumbent's fallback, not the
+plan.
 
 ### Stack
 
 | Layer | Choice | Why |
 |---|---|---|
-| Scheduling | Actions cron `*/30 * * * *` + keep-alive | fits private-repo free tier |
-| Language | Python 3.12 | available in Actions, no build step |
+| Scheduling | **Current:** Actions cron `*/30 * * * *` + keep-alive. **Target (Phase 17):** EventBridge Scheduler `cron(0/30 * * * ? *)` | the current cron fits the private-repo free tier but drifts 1–3 h; the target fires on time |
+| Language | Python 3.12 | available on Actions and the Lambda `python3.12` runtime, no build step |
 | HTTP | `httpx[http2]` | HTTP/2 is required for APNs |
 | APNs auth | `PyJWT` + `cryptography` | ES256 JWT signed with the `.p8` key |
 | DB | Supabase REST, service-role key | free tier; bypasses RLS server-side |
-| Secrets | GitHub Actions Secrets | `.p8` key, Supabase service key |
+| Secrets | **Current:** GitHub Actions Secrets. **Target (Phase 17):** SSM Parameter Store Standard (SecureString, default AWS-managed KMS key) | `.p8` key + Supabase service key; the same six secrets on either host — not Secrets Manager (never free) |
 
 **Runtime dependencies are capped at those three.** Anything needing a fourth needs a
 decision, not a `pip install` — the cap is what keeps the monitor's failure surface small and
@@ -883,6 +907,208 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ---
 
+## Phase 17 — Hosting migration: GitHub Actions → AWS Lambda + EventBridge Scheduler
+
+**Sequencing.** This backend infra phase lands **before** the GoingToCamp jurisdiction expansion
+(the provider/coverage growth tracked as Phase 17 in camp-assist's `PLAN.md`, reordered there by
+`campassist-roadmap-lambda-before-p17`). The captain sequenced hosting first (2026-07-31):
+expansion adds parks, parks consume cycle wall clock, and the cycle-time ceiling is the
+constraint both this migration and the budget re-derivation address — so the host is settled
+before more parks land on it.
+
+**This is a reliability fix, not a cost fix.** The `*/30 * * * *` Actions cron does not fire as
+configured. A 2026-07-31 measurement of the 20 most-recent scheduled runs found gaps of
+**1–3 hours** — ~12–13 runs/day, not the intended 48 — because GitHub's `schedule` trigger is
+best-effort and is delayed or dropped under load, independent of repo visibility or the minutes
+budget. Alerts therefore lag openings by hours, and catching a cancellation fast is the whole
+product. The current host behaves as GitHub documents; the defect is the **scheduler**, so the
+fix is a host change, not a code change. (Cost is a non-issue either way — see the $0 position.)
+
+### Target architecture
+
+EventBridge Scheduler → Lambda, with the pipeline itself unchanged:
+
+- **Trigger — EventBridge Scheduler** on an exact cron (`cron(0/30 * * * ? *)`): a dedicated
+  scheduler with at-least-once delivery, retries, and a DLQ. It fires on time; nothing else is
+  in the trigger path. Free tier 14 M invocations/mo; this workload is ~1,440/mo (0.01 %).
+- **Compute — AWS Lambda**, `python3.12`, **zip deployment package (no container image, no
+  ECR)**, 256 MB, timeout 900 s, reserved concurrency 1. The capped dependency set
+  (`httpx[http2]`, `PyJWT`, `cryptography`) packages to a measured **5.5 MB zipped / 18 MB
+  unzipped** against Lambda's 50 MB / 250 MB limits — `cryptography`'s `manylinux` wheel carries
+  its compiled binary, so no container is needed. Zip over container is deliberate: **ECR is the
+  design's only 12-month-limited service**, so shipping a zip deletes ECR, its year-two storage
+  charge, and a build step.
+- **Secrets — SSM Parameter Store Standard**, `SecureString`, encrypted with the **default
+  AWS-managed `aws/ssm` KMS key** (both free). The same six secrets the workflow passes today
+  (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`,
+  `APNS_P8_KEY`). Explicitly **not** Secrets Manager ($0.40/secret/mo forever) and **not** a
+  customer-managed KMS key ($1/mo) — the two silent "not-free" traps, both avoided by choosing
+  Standard params and the default key.
+- **Logs — CloudWatch Logs** (the monitor's JSON summary + annotations, plus Lambda's
+  `START/END/REPORT`): ~7–30 MB/mo against the 5 GB always-free tier. Set the log-group
+  **retention deliberately (14–30 days)** — Lambda's default is Never-Expire, and unbounded
+  retention, not volume, is the only real log cost here.
+- **Failure → a human.** A systemic cycle's non-zero exit becomes a Lambda invocation error →
+  the Lambda **`Errors` metric** → a **CloudWatch Alarm** (`Errors ≥ 1`) → **SNS** → operator
+  email. This is operator-only; the **user-facing camp alerts still go over APNs, unchanged**.
+
+### What changes in the repo, and what does not
+
+**Business logic does not move.** `scripts/monitor.py`, `scripts/providers/*`, `scripts/apns.py`,
+`scripts/db.py`, `scripts/common.py`, `scripts/preflight.py`, and `requirements.txt` are
+untouched. The provider seam, the write/time budgets, the containment/exit-status rules, and the
+schema-drift guard all run as-is. Secret loading via `SupabaseClient.from_env()` /
+`APNsClient.from_env()` is unchanged — the shim injects env before calling `main()`.
+
+**One new file — an entrypoint shim (`lambda_function.py`).** Three thin responsibilities:
+
+1. **Translate the exit code into a Lambda result — the single most important line.** `main()`
+   always ends in `raise SystemExit(exit_code(result))`, and preflight HALT raises
+   `SystemExit(1)` before that. `SystemExit` is a `BaseException`; if it propagates uncaught,
+   Lambda reports **every** invocation — including the healthy `SystemExit(0)` — as an error. So
+   the shim must catch it: `code == 0` → return normally (success); `code != 0` → **re-raise as a
+   real exception** so Lambda marks the invocation failed → `Errors` → alarm → SNS. **Getting
+   this wrong either pages on every green run or, worse, lets a systemic failure return a
+   *successful* invocation — which would silently undo the repo's loud-failure contract** (a
+   systemic run must stay loud — see Exit status). State it explicitly because a swallowed exit
+   code looks green and pages no one.
+2. **Reset the process-start anchor per invocation.** `PROCESS_STARTED` is captured at module
+   import and feeds the fan-out deadline (`FANOUT_DEADLINE_SECONDS`). On a **warm** container the
+   module is not re-imported, so the anchor would be stale (from a prior invocation) and push the
+   deadline into the past, skipping per-id error isolation. Fix: set
+   `monitor.PROCESS_STARTED = time.monotonic()` at the top of the handler before `main()`. (The
+   480 s poll budget is safe regardless — `run()` reads its start fresh each call.) At a 30-min
+   cadence containers are usually cold, but "usually" is not "always."
+3. **Load the six SSM parameters into `os.environ`** (via `boto3`, already in the Lambda runtime
+   — no zip addition), cached across warm invocations to keep `kms:Decrypt` well under the
+   20k/mo free tier.
+
+**`START_JITTER_MAX_SECONDS` stays at 20 s — do not change the constant.** Its own comment keeps
+the jitter *because the trigger is planned to move to an external cron that fires at exact
+wall-clock times, which restores the desync rationale* — **this migration is that move.** Under
+GitHub's `schedule` trigger the jitter bought little (GitHub's throttling already spread delivery
+across the hour); an exact EventBridge cron fires predictably at `:00/:30`, so the jitter again
+does real work desynchronizing the first provider request from the tick. And the GitHub-specific
+cost pressure that forced it down from 240 s to 20 s (per-minute billing rounding) does not exist
+on Lambda (per-millisecond billing), so there is no cost reason to touch it either. An earlier
+suggestion to *drop* the jitter on migration is explicitly wrong and is corrected here.
+
+### Ordered migration steps
+
+The monitor writes to a **live Supabase** and sends **real APNs pushes**, and there is **no
+run-level lock or lease** — the cycle just selects `status=eq.monitoring` with no `FOR UPDATE`
+and no lease column. So any overlap between two schedulers races on shared state. The cutover is
+staged around that.
+
+**Phase A — stand it up, no traffic:**
+
+- [ ] Create the 6 SSM SecureString parameters (default KMS key) with the real secret values.
+- [ ] Create the Lambda (python3.12, 256 MB, 900 s, reserved concurrency 1), its execution role
+  (logs + `ssm:GetParameters` + `kms:Decrypt` on the default key), the CloudWatch Alarm on
+  `Errors ≥ 1`, and the SNS topic with a confirmed email subscription. Deploy the zip.
+- [ ] Invoke once manually and read the logs: preflight passes, the JSON summary prints, exit is
+  clean. This exercises secrets, egress, and the shim end-to-end with no schedule attached.
+
+**Phase B — parallel proof (the dangerous window):**
+
+- [ ] Create the EventBridge schedule **staggered 15 minutes** from the GitHub cron (GitHub at
+  `:00/:30`, Lambda at `:15/:45`), and **leave the GitHub cron running**.
+- [ ] Run both for several days; compare each side's `run_summaries` rows (both write there):
+  confirm Lambda fires on time, polls the same units, and matches `campgrounds_polled` /
+  `alerts_sent` / `errors`.
+
+**Phase C — cut over:**
+
+- [ ] After several clean on-time Lambda days, disable the GitHub `schedule` trigger (comment out
+  the `cron:`). **Keep `monitor.yml` in the repo** as the rollback path.
+
+**The double-alert risk during overlap.** The monitor has two dedup layers — `state_hash` (per
+watch) and the `sent_alerts` 6 h cooldown (per `watch_id, site_id, date`) — and **both are
+check-then-write with no locking**. They dedup across **serialized** runs (a later run reads the
+earlier run's committed hash and sees "no delta") but **neither protects two truly concurrent
+runs** (both read the pre-alert state, both send, both write). GitHub's `concurrency: group:
+monitor` guard only serializes GitHub against itself; it does nothing against a separate Lambda
+scheduler. **The staggered schedule is what makes the parallel proof safe:** a cycle is capped at
+the 480 s budget, and a 15-min stagger at a 30-min cadence = 900 s > 480 s, so the second run
+always starts after the first has finished and committed — the two schedulers never overlap, and
+the shared Supabase turns them into correct dedup. A genuinely new opening appearing *between*
+the staggered runs is alerted once by whichever sees it first — correct, not a duplicate. A hard
+cut-over without the staggered proof is what is unsafe.
+
+**Rollback.** The monitor is stateless and idempotent against the shared Supabase, so rollback is
+instant with no data migration. During Phase B: disable the EventBridge schedule (one action) —
+the GitHub cron is still live, so monitoring never stops. After Phase C: re-enable the `cron:`
+and disable the schedule — one commit / one toggle, because the workflow file was kept. Keep the
+disabled workflow in the repo for weeks after cutover; deleting it is a separate later cleanup.
+
+### Operator by hand vs automated
+
+| By hand (one-time operator) | Automated / scripted |
+|---|---|
+| Open the AWS account and choose the **Paid Plan** (the Free Plan self-closes at 6 months and deletes everything — not a home for a production cron); card required | Zip build (`pip install --target … --platform manylinux2014_x86_64 --only-binary=:all:` — cross-compiles the Linux wheels on any machine, no Docker) |
+| Create the 6 SSM SecureString parameters with the real secret values (values never live in the repo or IaC) | `aws lambda update-function-code` deploy |
+| Create the Lambda, role, EventBridge schedule, alarm, SNS topic (or capture as optional IaC; the console is fine for one function) | Function-code redeploy on merge to `main` — a small `push`-triggered `deploy.yml`, immune to the cron-drift bug (drift only affects `schedule`), authed via GitHub OIDC → a short-lived IAM role scoped to `lambda:UpdateFunctionCode` |
+| Confirm the SNS email subscription (AWS emails a link) | Log-group retention (can be scripted into the deploy) |
+| Set a low-threshold budget + budget **action** and a zero-spend alert as a delayed backstop | — |
+
+### The $0 position, honestly
+
+On the zip + SSM-Standard + default-KMS path, **month 13 costs exactly what month 1 costs: $0** —
+every service touched is in AWS's permanent "Always Free" tier, and this workload sits at
+**~8 % of the binding axis** (Lambda GB-seconds), with every other meter well under 1 %. The one
+12-month-limited service in the original sketch (ECR) is engineered out by shipping a zip; the two
+never-free traps (Secrets Manager, a customer-managed KMS key) are avoided by choosing SSM
+Standard and the default key.
+
+**But the $0 is a *discipline*, not an AWS-enforced cap.** There is **no real-time hard spending
+cap** on a paid AWS account: overage auto-bills to the card, and a budget **action**
+(deny-invoke / SCP) is an **8–24-hour delayed, coarse brake**, not a cap — it reacts in hours,
+and whatever bills in that window bills. The protection here is structural — nothing in the
+design has a per-hour meter, and a bill would need a ~12× blow-up that 48 runs/day cannot reach
+by accident. Stated plainly so it is not oversold: durable, permanent $0 for this workload by
+*staying far under the always-free tiers*, not because AWS will stop the meter.
+
+### The scaling ceiling (why hosting is settled before more parks land)
+
+Cost is not the limit; **wall-clock time is.** The monitor polls serially with per-request
+politeness pacing, so distinct parks-under-watch consume cycle seconds, and the in-code cycle
+time budget stops polling well before Lambda's 900 s timeout and long before the GB-seconds money
+wall — both time walls precede the money wall, and the money wall can never actually be reached
+because Lambda kills the invocation at 900 s. The exact parks-per-cycle figure is being
+re-derived alongside `CYCLE_TIME_BUDGET_SECONDS` (`monitor-cycle-budget-rederive`) and is stated
+qualitatively here rather than pinned. The sequencing point: broad coverage is *free forever on
+cost* but *not reachable at a 30-min cadence on the serial design* — it needs an architectural
+change (shard by host, tiered cadence, or per-host async), each of which also stays free. That is
+exactly why the captain settled the host before the jurisdiction expansion adds parks. (The
+behaviour of a cycle that *hits* the budget — today it degrades by silently skipping and exiting
+green — is owned by `monitor-silent-skip-goes-green`, not this phase.)
+
+### Build
+
+- [ ] `lambda_function.py` shim: `SystemExit`→result translation (0 → success, non-zero → raised
+  error), `PROCESS_STARTED` reset, SSM→env secret load (cached). No business-logic file changes;
+  `requirements.txt` unchanged.
+- [ ] Zip-package build reproducible off-host (`--platform manylinux2014_x86_64
+  --only-binary=:all:`); measured 5.5 MB zipped / 18 MB unzipped, inside Lambda's 50 MB / 250 MB
+  limits.
+- [ ] Optional `deploy.yml` (`push` to `main`, OIDC → scoped IAM role) so a merge redeploys the
+  function code; the cron-drift bug does not apply to `push` triggers.
+
+### Tests
+
+- [ ] The shim's exit-code translation is unit-tested against a fake `main()`: `SystemExit(0)` →
+  normal return; `SystemExit(1)` (and preflight HALT) → a raised exception. **A systemic failure
+  must not become a successful invocation** — the offline-suite analogue of the loud-failure
+  contract.
+- [ ] Warm-container safety: a second in-process handler call re-anchors `PROCESS_STARTED` so the
+  fan-out deadline is not stale.
+- [ ] The secret-load path builds `os.environ` from a faked SSM client with no live call; the
+  monitor's `*.from_env()` readers stay untouched.
+- [ ] Live cutover checks (`aws lambda invoke`, staggered-parallel `run_summaries` comparison)
+  are manual gates, not offline tests — the suite stays fully offline, no AWS calls.
+
+---
+
 ## Backend bugs and incidents
 
 | Date | Issue | Status |
@@ -897,9 +1123,10 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 | Decision | Choice | Why |
 |---|---|---|
-| Polling cadence | Centralized Actions cron, private repo, every 30 min | 2,000-min free tier |
-| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stays inside the 1-minute billing floor and keeps the desync for an exact-wall-clock external trigger |
-| Scale-up path | Self-hosted runner (unlimited free, residential IP) or public repo | avoids paying, and a residential IP is less likely to be flagged |
+| Polling cadence | Centralized cron every 30 min (Actions today; EventBridge Scheduler after Phase 17) | 2,000-min Actions free tier / the exact scheduler fixes the drift |
+| Hosting | Migrate to **AWS Lambda + EventBridge Scheduler** (captain, 2026-07-31); zip package, SSM Standard secrets, default KMS — see Phase 17 | the Actions `schedule` cron drifts to 1–3 h, a reliability defect only a real scheduler fixes; Render rejected (no free cron, $1/mo floor fails $0), Cloud Run Jobs the runner-up |
+| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock trigger Phase 17 introduces — so it is **not** dropped on migration |
+| Actions scale-up path (superseded) | Self-hosted runner or public repo were the Actions-era escape hatches | both considered and rejected — neither fixes GitHub's best-effort `schedule` drift; migration to Lambda chosen instead (see Hosting / Phase 17) |
 | Alerting (v1) | APNs push with a direct booking link — nothing else | free programmatic SMS no longer exists; carrier email gateways are defunct |
 | DB writes | Delta-only via `state_hash`, one summary row/cycle, 30-day pruning | naive per-watch writing blew the free tier ~6× |
 | Watch expiry | Backend-owned (`status='expired'`) | client-side expiry cannot be trusted to run |
@@ -919,8 +1146,8 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| 30-min cron + GitHub scheduling lag | Alerts lag openings by 0–35 min | honest UI copy; self-hosted runner or public repo → 15-min polling |
-| Private-repo minute budget | ~1,800/2,000 min/month used | the budget table; self-hosted runner escape hatch |
+| GitHub `schedule` drift | Alerts lag openings by **1–3 h** in practice (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — EventBridge Scheduler fires on time; self-hosted runner / public repo do not fix it |
+| Private-repo minute budget | ~1,800/2,000 min/month used on Actions | the budget table; **moot after Phase 17** — Lambda bills per-ms, not per-run-minute, at ~8% of an always-free tier |
 | Unofficial provider APIs | Could change, break, or block | defensive parsing, captured fixtures, jitter, backoff, residential-IP fallback |
 | Azure WAF could extend to GoingToCamp `/api/*` | GTC path breaks | keep to plain `httpx` GET + browser UA + pacing, never a browser; the provider seam contains the blast radius to GTC |
 | Supabase free tier pauses after 7 idle days | n/a — the cron hits it every 30 min | inherent keep-alive |
@@ -928,7 +1155,7 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ## Backlog (backend)
 
-- 15-min polling via a self-hosted runner
+- 15-min polling — trivial once on the Phase 17 Lambda / EventBridge scheduler (an exact cron); the self-hosted-runner route is superseded by that migration
 - A retry policy for errored watches, classified on `error_reason` (data first — see Decisions)
 - Moving past-date errored rows to `expired` in the expiry pass (tidier census, but it costs
   writes and mixes two concerns)
