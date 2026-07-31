@@ -267,11 +267,18 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   randomized campground order, 1.2–2.8 s inter-request delays, exponential
   backoff (2 s → 4 s → 8 s, then skip the campground for this cycle).
 - **Time budget:** polling (including backoff retries) stops once an
-  8-minute per-cycle budget is spent, keeping every run — even under
-  sustained 403/429 blocking — inside the workflow's 15-minute timeout.
-  Skipped campgrounds are simply retried next cycle; skipped watches keep
-  their old `last_checked_at`, and the run summary counts only what was
-  actually polled.
+  8-minute per-cycle budget (`CYCLE_TIME_BUDGET_SECONDS = 480`) is spent,
+  keeping every run — even under sustained 403/429 blocking — inside the
+  workflow's 15-minute timeout. Skipped campgrounds are simply retried next
+  cycle; skipped watches keep their old `last_checked_at`, and the run
+  summary counts only what was actually polled. But a cycle that runs out of
+  budget **mid-plan goes red, not green**: the parks it never reached were not
+  served this cycle, which is a completed miss belonging to no single watch, so
+  it is recorded as a cycle failure (systemic → non-zero exit, `::error::`) with
+  the skipped count surfaced on the result as `polls_skipped`. There is no
+  tolerant threshold — serial per-request politeness caps a cycle at ~40
+  GoingToCamp parks, so any skip already means the fleet is over one cycle's
+  capacity. See PLAN.md "Time budget" for the arithmetic.
 - **Poll horizon:** every provider clamps what it requests for a watch to
   today through today + 12 months; "today" uses a fixed UTC-8 offset so
   same-night openings at US campgrounds stay alertable during US evening
@@ -457,8 +464,8 @@ are all faked. CI runs the same suite on every PR and push to `main`.
     2 stays green while 2 of 2 goes red — or that a failure belonging to no
     watch (the `run_summaries` INSERT, retention pruning, being unable to
     write `status='error'`, a provider raising out of a poll unit its watches
-    share, or a pool-wide unpollable condition — see [Providers](#providers))
-    occurred. Both constants live at the top of
+    share, a pool-wide unpollable condition — see [Providers](#providers) — or
+    the poll budget running out mid-plan, see Time budget) occurred. Both constants live at the top of
     `scripts/monitor.py` and are the tuning knobs.
 
     The numerator counts only the failures that say something about this
