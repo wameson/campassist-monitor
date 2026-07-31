@@ -497,6 +497,55 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo
   activity; `keepalive.yml` commits a timestamp monthly to prevent that.
 
+## Deploying to AWS Lambda (Phase 17)
+
+The plan of record moves the scheduler off GitHub Actions onto **AWS Lambda +
+EventBridge Scheduler** (PLAN.md "Phase 17 (campassist-monitor backend)"). The
+business logic is unchanged; a thin entrypoint shim (`lambda_function.py`,
+handler `lambda_function.handler`) adapts the CLI to Lambda by loading secrets
+from SSM, forwarding a fresh per-invocation process-start anchor, and turning a
+non-zero cycle exit into a Lambda invocation error (so systemic failures surface
+on the `Errors` metric — the same loud-failure contract the CLI keeps).
+
+**Build the deployment zip** (no Docker; cross-compiles the Linux wheels on any
+host):
+
+```bash
+make lambda-zip     # -> build/monitor-lambda.zip  (~5.6 MB zipped / ~19 MB unzipped)
+```
+
+`boto3` is provided by the Lambda `python3.12` runtime and is deliberately not
+bundled, so the runtime dependency cap is untouched.
+
+**Secrets — SSM Parameter Store.** The shim reads the same six values the Actions
+workflow passes, but from SSM `SecureString` parameters named `<prefix><NAME>`.
+The prefix defaults to `/campassist-monitor/` and is overridable per-deploy via
+the `SSM_PARAM_PREFIX` env var. The operator creates these six parameters by hand
+(values never live in the repo):
+
+`/campassist-monitor/SUPABASE_URL`, `…/SUPABASE_SERVICE_KEY`, `…/APNS_KEY_ID`,
+`…/APNS_TEAM_ID`, `…/APNS_BUNDLE_ID`, `…/APNS_P8_KEY`.
+
+**Automated redeploy on merge — `.github/workflows/deploy.yml`.** A `push`-to-main
+workflow (never `schedule` — schedule drift is the bug being fixed) builds the zip
+and runs `aws lambda update-function-code`, authenticated via **GitHub OIDC** to a
+short-lived IAM role scoped to `lambda:UpdateFunctionCode` — no long-lived AWS keys
+in secrets. It also sets CloudWatch log retention (Lambda's default is
+never-expire). It fails clearly if its config is absent, so set:
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `AWS_DEPLOY_ROLE_ARN` | ARN of the OIDC deploy role (`lambda:UpdateFunctionCode`) |
+| Variable | `LAMBDA_FUNCTION_NAME` | the function name |
+| Variable | `AWS_REGION` | e.g. `us-east-1` |
+| Variable | `LOG_RETENTION_DAYS` | optional; defaults to `30` |
+
+The Lambda function, execution role, EventBridge schedule, CloudWatch alarm, SNS
+topic and its email subscription are the operator's one-time console setup
+(PLAN.md Phase A) — this repo half creates no AWS resources and performs no
+cutover. The GitHub Actions cron in `monitor.yml` keeps running unchanged until
+the operator stages the cutover (PLAN.md Phases B/C).
+
 ## Upgrade path: self-hosted runner
 
 > **Plan of record is a host migration, not this route.** The captain has decided

@@ -1096,25 +1096,30 @@ green — is owned by `monitor-silent-skip-goes-green`, not this phase.)
 
 ### Build
 
-- [ ] `lambda_function.py` shim: `SystemExit`→result translation (0 → success, non-zero → raised
+- [x] `lambda_function.py` shim: `SystemExit`→result translation (0 → success, non-zero → raised
   error), fresh per-invocation `process_started` forwarded into the cycle (not a global rebind —
-  see warm-container mitigation), SSM→env secret load (cached). No business-logic file changes;
-  `requirements.txt` unchanged.
-- [ ] Zip-package build reproducible off-host (`--platform manylinux2014_x86_64
-  --only-binary=:all:`); measured 5.5 MB zipped / 18 MB unzipped, inside Lambda's 50 MB / 250 MB
-  limits.
-- [ ] Optional `deploy.yml` (`push` to `main`, OIDC → scoped IAM role) so a merge redeploys the
-  function code; the cron-drift bug does not apply to `push` triggers.
+  see warm-container mitigation), SSM→env secret load (cached). `requirements.txt` unchanged; the
+  one business-logic touch is a two-line plumbing addition — `main()` gains an optional
+  `process_started` (defaulting to the import-time anchor, so the CLI path is byte-for-byte
+  unchanged) and forwards it to `run()`, which is the only way the shim can reach `run()`'s bound
+  default via the documented `main()` entrypoint.
+- [x] Zip-package build reproducible off-host (`make lambda-zip`: `--platform
+  manylinux2014_x86_64 --only-binary=:all:`); measured 5.6 MB zipped / 19 MB unzipped, inside
+  Lambda's 50 MB / 250 MB limits (matches the ~5.5/18 estimate).
+- [x] `deploy.yml` (`push` to `main`, OIDC → IAM role scoped to `lambda:UpdateFunctionCode`) so a
+  merge redeploys the function code; the cron-drift bug does not apply to `push` triggers. Also
+  scripts log-group retention. Fails clearly when its config secret/variables are absent.
 
 ### Tests
 
-- [ ] The shim's exit-code translation is unit-tested against a fake `main()`: `SystemExit(0)` →
+- [x] The shim's exit-code translation is unit-tested against a fake `main()`: `SystemExit(0)` →
   normal return; `SystemExit(1)` (and preflight HALT) → a raised exception. **A systemic failure
   must not become a successful invocation** — the offline-suite analogue of the loud-failure
   contract.
-- [ ] Warm-container safety: a second in-process handler call forwards a fresh `process_started`
-  into `run()` so the fan-out deadline is not stale.
-- [ ] The secret-load path builds `os.environ` from a faked SSM client with no live call; the
+- [x] Warm-container safety: a second in-process handler call forwards a fresh `process_started`
+  into `run()` so the fan-out deadline is not stale — asserted by capturing the anchor that
+  reaches `run()` across two invocations; fails under a global-rebind revert.
+- [x] The secret-load path builds `os.environ` from a faked SSM client with no live call; the
   monitor's `*.from_env()` readers stay untouched.
 - [ ] Live cutover checks (`aws lambda invoke`, staggered-parallel `run_summaries` comparison)
   are manual gates, not offline tests — the suite stays fully offline, no AWS calls.
