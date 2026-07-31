@@ -276,9 +276,26 @@ one realistic browser User-Agent per run, rotated across runs; exponential backo
 runner (residential IP).
 
 ### Time budget
-Polling stops once an 8-minute per-cycle budget is spent, keeping every run — even under
-sustained blocking — inside the workflow's 15-minute timeout. Skipped units retry next cycle;
-skipped watches keep their old `last_checked_at`; the summary counts only what was polled.
+Polling stops once an 8-minute per-cycle budget (`CYCLE_TIME_BUDGET_SECONDS = 480`) is spent,
+keeping every run — even under sustained blocking — inside the workflow's 15-minute timeout.
+Skipped units retry next cycle; skipped watches keep their old `last_checked_at`; the summary
+counts only what was polled.
+
+**A budget-exhausted cycle goes red, not green.** Serial per-request politeness caps one cycle
+at **~40 GoingToCamp parks** (≈11 s/park against the 480 s budget); past that the poll loop runs
+out of budget and leaves the remaining parks unpolled — their watches simply do not fire that
+cycle. That is a *completed miss*, not an in-cycle transient the next run heals, and it belongs
+to no single watch (the poll plan is shared across every user), so it is recorded through
+`record_cycle_failure` (systemic by definition → non-zero exit, `::error::`), and the skipped
+count is surfaced on the result as `polls_skipped`, mirroring the errored-watch census (no added
+read or write — the ≤5-write budget holds; no watch is moved to `status='error'`). **There is
+deliberately no tolerant threshold:** the budget only trips once serial work already exceeds one
+cycle's capacity, so any skip already means the fleet (or a stalled upstream) is over capacity;
+a `K>0` threshold would silently under-serve up to `K` parks every cycle — the exact silent-miss
+class the census exists to prevent. Before this, a budget-exhausted cycle appended a bare warning
+to the world-readable `run_summaries.errors` and **exited 0 (green)**, so a fleet growing past
+~40 parks would silently stop polling its cold parks with nothing an operator watches saying so.
+The ~40-park ceiling is now visible: it makes the run red instead of hiding behind a warning line.
 
 ### Poll horizon
 Every provider clamps a watch's request to today → today + 12 months. "Today" uses a fixed
@@ -557,7 +574,8 @@ Fan-out rules, each with a reason:
 
 Failures belonging to no watch: the `run_summaries` INSERT, retention pruning, being unable to
 write `status='error'`, a provider raising out of a shared poll unit, a pool-wide unpollable
-condition.
+condition, and the **poll budget running out mid-plan** (skipped parks were not served this
+cycle — see the Time budget section for why any skip goes red).
 
 The **served set** is both the denominator and the scope of the numerator, so the ratio can
 never exceed 1. It excludes watches that expired this cycle, were errored, name an unregistered
