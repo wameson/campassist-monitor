@@ -980,10 +980,15 @@ schema-drift guard all run as-is. Secret loading via `SupabaseClient.from_env()`
 2. **Reset the process-start anchor per invocation.** `PROCESS_STARTED` is captured at module
    import and feeds the fan-out deadline (`FANOUT_DEADLINE_SECONDS`). On a **warm** container the
    module is not re-imported, so the anchor would be stale (from a prior invocation) and push the
-   deadline into the past, skipping per-id error isolation. Fix: set
-   `monitor.PROCESS_STARTED = time.monotonic()` at the top of the handler before `main()`. (The
-   480 s poll budget is safe regardless — `run()` reads its start fresh each call.) At a 30-min
-   cadence containers are usually cold, but "usually" is not "always."
+   deadline into the past, skipping per-id error isolation. **Rebinding the module global alone is
+   not enough:** `run()` binds `process_started` as a default argument (`process_started:
+   float | None = PROCESS_STARTED`), which Python evaluates once at import, and `main()` calls
+   `run()` without forwarding it — so a later `monitor.PROCESS_STARTED = time.monotonic()` leaves
+   `run()`'s bound default stale and the warm-container anchor still past-deadline. Fix: forward a
+   **fresh** anchor into the cycle each invocation — pass `process_started=time.monotonic()`
+   through to `run()` (via the shim/`main()` path), rather than relying on rebinding the global.
+   (The 480 s poll budget is safe regardless — `run()` reads its start fresh each call.) At a
+   30-min cadence containers are usually cold, but "usually" is not "always."
 3. **Load the six SSM parameters into `os.environ`** (via `boto3`, already in the Lambda runtime
    — no zip addition), cached across warm invocations to keep `kms:Decrypt` well under the
    20k/mo free tier.
@@ -1092,7 +1097,8 @@ green — is owned by `monitor-silent-skip-goes-green`, not this phase.)
 ### Build
 
 - [ ] `lambda_function.py` shim: `SystemExit`→result translation (0 → success, non-zero → raised
-  error), `PROCESS_STARTED` reset, SSM→env secret load (cached). No business-logic file changes;
+  error), fresh per-invocation `process_started` forwarded into the cycle (not a global rebind —
+  see warm-container mitigation), SSM→env secret load (cached). No business-logic file changes;
   `requirements.txt` unchanged.
 - [ ] Zip-package build reproducible off-host (`--platform manylinux2014_x86_64
   --only-binary=:all:`); measured 5.5 MB zipped / 18 MB unzipped, inside Lambda's 50 MB / 250 MB
@@ -1106,8 +1112,8 @@ green — is owned by `monitor-silent-skip-goes-green`, not this phase.)
   normal return; `SystemExit(1)` (and preflight HALT) → a raised exception. **A systemic failure
   must not become a successful invocation** — the offline-suite analogue of the loud-failure
   contract.
-- [ ] Warm-container safety: a second in-process handler call re-anchors `PROCESS_STARTED` so the
-  fan-out deadline is not stale.
+- [ ] Warm-container safety: a second in-process handler call forwards a fresh `process_started`
+  into `run()` so the fan-out deadline is not stale.
 - [ ] The secret-load path builds `os.environ` from a faked SSM client with no live call; the
   monitor's `*.from_env()` readers stay untouched.
 - [ ] Live cutover checks (`aws lambda invoke`, staggered-parallel `run_summaries` comparison)
