@@ -1109,20 +1109,17 @@ a *trigger that never fires*. Three complementary layers, all within free tiers:
   after 60 idle days, and the `schedule` backstop is retained, so it is still needed. (It
   would become removable only if `schedule` were ever dropped entirely; `workflow_dispatch`
   is not subject to the 60-day rule.)
-- **`lambda_function.py`, `tests/test_lambda_function.py`, and `make lambda-zip` are now
-  fully orphaned.** They were the shim for running the *poll itself* inside AWS Lambda — the
-  plan the 8×403 killed. Path A runs a **new, unrelated ~15-line trigger Lambda** (deployed
-  operator-side, not built from this shim), and the poll never moves to AWS, so nothing in
-  the repo ever calls this shim again. **Recommended disposition: keep dormant now, remove in
-  a separate follow-up cleanup** (not in this documentation pass) — a reversible deletion once
-  Path A is live. While the shim remains, its tests stay green and the `lambda_function`
-  import name on `pytest.ini`'s `sys.path` stays accurate.
-- **`deploy.yml` is orphaned the same way.** It builds the Lambda zip and pushes it via GitHub
-  OIDC → a scoped `lambda:UpdateFunctionCode` role, for the dead polling Lambda.
-  **Recommended disposition: remove in the same follow-up cleanup.** The trigger Lambda is ~15
-  lines the operator deploys once from the console/CLI; its code changes almost never, so it
-  needs no per-merge repo deploy workflow, and `deploy.yml` has no successor to become. Do not
-  delete it in this pass.
+- **The dead poll-in-Lambda artifacts have been removed** (the follow-up cleanup this section
+  anticipated). They were the shim for running the *poll itself* inside AWS Lambda — the plan
+  the 8×403 killed — and comprised `lambda_function.py` (the SSM→env / `SystemExit`→invocation-
+  error shim), `tests/test_lambda_function.py`, the `make lambda-zip` `Makefile`, and
+  `deploy.yml` (OIDC build-and-push of the Lambda zip → a scoped `lambda:UpdateFunctionCode`
+  role). Path A runs a **new, unrelated ~15-line trigger Lambda** (`trigger_lambda.py`,
+  deployed operator-side, not built from this shim), and the poll never moves to AWS, so
+  nothing in the repo ever referenced any of them. `deploy.yml` had no successor to become —
+  the trigger Lambda is ~15 lines the operator deploys once from the console/CLI, needing no
+  per-merge deploy workflow. The refusal history is preserved above (§ "Approaches tried and
+  rejected"); only the dead code is gone.
 
 ### The AWS resources the captain already built
 
@@ -1248,9 +1245,10 @@ work.
   coverage of `monitor.py` / providers / budgets / containment / exit-status carries over
   as-is. Phase A **adds** `tests/test_trigger_lambda.py` (fully offline: fake SSM + fake HTTP
   poster; covers 204→success, non-204→raise, and token-never-logged); no existing test changed.
-- [x] The dormant AWS shim tests (`tests/test_lambda_function.py`) **stay green** while
-  `lambda_function.py` remains in the repo; both are removed together in the post-Path-A
-  cleanup, not here.
+- [x] The dormant AWS shim (`lambda_function.py`) and its tests
+  (`tests/test_lambda_function.py`) have been **removed** in the post-Path-A cleanup, along
+  with `make lambda-zip` and `deploy.yml`; the offline suite stays green without them (the
+  9 shim tests are the only drop).
 - [ ] Live gates are manual, not offline tests: the Phase A manual invoke (`204` + a real
   run), the Phase B on-time-run confirmation from `run_summaries.ran_at`, and the
   heartbeat-alarm firing test. The suite makes no cloud calls.

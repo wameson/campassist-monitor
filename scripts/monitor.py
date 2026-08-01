@@ -1463,10 +1463,10 @@ def exit_code(result: dict) -> int:
 def main(process_started: float | None = PROCESS_STARTED) -> None:
     # `process_started` is plumbing, not policy: the default is the import-time
     # anchor the CLI entrypoint has always used, so `python scripts/monitor.py`
-    # behaves exactly as before. A long-lived host (the Lambda shim on a warm
-    # container) forwards a *fresh* reading each invocation, because run() binds
-    # its own process_started default once at import and this is the only path
-    # that reaches it — see lambda_function.py and PLAN.md Phase 17.
+    # behaves exactly as before. The parameter exists so a long-lived host (one
+    # reusing a warm process across invocations) could forward a *fresh* reading
+    # each time, because run() binds its own process_started default once at
+    # import; the CLI is the only caller today and takes the default.
     rng = random.Random()
     db = SupabaseClient.from_env()
     # Schema-drift guard, deliberately ahead of the jitter sleep: a run halted by
