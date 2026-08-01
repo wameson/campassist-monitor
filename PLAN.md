@@ -73,7 +73,7 @@ campassist-monitor (GitHub, PRIVATE)
 | Monitor cron every 30 min (**measured 2.2 billed min/run**, rounded up; 1,461 runs/mo) | ~3,214 min/mo |
 | Backend pytest CI (ubuntu 1×, ~2 min/PR) | ~40 min/mo |
 | iOS unit tests on merge to main (macOS **10×**) | ~320 min/mo |
-| **Total vs 2,000 free** | **over — the ≈$7/mo interim overage (Phase 17 cost table)** |
+| **Monitor vs 2,000 free** | **over — the ≈$7/mo interim overage on the monitor row alone (Phase 17 cost table); the CI + iOS minutes are the separately-accounted ~+$2/mo shared-pool caveat** |
 
 **The measured billed cost is ~2.2 min/run, and that gap above the 1-minute floor is the whole
 ≈$7/mo.** Billing is per job, rounded up to the whole minute; a no-change cycle runs ~94–125 s
@@ -980,7 +980,7 @@ to `api.github.com`; the 403 that killed both migrations cannot apply to it. Ful
 ### The architecture — Path A (Scheduler → Lambda → workflow_dispatch)
 
 ```
-AWS account 852845753034  (talks only to api.github.com — never to GoingToCamp)
+AWS account <AWS_ACCOUNT_ID>  (talks only to api.github.com — never to GoingToCamp)
   EventBridge Scheduler   cron */30, exact wall clock
       └─▶ Lambda (trigger hop, ~15 lines: read PAT, POST dispatch, log HTTP status)
               ├── reads the GitHub PAT from an SSM SecureString at invoke
