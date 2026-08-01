@@ -922,9 +922,10 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ## Phase 17 (campassist-monitor backend) — AWS-triggered GitHub Actions (fix the scheduler drift)
 
-**Documentation only — nothing here has shipped.** Every checkbox is deliberately
-unticked; no cloud resource has been provisioned and the live `monitor.yml` cron is
-untouched.
+**Repo half of Path A has shipped; no cloud resource has.** The trigger code
+(`trigger_lambda.py` + its offline tests) is in-repo and its build-side checkboxes are
+ticked, but every operator/cloud checkbox is deliberately unticked: no cloud resource has
+been provisioned and the live `monitor.yml` cron is untouched.
 
 **This is a reliability fix, not a cost fix, and the poll does not move.** The
 `*/30 * * * *` Actions cron does not fire as configured: a 2026-07-31 measurement of the
