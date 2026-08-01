@@ -518,6 +518,44 @@ path GoingToCamp's WAF accepts:
 See PLAN.md "Phase 17 (campassist-monitor backend) — AWS-triggered GitHub
 Actions" for the full plan, cost table, token scope, and cutover/rollback.
 
+### Phase A — stand up the trigger (operator steps)
+
+The trigger's code lives in this repo at `trigger_lambda.py` (repo root, beside
+the orphaned `lambda_function.py` — deliberately *not* inside it or `scripts/`,
+so it shares nothing with the poll pipeline; handler `trigger_lambda.handler`).
+It is stdlib-only — the HTTP POST goes through `urllib` and `boto3` comes from
+the Lambda runtime — so it has **no bundled dependency** and deploys as a single
+file. The AWS resources below are the operator's to create; the repo half is
+just this code and its tests.
+
+1. **Mint the fine-grained PAT.** GitHub → Settings → Developer settings →
+   Fine-grained tokens: **only** repository `wameson/campassist-monitor`,
+   repository permission **Actions: Read and write**, **90-day** expiry. Not a
+   classic PAT. *(If the dispatch later returns 403, add **Contents: Read** —
+   the endpoint may need it to resolve the ref; start without it.)*
+2. **Store it in SSM Parameter Store** as a **`SecureString`** (free AWS-managed
+   KMS key) named **`/campassist-monitor/github-dispatch-pat`** — the name the
+   Lambda reads by default (override with the `GITHUB_PAT_SSM_PARAM` env var if
+   you use a different one). Rotation = update this SecureString in place; the
+   Lambda picks up the new value on its next invoke, no redeploy.
+3. **Create the Lambda** (`python3.12`, handler `trigger_lambda.handler`): paste
+   `trigger_lambda.py` into the console inline editor, or `zip trigger.zip
+   trigger_lambda.py` and upload — no wheel build, no `make lambda-zip`. Grant
+   its execution role only **`ssm:GetParameter`** on that one parameter (plus
+   `kms:Decrypt` on the AWS-managed key) and CloudWatch Logs. Point the
+   `Invocations`-heartbeat CloudWatch alarm and the SNS email at it (confirm the
+   subscription). *(These reuse the re-scoped role/alarm/SNS the captain already
+   built — see PLAN.md.)*
+4. **Invoke it once manually.** It should return `{"ok": true, "status": 204}`,
+   log the `204`, and a `monitor.yml` run should appear. This exercises the PAT,
+   the SSM read, and the dispatch end-to-end with no schedule attached. On
+   anything but 204 the Lambda **raises** — the invocation is marked failed and
+   the alarm fires, by design (the trigger's failure mode is *silent missing*, so
+   every attempt is logged and every non-204 is loud).
+
+Phase B (attach the EventBridge schedule alongside the retained `schedule`
+backstop) and beyond are operator steps in PLAN.md — no repo change.
+
 **Two earlier plans that tried to move the poll *itself* off Actions were both
 refused by the WAF** — AWS Lambda (8×403) and Azure Container Apps Jobs (probe
 403). Their dormant artifacts still sit in the repo and are **orphaned** by the
@@ -525,7 +563,8 @@ Phase 17 design (the poll never moves to AWS): `lambda_function.py` and its test
 (the SSM→env / `SystemExit`→invocation-error shim), `make lambda-zip`, and
 `deploy.yml` (OIDC build-and-push of the Lambda zip). They are slated for removal
 in a follow-up cleanup — **do not deploy them; the WAF refuses that path.** The
-new trigger Lambda is a separate, unrelated ~15-line function, not this shim.
+new trigger Lambda (`trigger_lambda.py`, above) is a separate, unrelated
+stdlib-only function, not this shim.
 
 ## Fallback: self-hosted runner
 

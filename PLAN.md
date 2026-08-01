@@ -1164,8 +1164,9 @@ incumbent path never stops, so there is no cutover window and no data migration.
 
 - [ ] Mint the fine-grained PAT (single repo, Actions: Read and write, 90-day expiry) and
   store it as an SSM SecureString.
-- [ ] Create the trigger Lambda (~15 lines: read the PAT from SSM,
-  `POST …/monitor.yml/dispatches`, log the HTTP status), its re-scoped execution role, the
+- [ ] Create the trigger Lambda (**code already in-repo: `trigger_lambda.py`, handler
+  `trigger_lambda.handler`** — read the PAT from SSM, `POST …/monitor.yml/dispatches`, log the
+  HTTP status; deploy as a single file, no wheel build), its re-scoped execution role, the
   CloudWatch `Invocations` heartbeat alarm, and the SNS email (confirm the subscription).
 - [ ] Invoke the Lambda manually once; confirm it returns GitHub's `204` and a `monitor.yml`
   run appears. This exercises the PAT, the SSM read, and the dispatch path end-to-end with no
@@ -1227,22 +1228,26 @@ work.
 
 ### Build
 
-- [ ] Trigger Lambda (~15 lines: SSM `GetParameter` for the PAT,
-  `POST …/monitor.yml/dispatches`, log the HTTP status) + re-scoped execution role — an
-  operator stand-up, no repo code. `requirements.txt`, `monitor.py`, and the whole poll
-  pipeline are **untouched**.
+- [x] Trigger Lambda **code** (`trigger_lambda.py` at repo root; ~15 lines: SSM
+  `GetParameter` for the PAT, `POST …/monitor.yml/dispatches`, log the HTTP status, 204→success
+  else raise). Stdlib-only (`urllib` + runtime `boto3`), so it deploys as a single file with no
+  bundled dependency; `requirements.txt`, `monitor.py`, and the whole poll pipeline are
+  **untouched**. (PR: repo half of Phase A.)
+- [ ] Deploy that code as a Lambda + re-scoped execution role (`ssm:GetParameter` on the one
+  PAT parameter + Logs) — **operator stand-up**, no further repo change.
 - [ ] EventBridge schedule (`*/30`, exact wall clock, `MaximumRetryAttempts = 0`) targeting
   the Lambda; SSM SecureString holding the fine-grained PAT; CloudWatch `Invocations`
   heartbeat alarm; SNS topic + confirmed email.
-- [ ] `monitor.yml`: **no change required** — `workflow_dispatch` + `concurrency` already
-  present; `schedule` retained as the offset backstop.
+- [x] `monitor.yml`: **no change required** — `workflow_dispatch` + `concurrency` already
+  present (verified); `schedule` retained as the offset backstop.
 
 ### Tests
 
-- [ ] The offline suite (`pytest`) stays fully offline and **unchanged** — no business logic
-  moves, so its coverage of `monitor.py` / providers / budgets / containment / exit-status
-  carries over as-is.
-- [ ] The dormant AWS shim tests (`tests/test_lambda_function.py`) **stay green** while
+- [x] The offline suite (`pytest`) stays fully offline — no business logic moves, so its
+  coverage of `monitor.py` / providers / budgets / containment / exit-status carries over
+  as-is. Phase A **adds** `tests/test_trigger_lambda.py` (fully offline: fake SSM + fake HTTP
+  poster; covers 204→success, non-204→raise, and token-never-logged); no existing test changed.
+- [x] The dormant AWS shim tests (`tests/test_lambda_function.py`) **stay green** while
   `lambda_function.py` remains in the repo; both are removed together in the post-Path-A
   cleanup, not here.
 - [ ] Live gates are manual, not offline tests: the Phase A manual invoke (`204` + a real
