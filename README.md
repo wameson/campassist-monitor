@@ -29,6 +29,8 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 | `.github/workflows/monitor.yml` | 30-minute cron + manual `workflow_dispatch` |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
+| `.github/workflows/secret-scan.yml` | gitleaks on every PR — fails the check on any finding (see [Secret scanning](#secret-scanning)) |
+| `.gitleaks.toml` | gitleaks ruleset config + the narrow test-fixture allowlist |
 | `tests/` | Offline pytest suite — fakes and fixtures only, no network or secrets |
 
 ## Providers
@@ -565,6 +567,41 @@ the AWS-Lambda poll attempt — `lambda_function.py` and its tests, the
 `make lambda-zip` `Makefile`, and `deploy.yml` — have now been removed. The
 trigger Lambda (`trigger_lambda.py`, above) is a separate, unrelated stdlib-only
 function that fires the workflow and never polls anything.
+
+## Secret scanning
+
+Flipping this repo public (Phase 17, Phase D) exposes **every commit ever made**,
+not just the current tree — a secret committed once and later deleted stays
+readable in history forever. Two layers guard against that, and they are
+**complementary**:
+
+- **In-CI scanning (this repo).** `.github/workflows/secret-scan.yml` runs
+  [gitleaks](https://github.com/gitleaks/gitleaks) (pinned, checksum-verified) on
+  **every pull request** and **fails the check** on any finding — it does not
+  merely warn. It scans the commits the PR introduces (`base..head`) with the
+  full default ruleset (hundreds of rules + entropy detection), so it catches a
+  far broader set than a handful of hand-written patterns and it composes with
+  the no-mistakes gate. The scan finishes in well under a minute (free once the
+  repo is public; a few cents of Actions time while it is private). Exemptions
+  live in [`.gitleaks.toml`](.gitleaks.toml) as a **narrow, explicit allowlist**
+  (one exact fake-token string, not a disabled rule or an exempted file), so a
+  reviewer can see exactly what is ignored and why, and a real secret added next
+  to the fake one is still caught.
+- **GitHub push protection (a Phase D setting to enable — free on public repos).**
+  GitHub offers **secret scanning and push protection at no cost on public
+  repositories**. Push protection **blocks a known credential format at
+  `git push` time — before it ever reaches history** — which is strictly better
+  than catching it afterwards, when the only real remedy is to *rotate* the
+  credential (deleting the line or rewriting history does not truly remove it:
+  GitHub retains PR diffs after force-pushes). This is a repository setting, not
+  code: after the public flip, enable **Settings → Code security → Secret
+  scanning** and **Push protection**.
+
+The division of labor: GitHub's push protection catches **known provider
+formats at the door**; the CI scanner catches a **broader ruleset and covers
+history / arbitrary changes** in every PR. Before the public flip, a **one-time
+full-history scan** (`gitleaks git --log-opts=--all`) must come back clean —
+publishing is gated on it.
 
 ## Fallback: self-hosted runner
 

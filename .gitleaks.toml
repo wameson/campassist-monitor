@@ -1,0 +1,38 @@
+# gitleaks configuration for campassist-monitor.
+#
+# Used by the per-PR secret scan (.github/workflows/secret-scan.yml) and by any
+# manual full-history run. We extend gitleaks' default ruleset (hundreds of
+# rules + entropy detection) rather than hand-maintaining our own — see the
+# README "Secret scanning" section for the posture.
+
+title = "campassist-monitor gitleaks config"
+
+[extend]
+# Inherit the full built-in ruleset. Do NOT set this to false; the point of the
+# scan is the broad default coverage, not a bespoke handful of patterns.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Allowlist — narrow, explicit, and auditable.
+#
+# Anything exempted here is visible in review: a reviewer sees exactly which
+# string is being ignored and why. We do NOT disable rules or exempt whole
+# files, which would silently blind the scanner to real secrets landing beside
+# the fake one.
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Known non-secret test fixture"
+
+# tests/test_trigger_lambda.py defines an obviously-fake, offline-only GitHub
+# PAT constant (SECRET_TOKEN) whose whole purpose is to assert the real trigger
+# never logs its token. It is not a credential and never was.
+#
+# gitleaks' current default ruleset does not actually match this value (the
+# underscores break the strict `ghp_[0-9a-zA-Z]{36}` github-pat rule), so this
+# entry is precautionary: if the ruleset ever loosens to catch it, this keeps
+# the known fixture from breaking every PR. It exempts ONLY this exact string,
+# so a real secret added anywhere — including that same test file — is still
+# caught.
+regexes = [
+  '''ghp_fake_do_not_log_0123456789ABCDEF''',
+]
