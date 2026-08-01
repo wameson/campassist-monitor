@@ -230,13 +230,6 @@ def grid_body(facility_id: int, first: date, last: date) -> dict:
     }
 
 
-def _int(value, default=None):
-    """A JSON number as an int, or `default`. `bool` is not an integer here."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return default
-    return value
-
-
 def _slice_date(slot: dict, key) -> date | None:
     """The calendar date one slice stands for, from its own `Date` field or, as a
     fallback, the ISO-datetime key it is stored under. None when neither parses."""
