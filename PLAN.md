@@ -190,6 +190,7 @@ if needed.
 | `0004_watches_error_reason.sql` | `error_reason` | `WARN` (write proves tolerance) |
 | `0005_alert_history.sql` | `alert_history` table + RLS policy | `WARN` (write-only, fully contained — an unapplied migration keeps monitoring) |
 | `0006_watches_flexible_dates.sql` | `date_mode`, `flex_min_nights`, `flex_max_nights` | `WARN` (read via `.get` with a `'fixed'`/None default — unmigrated DB reads every watch as fixed) |
+| `0007_watches_provider_use_direct.sql` | widens the `provider` CHECK to admit `'use_direct'` (no new column) | n/a — no column, so `preflight.REQUIRED` is unchanged |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
 deliberate.** There is no auto-apply anywhere: not in CI, not in the monitor, not behind a
@@ -411,6 +412,7 @@ value, registered in `scripts/providers/__init__.py`.
 |---|---|---|
 | `recreation_gov` | one (campground, month) `GET /api/camps/availability/campground/{id}/month?start_date=…` (UTC month start) | unused — `campground_id` is the whole identity |
 | `going_to_camp` | one (park, stay): root map + each child map, 2–5 paced GETs inside one `poll`, plus one park-catalog GET | `{"resource_location_id": …, "map_id": …}`, both required |
+| `use_direct` | one (facility, stay): a single read-only POST to the tenant's availability grid (no recursion, no catalog fetch — the grid body carries `UnitId`, `Name`, per-night `IsFree`) | unused — `campground_id = '<tenant>_<facilityId>'` carries both the tenant and the facility |
 
 A watch naming a provider this build does not register is **skipped untouched** — never
 errored — so an older monitor cannot mis-serve a row a newer client wrote. An *unknown*
@@ -419,7 +421,9 @@ provider is refused rather than defaulted; a **missing/null** `provider` default
 
 Booking links: recreation.gov → `https://www.recreation.gov/camping/campsites/{campsite_id}`;
 GoingToCamp → `/create-booking/results?mapId=…&resourceLocationId=…&startDate=…&endDate=…`
-(the SPA takes no site preselect).
+(the SPA takes no site preselect); UseDirect → the tenant's public booking site
+(`https://www.reservecalifornia.com/` for `ca`; the grid carries no id to build a verified
+per-facility link from).
 
 ### SSRF invariant — the one that must never be relaxed
 
