@@ -2,7 +2,7 @@
 
 CampAssist backend: centralized campsite availability monitor for recreation.gov
 and GoingToCamp (Washington State Parks).
-A GitHub Actions cron job (every 30 minutes, in this **private** repo) polls all
+A GitHub Actions cron job (every 30 minutes, in this **public** repo) polls all
 users' watches through the conformer each one's `provider` names — deduplicated
 to one request per unique poll unit per cycle (see [Providers](#providers)) —
 detects new openings via state hashes, and sends APNs push notifications with a
@@ -552,8 +552,8 @@ GoingToCamp's WAF accepts:
   GoingToCamp.
 - `schedule` stays as an **offset backstop**, and a CloudWatch heartbeat alarm
   plus a `run_summaries.ran_at` freshness check catch a silently-stopped trigger.
-- A later step **flips the repo public** (after the backend is complete, gated on
-  a full-history secret scan) to take Actions minutes to $0.
+- The repo has been **flipped public** (2026-08-01, after the backend was complete
+  and a full-history secret scan came back clean), which took Actions minutes to $0.
 
 See PLAN.md "Phase 17 (campassist-monitor backend) — AWS-triggered GitHub
 Actions" for the full plan, cost table, token scope, and cutover/rollback.
@@ -607,10 +607,11 @@ function that fires the workflow and never polls anything.
 
 ## Secret scanning
 
-Flipping this repo public (Phase 17, Phase D) exposes **every commit ever made**,
-not just the current tree — a secret committed once and later deleted stays
-readable in history forever. Two layers guard against that, and they are
-**complementary**:
+This repo is public (Phase 17, Phase D, since 2026-08-01), so **every commit ever
+made** is readable — not just the current tree, and a secret committed once and
+later deleted stays readable in history forever. That makes rotation, not removal,
+the only real remedy, and it governs **every future commit**. Two layers guard
+against a secret ever landing, and they are **complementary**:
 
 - **In-CI scanning (this repo).** `.github/workflows/secret-scan.yml` runs
   [gitleaks](https://github.com/gitleaks/gitleaks) (pinned, checksum-verified) on
@@ -618,8 +619,8 @@ readable in history forever. Two layers guard against that, and they are
   merely warn. It scans the commits the PR introduces (`base..head`) with the
   full default ruleset (hundreds of rules + entropy detection), so it catches a
   far broader set than a handful of hand-written patterns and it composes with
-  the no-mistakes gate. The scan finishes in well under a minute (free once the
-  repo is public; a few cents of Actions time while it is private). Exemptions
+  the no-mistakes gate. The scan finishes in well under a minute (free now that the
+  repo is public; it cost a few cents of Actions time during the private window). Exemptions
   live in [`.gitleaks.toml`](.gitleaks.toml) as a **narrow, explicit allowlist**
   (one exact fake-token string, not a disabled rule or an exempted file), so a
   reviewer can see exactly what is ignored and why, and a real secret added next
@@ -636,16 +637,15 @@ readable in history forever. Two layers guard against that, and they are
 
 The division of labor: GitHub's push protection catches **known provider
 formats at the door**; the CI scanner catches a **broader ruleset and covers
-history / arbitrary changes** in every PR. Before the public flip, a **one-time
-full-history scan** (`gitleaks git --log-opts=--all`) must come back clean —
-publishing is gated on it.
+history / arbitrary changes** in every PR. The public flip was gated on a **one-time
+full-history scan** (`gitleaks git --log-opts=--all`) coming back clean — it did
+(108 commits, 2026-08-01) before the repo was published.
 
 ## Fallback: self-hosted runner
 
 If GitHub's own runner egress is ever refused by GoingToCamp (it is accepted
-today, which is why the poll stays there), or the private-repo free tier gets
-tight before the public flip, register any always-on home machine as a
-self-hosted runner — **unlimited free minutes on private repos** and a
+today, which is why the poll stays there), register any always-on home machine as a
+self-hosted runner — free minutes (unlimited on a private repo) and a
 residential IP:
 
 1. Repo → **Settings → Actions → Runners → New self-hosted runner**, follow the
@@ -655,7 +655,7 @@ residential IP:
    `runs-on: self-hosted`.
 
 This is a fallback only. The plan of record is the AWS trigger plus the public-repo
-flip (Phase 17), which is what actually takes running cost to $0.
+flip (Phase 17); the flip is done (2026-08-01) and is what took running cost to $0.
 
 ## Licence
 
