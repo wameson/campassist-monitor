@@ -582,3 +582,17 @@ residential IP:
 
 This is a fallback only. The plan of record is the AWS trigger plus the public-repo
 flip (Phase 17), which is what actually takes running cost to $0.
+
+## Licence
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+(full text in [`LICENSE`](LICENSE); licensor: **wameson**). Non-commercial use —
+personal, hobby, research, and other non-commercial purposes — is permitted; any
+commercial use requires permission first.
+
+This is **not** an OSI-approved open-source licence: restricting commercial use puts
+it outside that definition, so there is deliberately no open-source badge.
+
+For commercial licensing enquiries, open an issue at
+[github.com/wameson/campassist-monitor/issues](https://github.com/wameson/campassist-monitor/issues)
+(no personal email is published here, since this is a public repository).
