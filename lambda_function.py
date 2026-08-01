@@ -42,8 +42,9 @@ import time
 
 # The env var names the GitHub Actions workflow passes today. Each one's value
 # lives in SSM at `<prefix><NAME>`; the prefix is the single naming convention
-# the operator must match when creating the SecureString parameters (README
-# "Deploying to AWS Lambda"). Values never live in the repo or in IaC.
+# the operator must match when creating the SecureString parameters. (This
+# deploy path is now orphaned/dormant — see PLAN.md Phase 17.) Values never
+# live in the repo or in IaC.
 SECRET_ENV_VARS = (
     "SUPABASE_URL",
     "SUPABASE_SERVICE_KEY",
