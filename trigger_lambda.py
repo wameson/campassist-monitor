@@ -1,14 +1,14 @@
 """AWS trigger Lambda: fire monitor.yml on an exact schedule (PLAN.md Phase 17, Path A).
 
-This is the *new, unrelated* trigger hop the plan describes — **not** the
-orphaned `lambda_function.py` poll shim (that ran the poll itself inside Lambda,
-a plan the GoingToCamp WAF killed with an 8×403). This function never touches
-GoingToCamp; its only network peer is `api.github.com`. It does exactly three
-things:
+This is the trigger hop the plan describes — **not** an attempt to run the poll
+itself inside Lambda. That earlier plan (and the dead shim it needed) was killed
+by the GoingToCamp WAF with an 8×403 and has since been removed from the repo;
+this function never touches GoingToCamp, and its only network peer is
+`api.github.com`. It does exactly three things:
 
 1. **Read the GitHub PAT from SSM Parameter Store** (`SecureString`,
-   `WithDecryption=True`) at invoke — the same injected-client pattern the poll
-   shim uses, so the whole thing stays testable offline with a fake SSM client.
+   `WithDecryption=True`) at invoke — an injected-client pattern, so the whole
+   thing stays testable offline with a fake SSM client.
 2. **POST `workflow_dispatch`** to the single hardcoded GitHub endpoint with
    `{"ref": "main"}`, telling GitHub Actions to run the (unchanged) poll.
 3. **Log the HTTP status of every attempt**, and treat GitHub's **204** as
@@ -20,13 +20,13 @@ Why raising matters: the whole reason Path A uses a Lambda instead of a direct
 EventBridge API-destination call is that this system's failure mode is *silent
 missing* — no run happens, so no Actions failure email is ever sent. A swallowed
 non-204 would look green and page no one; re-raising is the loud-failure contract
-(mirrors the poll shim's `SystemExit`→invocation-error translation).
+that turns a missed trigger into a visible invocation error.
 
 **No third-party imports.** The HTTP POST goes through the standard library
 (`urllib`), and `boto3` is provided by the Lambda `python3.12` runtime and
 imported lazily inside `_ssm_client()`. So this file has **zero** bundled
 dependencies: the operator deploys it as a single file (console inline editor or
-a one-file zip), no wheel build, no `make lambda-zip`, and the runtime dependency
+a one-file zip), no wheel build, no packaging step, and the runtime dependency
 cap (`httpx[http2]`, `PyJWT`, `cryptography`) is untouched — it isn't in the poll
 package at all. The offline suite injects a fake SSM client and a fake HTTP
 poster, so neither `boto3` nor the network is ever touched under pytest.

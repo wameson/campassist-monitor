@@ -521,9 +521,9 @@ Actions" for the full plan, cost table, token scope, and cutover/rollback.
 
 ### Phase A — stand up the trigger (operator steps)
 
-The trigger's code lives in this repo at `trigger_lambda.py` (repo root, beside
-the orphaned `lambda_function.py` — deliberately *not* inside it or `scripts/`,
-so it shares nothing with the poll pipeline; handler `trigger_lambda.handler`).
+The trigger's code lives in this repo at `trigger_lambda.py` (repo root —
+deliberately *not* inside `scripts/`, so it shares nothing with the poll
+pipeline; handler `trigger_lambda.handler`).
 It is stdlib-only — the HTTP POST goes through `urllib` and `boto3` comes from
 the Lambda runtime — so it has **no bundled dependency** and deploys as a single
 file. The AWS resources below are the operator's to create; the repo half is
@@ -541,7 +541,7 @@ just this code and its tests.
    Lambda picks up the new value on its next invoke, no redeploy.
 3. **Create the Lambda** (`python3.12`, handler `trigger_lambda.handler`): paste
    `trigger_lambda.py` into the console inline editor, or `zip trigger.zip
-   trigger_lambda.py` and upload — no wheel build, no `make lambda-zip`. Grant
+   trigger_lambda.py` and upload — no wheel build, no packaging step. Grant
    its execution role only **`ssm:GetParameter`** on that one parameter (plus
    `kms:Decrypt` on the AWS-managed key) and CloudWatch Logs. Point the
    `Invocations`-heartbeat CloudWatch alarm and the SNS email at it (confirm the
@@ -559,13 +559,12 @@ backstop) and beyond are operator steps in PLAN.md — no repo change.
 
 **Two earlier plans that tried to move the poll *itself* off Actions were both
 refused by the WAF** — AWS Lambda (8×403) and Azure Container Apps Jobs (probe
-403). Their dormant artifacts still sit in the repo and are **orphaned** by the
-Phase 17 design (the poll never moves to AWS): `lambda_function.py` and its tests
-(the SSM→env / `SystemExit`→invocation-error shim), `make lambda-zip`, and
-`deploy.yml` (OIDC build-and-push of the Lambda zip). They are slated for removal
-in a follow-up cleanup — **do not deploy them; the WAF refuses that path.** The
-new trigger Lambda (`trigger_lambda.py`, above) is a separate, unrelated
-stdlib-only function, not this shim.
+403). That is why the Phase 17 design triggers from AWS but keeps polling on
+GitHub Actions: it is the only egress the WAF accepts. The dead artifacts from
+the AWS-Lambda poll attempt — `lambda_function.py` and its tests, the
+`make lambda-zip` `Makefile`, and `deploy.yml` — have now been removed. The
+trigger Lambda (`trigger_lambda.py`, above) is a separate, unrelated stdlib-only
+function that fires the workflow and never polls anything.
 
 ## Fallback: self-hosted runner
 
