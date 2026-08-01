@@ -266,6 +266,48 @@ class FakeGTCHTTP:
         return self.responses[url] or FakeResponse(404)
 
 
+class FakeUseDirectHTTP:
+    """UseDirect stand-in; responder(facility_id) -> FakeResponse.
+
+    Every availability read is a single POST to the tenant's grid URL, keyed on
+    the `FacilityId` in the JSON body, so that is what the responder is keyed on.
+    There is deliberately no GET path — the availability read is a POST and
+    nothing else — and each POST's headers and body are recorded so a test can
+    assert the fixed User-Agent, the exact request shape, and that no host but
+    the pinned tenant one is ever reached.
+    """
+
+    def __init__(self, responder):
+        self.responder = responder
+        self.requests: list[dict] = []
+
+    def post(self, url, params=None, headers=None, json=None):
+        facility_id = (json or {}).get("FacilityId")
+        self.requests.append({
+            "method": "POST",
+            "url": url,
+            "facility_id": facility_id,
+            "params": params,
+            "headers": headers,
+            "json": json,
+        })
+        return self.responder(facility_id)
+
+
+def make_usedirect_watch(**overrides) -> dict:
+    """A use_direct watch on the park the probe captured: ReserveCalifornia
+    facility 377, campground_id 'ca_377' ('ca' = the one wired tenant), 2026-08-10
+    to 2026-08-12 (nights 10 and 11; 12 is the check-out day the cycle drops)."""
+    watch = make_watch(
+        campground_id="ca_377",
+        campground_name="Anza-Borrego Desert SP — Middle Section",
+        campground_state="CA",
+        provider="use_direct",
+    )
+    watch.update(overrides)
+    return watch
+
+
 def make_watch(**overrides) -> dict:
     watch = {
         "id": "w1",

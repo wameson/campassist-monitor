@@ -28,7 +28,7 @@ def test_registry_is_keyed_by_conformer_name():
     for name, provider in PROVIDERS.items():
         assert provider.name == name
         assert isinstance(provider, Provider)  # the whole seam, not just poll()
-    assert set(PROVIDERS) == {"recreation_gov", "going_to_camp"}
+    assert set(PROVIDERS) == {"recreation_gov", "going_to_camp", "use_direct"}
     assert DEFAULT_PROVIDER in PROVIDERS
 
 

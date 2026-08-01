@@ -11,6 +11,7 @@ from __future__ import annotations
 from .base import PollKey, Provider
 from .going_to_camp import GoingToCampProvider
 from .recreation_gov import RecreationGovProvider
+from .use_direct import UseDirectProvider
 
 # Matches the `watches.provider` default: a row that predates the column, or a
 # fixture written before it existed, is a recreation.gov watch.
@@ -19,6 +20,7 @@ DEFAULT_PROVIDER = "recreation_gov"
 PROVIDERS: dict[str, Provider] = {
     RecreationGovProvider.name: RecreationGovProvider(),
     GoingToCampProvider.name: GoingToCampProvider(),
+    UseDirectProvider.name: UseDirectProvider(),
 }
 
 
@@ -68,6 +70,7 @@ __all__ = [
     "PollKey",
     "Provider",
     "RecreationGovProvider",
+    "UseDirectProvider",
     "provider_for",
     "provider_name",
     "unpollable_reason",
