@@ -29,6 +29,8 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 | `.github/workflows/monitor.yml` | 30-minute cron + manual `workflow_dispatch` |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
+| `.github/workflows/secret-scan.yml` | gitleaks on every PR — fails the check on any finding (see [Secret scanning](#secret-scanning)) |
+| `.gitleaks.toml` | gitleaks ruleset config + the narrow test-fixture allowlist |
 | `tests/` | Offline pytest suite — fakes and fixtures only, no network or secrets |
 
 ## Providers

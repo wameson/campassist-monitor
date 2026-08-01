@@ -43,6 +43,7 @@ campassist-monitor (GitHub, PRIVATE)
     └── run_summaries row + 30-day retention prune
   .github/workflows/keepalive.yml  monthly commit (GitHub disables crons after 60 idle days)
   .github/workflows/ci.yml         pytest on PR + push to main (ubuntu)
+  .github/workflows/secret-scan.yml  gitleaks on every PR — fails on any finding (Phase D gate)
         ▲ ▼
   Supabase (free): watches · device_tokens · sent_alerts · run_summaries
         ▲ ▼
@@ -1192,10 +1193,13 @@ incumbent path never stops, so there is no cutover window and no data migration.
 *Do this only after the backend implementation is complete (captain, 2026-07-31).* Flipping
 public takes the running cost from ~$7/mo to **$0** and makes cadence a free knob again.
 
-- [ ] **Full git-history secret scan FIRST.** Making a repository public exposes its **entire
+- [x] **Full git-history secret scan FIRST.** Making a repository public exposes its **entire
   history, not just its current state** — a secret that was ever committed and later removed
-  stays readable in old commits. Scan the whole history (e.g. `gitleaks detect` / `trufflehog`
-  over all refs) before the flip.
+  stays readable in old commits. Done 2026-07-31: `gitleaks git --log-opts=--all` came back
+  **clean at 108 commits** (the AWS account ID in `6090b18b`/`970ceee6` is captain-accepted,
+  not a credential, and unflagged). gitleaks is now the committed tool and also gates **every
+  PR** on its `base..head` — see README "Secret scanning". Re-run over any commits added since,
+  right before the flip.
 - [ ] **Any hit is a blocker requiring credential rotation, not merely removal from history.**
   Rewriting history does not help once a commit has been fetched, cloned, or indexed; the
   exposed credential (the Supabase service key, the APNs `.p8`, any PAT) must be **rotated**.
@@ -1261,8 +1265,9 @@ work.
   *(same)*.
 - [ ] Disabling the EventBridge schedule fires the heartbeat alarm and the SNS email within
   the alarm window *(same)*.
-- [ ] Phase D: the full-history secret scan is clean (or all hits rotated) before the
-  irreversible public flip *(operator judgement — the gate is a blocker, not a test)*.
+- [x] Phase D: the full-history secret scan is clean (or all hits rotated) before the
+  irreversible public flip *(operator judgement — the gate is a blocker, not a test)*. Clean
+  at 108 commits on 2026-07-31; re-run over any newer commits at flip time.
 
 ---
 
