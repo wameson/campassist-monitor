@@ -50,12 +50,13 @@ is recorded against the conformer that asked for it, and the 404-strike
 bookkeeping is kept per provider, so two providers that happen to name the same
 `campground_id` are polled — and struck — entirely separately.
 
-Two conformers ship today:
+Three conformers ship today:
 
 | `provider` | Module | Poll unit | `provider_ref` |
 |---|---|---|---|
 | `recreation_gov` | `scripts/providers/recreation_gov.py` | one (campground, month) request | unused — `campground_id` is the whole identity |
 | `going_to_camp` | `scripts/providers/going_to_camp.py` | one (park, stay) — the root map plus each child map it names, 2–5 paced GETs inside a single `poll`, plus one park-catalog GET (see below) | `{"resource_location_id": …, "map_id": …}`, both required (a watch without them is errored once, see Watch lifecycle) |
+| `use_direct` | `scripts/providers/use_direct.py` | one (facility, stay) — a single read-only POST to the tenant's availability grid | unused — the `campground_id` carries both the tenant and the facility |
 
 GoingToCamp (Washington State Parks, on the Aspira platform) is map-scoped and
 recursive: a park's root map answers with pointers to its child maps and no
@@ -119,6 +120,39 @@ to clear rather than one more failed unit: `poll` raises, the cycle contains it
 as a cycle failure, and the run goes non-zero — a park that can never be served
 must not sit behind a green exit code while its watches look healthy.
 
+UseDirect (the Tyler platform behind **ReserveCalifornia**, and other western
+state parks on the same seam later) is a single read-only POST per (facility,
+stay) to the tenant's availability grid — no recursion, no second catalog
+request: the grid body carries each site's stable `UnitId`, its display `Name`,
+and a per-night `IsFree`, and a night is an opening only when `IsFree` is
+positively true (anything else — a held or blocked slice, a missing field — is
+taken). It is **multi-tenant by design** because UseDirect runs one deployment
+per state, each on its own host: a `Tenant` registry (`use_direct.TENANTS`) pins
+each state's request host, path prefix and booking site as vetted constants, and
+the `campground_id`'s tenant key only *selects* one of them (an allowlist
+lookup). ReserveCalifornia is the one tenant wired today; California has migrated
+off `*.usedirect.com` onto a Tyler cloud host, so no host is inferred from a
+pattern — each state's is pinned individually. The booking deep link lands on the
+tenant's public booking site (the grid carries no id to build a verified
+per-facility link from). It applies **no ADA exclusion** and does not read
+`include_ada_only`: the grid's `IsAda` is not established to mean "reserved" (it
+reads like recreation.gov's "has accessibility features", not GoingToCamp's
+explicit "ADA Only"), so filtering on it would risk hiding bookable sites. Its
+per-system unit codes (`UnitCategoryId`, `UnitTypeGroupId`) are read by nothing
+here, so none can be shared across tenants; a future build that decodes them must
+key its vocabulary per tenant and fail open, like GoingToCamp's. Like
+GoingToCamp, one facility's grid is capped (`MAX_UNITS_PER_FACILITY`, a safety
+cap orders of magnitude above any real facility): a response past it is a
+permanent fault an operator must clear, so `poll` raises and the run goes
+non-zero rather than serving a runaway response behind a green exit.
+
+**Shared wire contract (owned by this backend conformer; the iOS app builds to
+it):** a UseDirect watch has `provider = 'use_direct'` and
+`campground_id = '<tenant>_<facilityId>'` — a registered tenant key (`ca` for
+ReserveCalifornia), an underscore, and the UseDirect FacilityId as a decimal
+integer, e.g. `ca_377`. Underscore, never colon, so it matches
+`[A-Za-z0-9_-]+`; `provider_ref` is unused.
+
 A watch whose `provider` this build has no conformer for is left untouched —
 unpolled, still `monitoring`, outside the systemic error rate — and reported as
 a count in the run summary, so an older monitor cannot mis-serve a row a newer
@@ -130,7 +164,10 @@ watch's campground identity for the cycle's 404-strike lifecycle and
 id has any other character is errored before it is ever polled. A
 `going_to_camp` row therefore needs a stable id in that alphabet: the client
 packs `gtc_<resourceLocationId>_<mapId>` — **underscores, never colons**, the
-contract `PLAN.md` states in full. The backend never parses it.
+contract `PLAN.md` states in full; a `use_direct` row packs
+`<tenant>_<facilityId>` the same way (e.g. `ca_377`). For `recreation_gov` the
+backend never parses the id; for `going_to_camp` and `use_direct` it does, but
+only into identifiers — never a host (SSRF).
 
 To add a provider: write the conformer in its own module under
 `scripts/providers/`, then register it in `scripts/providers/__init__.py`.

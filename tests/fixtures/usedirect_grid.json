@@ -1,0 +1,86 @@
+{
+  "Message": "Built in 12.5245 ms size 74259 bytes on rdr-cali-prod-7bc4f5dcdd-vnmbw",
+  "Filters": {"InSeasonOnly": "True", "WebOnly": "True"},
+  "UnitTypeId": 0,
+  "StartDate": "2026-08-10",
+  "EndDate": "2026-08-12",
+  "NightsRequested": 3,
+  "TodayDate": "2026-08-01",
+  "TimeZone": "America/Los_Angeles",
+  "MinDate": "2026-08-02",
+  "MaxDate": "2027-02-01",
+  "AvailableUnitsOnly": false,
+  "UnitSort": "orderby",
+  "Facility": {
+    "FacilityId": 377,
+    "Name": "Middle Section (sites 29-91) & Anza Group)",
+    "Latitude": 33.2716,
+    "Longitude": -116.3339,
+    "UnitCount": 3,
+    "AvailableUnitCount": 2,
+    "SliceCount": 9,
+    "AvailableSliceCount": 4,
+    "Units": {
+      "5043": {
+        "UnitId": 5043,
+        "Name": "Campsite #29",
+        "ShortName": "29",
+        "IsAda": false,
+        "AllowWebBooking": true,
+        "IsWebViewable": true,
+        "UnitCategoryId": 1,
+        "UnitTypeGroupId": 1,
+        "UnitTypeId": 7,
+        "UseType": 3,
+        "VehicleLength": 27,
+        "SliceCount": 3,
+        "AvailableCount": 2,
+        "Slices": {
+          "2026-08-10T00:00:00": {"Date": "2026-08-10", "IsFree": true, "IsBlocked": false, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-11T00:00:00": {"Date": "2026-08-11", "IsFree": false, "IsBlocked": false, "IsWalkin": false, "ReservationId": 8508718, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-12T00:00:00": {"Date": "2026-08-12", "IsFree": true, "IsBlocked": false, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false}
+        }
+      },
+      "5044": {
+        "UnitId": 5044,
+        "Name": "Campsite #30",
+        "ShortName": "30",
+        "IsAda": false,
+        "AllowWebBooking": true,
+        "IsWebViewable": true,
+        "UnitCategoryId": 1,
+        "UnitTypeGroupId": 1,
+        "UnitTypeId": 7,
+        "UseType": 3,
+        "VehicleLength": 24,
+        "SliceCount": 3,
+        "AvailableCount": 0,
+        "Slices": {
+          "2026-08-10T00:00:00": {"Date": "2026-08-10", "IsFree": false, "IsBlocked": false, "IsWalkin": false, "ReservationId": 8508701, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-11T00:00:00": {"Date": "2026-08-11", "IsFree": false, "IsBlocked": true, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-12T00:00:00": {"Date": "2026-08-12", "IsFree": false, "IsBlocked": false, "IsWalkin": false, "ReservationId": 8508702, "Lock": null, "MinStay": 1, "IsReservationDraw": false}
+        }
+      },
+      "5051": {
+        "UnitId": 5051,
+        "Name": "Campsite #37 (accessible)",
+        "ShortName": "37",
+        "IsAda": true,
+        "AllowWebBooking": true,
+        "IsWebViewable": true,
+        "UnitCategoryId": 1,
+        "UnitTypeGroupId": 1,
+        "UnitTypeId": 7,
+        "UseType": 3,
+        "VehicleLength": 30,
+        "SliceCount": 3,
+        "AvailableCount": 3,
+        "Slices": {
+          "2026-08-10T00:00:00": {"Date": "2026-08-10", "IsFree": true, "IsBlocked": false, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-11T00:00:00": {"Date": "2026-08-11", "IsFree": true, "IsBlocked": false, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false},
+          "2026-08-12T00:00:00": {"Date": "2026-08-12", "IsFree": true, "IsBlocked": false, "IsWalkin": false, "ReservationId": 0, "Lock": null, "MinStay": 1, "IsReservationDraw": false}
+        }
+      }
+    }
+  }
+}
