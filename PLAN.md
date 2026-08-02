@@ -1192,10 +1192,11 @@ incumbent path never stops, so there is no cutover window and no data migration.
   `schedule` entirely: that also makes `keepalive.yml` load-bearing to remove and gives up
   layer 1 of failure visibility.
 
-**Phase D — flip the repository public (the $0 step — gated on a secret scan):**
+**Phase D — flip the repository public (the $0 step — gated on a secret scan): DONE 2026-08-01.**
 
-*Do this only after the backend implementation is complete (captain, 2026-07-31).* Flipping
-public takes the running cost from ~$7/mo to **$0** and makes cadence a free knob again.
+*Done after the backend implementation completed (captain, 2026-07-31).* The full-history
+secret scan came back clean and the repository is now public, which took the running cost from
+~$7/mo to **$0** and made cadence a free knob again.
 
 - [x] **Full git-history secret scan FIRST.** Making a repository public exposes its **entire
   history, not just its current state** — a secret that was ever committed and later removed
@@ -1204,13 +1205,15 @@ public takes the running cost from ~$7/mo to **$0** and makes cadence a free kno
   not a credential, and unflagged). gitleaks is now the committed tool and also gates **every
   PR** on its `base..head` — see README "Secret scanning". Re-run over any commits added since,
   right before the flip.
-- [ ] **Any hit is a blocker requiring credential rotation, not merely removal from history.**
+- [x] **Any hit is a blocker requiring credential rotation, not merely removal from history.**
   Rewriting history does not help once a commit has been fetched, cloned, or indexed; the
   exposed credential (the Supabase service key, the APNs `.p8`, any PAT) must be **rotated**.
-- [ ] **The flip is irreversible.** Once public and cloned or indexed, the history cannot be
-  taken back. Confirm the scan is clean and every flagged secret rotated before flipping.
-- [ ] Flip visibility. Actions minutes are now free at any cadence; revisit 15-min polling on
-  its merits (§ Cadence), no longer on price.
+  This rule now governs **every future commit**, not just the flip: the history is public, so
+  any secret that ever lands in a commit must be rotated, never merely removed.
+- [x] **The flip is irreversible.** The repository is public and its history is now readable to
+  anyone who clones or indexes it. Done after confirming the scan was clean.
+- [x] Flip visibility. **Done 2026-08-01** — the repository is public. Actions minutes are now
+  free at any cadence; 15-min polling is revisited on its merits (§ Cadence), no longer on price.
 
 ### Cadence — 30 min now, a free knob once public
 
@@ -1219,9 +1222,10 @@ and 15 min doubles daily request volume against GoingToCamp (~1,900 → ~3,800/d
 absolute volume, but it spends politeness margin on a WAF already refusing one of our egress
 paths. 15 min does **not** raise per-cycle capacity (a cycle is still capped at the 480 s
 budget, ~40 parks, and simply repeats twice as often — past ~40 parks the fix is sharding,
-orthogonal to cadence). Once the repo is public (Phase D), 15 min costs the same $0 as 30
-min, so cadence becomes a **latency/politeness** call, not a money one, and can be revisited
-then. Source: `monitor-aws-trigger-arch/report.md` §6.
+orthogonal to cadence). Now that the repo is public (Phase D, done 2026-08-01), 15 min costs
+the same $0 as 30 min, so cadence is a **latency/politeness** call, not a money one. **30 min
+stands** (captain): cycle time, not money, is the ceiling. Source:
+`monitor-aws-trigger-arch/report.md` §6.
 
 ### The scaling ceiling is unchanged by this phase
 
@@ -1292,7 +1296,7 @@ work.
 | Polling cadence | 30 min for now (captain, 2026-07-31); the poll stays on GitHub Actions | on the private repo 15 min is ≈$27/mo vs ≈$7 at 30, and doubles request volume against the WAF; once the repo is public (Phase 17), any cadence is $0 and 15 min is revisited on latency, not price |
 | Hosting / trigger | **Path A — AWS EventBridge Scheduler → ~15-line Lambda → GitHub `workflow_dispatch`** (captain, 2026-07-31); the poll keeps running on **GitHub Actions**, only the trigger moves — see Phase 17. **Supersedes two abandoned poll-migration plans**: AWS Lambda running the poll (8×403 from GoingToCamp's Azure Front Door WAF) and Azure Container Apps Jobs (Phase 0 probe 403) | GitHub's `schedule` cron drifts 1–3 h, which only a real scheduler fixes; the WAF refuses AWS and general-Azure egress but not GitHub's runner range, so the poll must stay on Actions; the AWS trigger never touches GoingToCamp, so its 403 risk is nil |
 | Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock AWS trigger Phase 17 introduces — so it is **not** dropped |
-| Repo visibility | Flip **public after the backend implementation is complete** (captain, 2026-07-31), gated on a full-history secret scan | takes Actions minutes to $0; the interim ≈$7/mo at 30 min is accepted. Irreversible once cloned/indexed, so any historical secret must be rotated, not merely removed — see Phase 17 Phase D. A self-hosted **residential** runner survives only as a fallback if GitHub's own egress is ever refused |
+| Repo visibility | **Public since 2026-08-01** (captain, 2026-07-31), flipped after the backend implementation completed and a clean full-history secret scan | Actions minutes are now **$0** (the ≈$7/mo at 30 min was the accepted interim during the private-repo window). Irreversible once cloned/indexed, so any historical secret must be rotated, not merely removed — a rule that now governs every future commit; see Phase 17 Phase D. A self-hosted **residential** runner survives only as a fallback if GitHub's own egress is ever refused |
 | Alerting (v1) | APNs push with a direct booking link — nothing else | free programmatic SMS no longer exists; carrier email gateways are defunct |
 | DB writes | Delta-only via `state_hash`, one summary row/cycle, 30-day pruning | naive per-watch writing blew the free tier ~6× |
 | Watch expiry | Backend-owned (`status='expired'`) | client-side expiry cannot be trusted to run |
