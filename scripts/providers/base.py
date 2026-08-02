@@ -107,6 +107,48 @@ def open_dates_in_window(
     )
 
 
+def relevant_open_sites(
+    parsed: dict,
+    wanted: set[str],
+    today: date,
+    start: date,
+    end: date,
+    *,
+    exclude: Callable[[dict], bool] | None = None,
+) -> dict[str, dict]:
+    """The watch's current open-site state from a boolean-grid provider's parsed
+    sites, normalized to the shared shape {site_id: {"campsite_id","site","dates"}}.
+
+    Shared by the two conformers whose site identity is a single stable id and
+    whose per-night value is a plain bool (going_to_camp, use_direct).
+    recreation.gov is deliberately not a caller: it matches its wanted set on the
+    site *label* too and reads a status string, not a bool, so its own loop stays
+    separate. Each parsed site is matched on its id alone
+    (`{site_id, campsite_id} & wanted`, skipped only when the watch named sites),
+    then kept only when it still has open, in-window nights (`open_dates_in_window`).
+
+    `exclude`, when given, drops a site the filter should hide — going_to_camp's
+    ADA-Only exclusion. It runs AFTER the wanted match (a site the watch named is
+    never dropped, which the caller's predicate also enforces) and BEFORE the
+    caller hashes the shape, so a hidden site appearing or vanishing is not a
+    delta and costs no write.
+    """
+    current: dict[str, dict] = {}
+    for site_id, site in parsed.items():
+        if wanted and not ({site_id, site["campsite_id"]} & wanted):
+            continue
+        if exclude is not None and exclude(site):
+            continue
+        open_dates = open_dates_in_window(site["availabilities"], today, start, end)
+        if open_dates:
+            current[site_id] = {
+                "campsite_id": site["campsite_id"],
+                "site": site["site"],
+                "dates": open_dates,
+            }
+    return current
+
+
 def fetch_with_backoff(
     request: Callable[[], httpx.Response],
     parse: Callable[[object], object],

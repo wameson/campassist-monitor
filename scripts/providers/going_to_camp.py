@@ -49,7 +49,7 @@ from .base import (
     fetch_with_backoff,
     horizon_month_start,
     night_span_bounds,
-    open_dates_in_window,
+    relevant_open_sites,
 )
 
 # The one host this provider talks to. A code constant, never provider_ref.
@@ -1047,44 +1047,35 @@ class GoingToCampProvider:
         # this is the deliberate behaviour change the migration documents.
         include_ada_only = bool(watch.get("include_ada_only"))
 
-        current: dict[str, dict] = {}
-        for resource_id, site in parsed.items():
-            # Matched on the stable identifiers alone. `site` carries the
-            # catalog label, which reverts to the resourceId whenever the
-            # catalog fetch fails, so a watch naming labels would match every
-            # site on a healthy cycle and none at all on a degraded one —
-            # openings suppressed with nothing the user can see. The label is
-            # for display; the resourceId is the identity, and it is the
-            # resourceId the client persists in `site_ids` for a per-site
-            # GoingToCamp watch while showing the label.
-            if wanted and not ({resource_id, site["campsite_id"]} & wanted):
-                continue
-            # "ADA Only" on this platform means only campers with disabilities
-            # may reserve the site, so it is not an opening for a watch that
-            # did not ask for it — the platform's own search excludes these by
-            # default too. Three rules make that safe:
-            #   * it runs AFTER the `wanted` match, and only for an undirected
-            #     watch: a watch that named this site chose it deliberately and
-            #     the filter must not overrule the choice.
-            #   * it runs BEFORE the caller hashes this shape, so an ADA-only
-            #     site opening and closing is not a delta at all — no phantom
-            #     state_hash churn, no `sent_alerts` row, no `watches` write.
-            #   * it fails open: only a site the catalog positively marked
-            #     carries the flag (see `apply_site_metadata`), so a catalog
-            #     this cycle could not read suppresses nothing. A suppressed
-            #     opening is invisible to the user; a surplus one is only noise.
-            if site.get("ada_only") and not include_ada_only and not wanted:
-                continue
-            open_dates = open_dates_in_window(
-                site["availabilities"], today, start, end
-            )
-            if open_dates:
-                current[resource_id] = {
-                    "campsite_id": site["campsite_id"],
-                    "site": site["site"],
-                    "dates": open_dates,
-                }
-        return current
+        # Sites are matched on the stable identifiers alone. `site` carries the
+        # catalog label, which reverts to the resourceId whenever the catalog
+        # fetch fails, so a watch naming labels would match every site on a
+        # healthy cycle and none at all on a degraded one — openings suppressed
+        # with nothing the user can see. The label is for display; the resourceId
+        # is the identity, and it is the resourceId the client persists in
+        # `site_ids` for a per-site GoingToCamp watch while showing the label.
+        #
+        # The `exclude` predicate is the "ADA Only" exclusion: on this platform
+        # that means only campers with disabilities may reserve the site, so it is
+        # not an opening for a watch that did not ask for it — the platform's own
+        # search excludes these by default too. Three rules make that safe:
+        #   * it runs AFTER the `wanted` match (relevant_open_sites applies it
+        #     there) and only for an undirected watch (`not wanted`): a watch that
+        #     named this site chose it deliberately and the filter must not
+        #     overrule the choice.
+        #   * it runs BEFORE the caller hashes this shape, so an ADA-only site
+        #     opening and closing is not a delta at all — no phantom state_hash
+        #     churn, no `sent_alerts` row, no `watches` write.
+        #   * it fails open: only a site the catalog positively marked carries the
+        #     flag (see `apply_site_metadata`), so a catalog this cycle could not
+        #     read suppresses nothing. A suppressed opening is invisible to the
+        #     user; a surplus one is only noise.
+        return relevant_open_sites(
+            parsed, wanted, today, start, end,
+            exclude=lambda site: bool(
+                site.get("ada_only") and not include_ada_only and not wanted
+            ),
+        )
 
     def booking_url(self, watch: dict, openings: list[dict]) -> str:
         """The park's booking search, pre-filled with the watch's dates.
