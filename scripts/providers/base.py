@@ -13,7 +13,7 @@ so no provider may ever derive a host, URL or path from it (SSRF).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable, Protocol, runtime_checkable
 
 import httpx
@@ -52,6 +52,31 @@ def horizon_month_start(today: date, horizon_months: int) -> date:
     """
     years, month0 = divmod(today.month - 1 + horizon_months, 12)
     return date(today.year + years, month0 + 1, 1)
+
+
+def night_span_bounds(
+    start: date, end: date, today: date, horizon_months: int
+) -> tuple[date, date, date] | None:
+    """The shared bounds the two day-range conformers clamp their poll request
+    to, or None when there is nothing to poll — a stay whose last night has
+    passed, or one still beyond the horizon.
+
+    Returns `(first, last_night, horizon)`: `first` is the first night to
+    request, clamped forward to today; `last_night` is the stay's own last night
+    (`end - 1 day`, or `start` for a single-night stay); `horizon` is the last
+    pollable date (`horizon_month_start`). Only the request *end* differs between
+    the two conformers, so each builds it from these bounds itself —
+    going_to_camp clamps the stay `end`, use_direct the `last_night` — because
+    the two APIs disagree on whether the requested end is itself a served night
+    (see each conformer's poll_range)."""
+    last_night = end - timedelta(days=1) if end > start else start
+    if last_night < today:
+        return None
+    first = max(start, today)
+    horizon = horizon_month_start(today, horizon_months)
+    if first > horizon:
+        return None
+    return first, last_night, horizon
 
 
 def fetch_with_backoff(

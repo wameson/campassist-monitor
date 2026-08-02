@@ -44,7 +44,7 @@ import httpx
 
 from common import as_date, capped_line, date_in_watch
 
-from .base import PollKey, fetch_with_backoff, horizon_month_start
+from .base import PollKey, fetch_with_backoff, horizon_month_start, night_span_bounds
 
 # The one host this provider talks to. A code constant, never provider_ref.
 HOST = "washington.goingtocamp.com"
@@ -232,13 +232,10 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     all, so its check-out day stays in the request (it is what the booking
     search is given) and is dropped from the result by `date_in_watch`, exactly
     as the other conformer drops it from a month it polled anyway."""
-    last_night = end - timedelta(days=1) if end > start else start
-    if last_night < today:
+    bounds = night_span_bounds(start, end, today, POLL_HORIZON_MONTHS)
+    if bounds is None:
         return None
-    first = max(start, today)
-    horizon = horizon_date(today)
-    if first > horizon:
-        return None
+    first, _last_night, horizon = bounds
     return first, max(min(end, horizon), first)
 
 

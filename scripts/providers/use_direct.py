@@ -58,14 +58,14 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import date, timedelta
+from datetime import date
 from typing import NamedTuple
 
 import httpx
 
 from common import as_date, date_in_watch
 
-from .base import PollKey, fetch_with_backoff, horizon_month_start
+from .base import PollKey, fetch_with_backoff, night_span_bounds
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
 # A platform-wide UseDirect constant, not a per-tenant value.
@@ -183,12 +183,6 @@ def parse_campground_id(campground_id: str) -> tuple[Tenant, int]:
 
 # --- poll plan ------------------------------------------------------------
 
-def horizon_date(today: date) -> date:
-    """First-of-month containing today + POLL_HORIZON_MONTHS: a stay starting
-    after it is not polled yet."""
-    return horizon_month_start(today, POLL_HORIZON_MONTHS)
-
-
 def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     """The (first night, last night) to request, both INCLUSIVE, or None when
     there is nothing to poll — a stay whose last night has passed, or one still
@@ -202,13 +196,10 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     forward to today and back to the horizon, so no past or out-of-horizon night
     can reach a request, the state hash or an alert. `extract_relevant` still
     drops the check-out day and past nights from whatever the grid returns."""
-    last_night = end - timedelta(days=1) if end > start else start
-    if last_night < today:
+    bounds = night_span_bounds(start, end, today, POLL_HORIZON_MONTHS)
+    if bounds is None:
         return None
-    first = max(start, today)
-    horizon = horizon_date(today)
-    if first > horizon:
-        return None
+    first, last_night, horizon = bounds
     return first, min(last_night, horizon)
 
 
