@@ -30,7 +30,7 @@ per cycle.
 ## Architecture
 
 ```
-campassist-monitor (GitHub, PRIVATE)
+campassist-monitor (GitHub, PUBLIC since 2026-08-01)
   .github/workflows/monitor.yml   cron */30 + workflow_dispatch, timeout-minutes: 15
     ├── preflight: read-only schema-drift probe (before the jitter)
     ├── start jitter: sleep rand(0–20s)
@@ -51,69 +51,65 @@ campassist-monitor (GitHub, PRIVATE)
 ```
 
 > **Phase 17 changes the *trigger*, not this topology.** The poll keeps running on GitHub
-> Actions — the one egress path proven to reach GoingToCamp — but stops being fired by GitHub's
-> best-effort `schedule` cron (which drifts 1–3 h). Instead an **AWS EventBridge Scheduler fires
+> Actions — the one egress path proven to reach GoingToCamp — and is meant to stop being fired by
+> GitHub's best-effort `schedule` cron (which drifts 1–3 h): an **AWS EventBridge Scheduler fires
 > on the exact wall clock and calls `monitor.yml`'s `workflow_dispatch`** (captain, 2026-07-31).
 > AWS never talks to GoingToCamp; the diagram above — the poll, Supabase, APNs, the six secrets in
-> GitHub Actions Secrets — is unchanged. Two earlier plans that tried to move the *poll itself* off
-> Actions (AWS Lambda, then Azure Container Apps Jobs) were both refused by GoingToCamp's Azure
-> Front Door WAF; see Phase 17 "Approaches tried and rejected." A later step flips the repo public
-> to take Actions minutes to $0.
+> GitHub Actions Secrets — is unchanged. **Status: live.** The AWS trigger fires `workflow_dispatch`
+> on the exact wall clock (Phase B done — the run history shows dispatches at exactly `:00`/`:30`),
+> with the GitHub `schedule` cron kept running alongside it as the offset backstop; Phase C
+> (thinning that backstop) is optional and not done, so both triggers run by design (see Phase 17).
+> Two earlier plans that tried to move the *poll itself* off Actions (AWS Lambda, then Azure
+> Container Apps Jobs) were both refused by GoingToCamp's Azure Front Door WAF; see Phase 17
+> "Approaches tried and rejected." A later step (Phase D) flipped the repo **public on 2026-08-01**,
+> taking Actions minutes to $0.
 
-### GitHub Actions minutes budget (private repo, 2,000 free min/month)
+> **Standing rule since the public flip (2026-08-01).** The repo's **entire git history** is
+> public, not just its current state — a secret that was *ever* committed stays readable in old
+> commits. Any secret that ever lands in a commit must be **rotated, not merely removed**: removal
+> from history does nothing once a commit has been fetched, cloned, or indexed. This governs
+> **every future commit**. `.github/workflows/secret-scan.yml` (gitleaks, pinned/checksum-verified)
+> gates every PR on its `base..head` diff and fails on any finding (README "Secret scanning").
 
-> **The poll stays on GitHub Actions, so this budget stays live.** Phase 17 moves only the
-> *trigger* to AWS; the job that spends these minutes does not move. The budget therefore binds
-> until the **repo is flipped public** (Phase 17's late step), at which point standard-runner
-> minutes become **free at any cadence** and the ≈$7/mo interim cost goes to $0. The
-> per-minute-rounding arithmetic below is Actions-specific and remains load-bearing until that
-> flip.
+### GitHub Actions minutes — now $0 (public repo)
 
-| Item | Consumption |
-|---|---|
-| Monitor cron every 30 min (**measured 2.2 billed min/run**, rounded up; 1,461 runs/mo) | ~3,214 min/mo |
-| Backend pytest CI (ubuntu 1×, ~2 min/PR) | ~40 min/mo |
-| iOS unit tests on merge to main (macOS **10×**) | ~320 min/mo |
-| **Monitor vs 2,000 free** | **over — the ≈$7/mo interim overage on the monitor row alone (Phase 17 cost table); the CI + iOS minutes are the separately-accounted ~+$2/mo shared-pool caveat** |
+> **The repo went public on 2026-08-01 (Phase 17, Phase D), so standard-runner minutes are free
+> at any cadence — this is no longer a cost constraint.** The poll still runs on GitHub Actions
+> (Phase 17 moves only the *trigger*), but the job's minutes cost nothing. What survives the flip
+> is the in-code cycle **time** budget (`CYCLE_TIME_BUDGET_SECONDS`, 480 s), a coverage/correctness
+> limit racing only GitHub's own `timeout-minutes: 15` (900 s) — never a billing one.
 
-**The measured billed cost is ~2.2 min/run, and that gap above the 1-minute floor is the whole
-≈$7/mo.** Billing is per job, rounded up to the whole minute; a no-change cycle runs ~94–125 s
-(measured, n=15; mean ~109 s), so most runs bill 2 min and roughly one in four bills 3 —
-averaging **2.2 billed min/run** (Phase 17 cost table). Over 1,461 runs/mo that is ~3,214 min,
-past the 2,000 free tier by ~1,214, i.e. the ≈$7/mo the public flip (Phase 17) erases.
+**Historical, kept as an accepted-cost record.** During the private-repo window the monitor ran
+against the 2,000 free min/month tier and overran it, an **accepted ≈$7/mo interim cost** at
+30-min cadence — a real cost the captain accepted, erased by the public flip. Actions bills **per
+job, rounded up to the whole minute**; a no-change cycle measured ~94–125 s (n=15, ~109 s mean),
+so most runs billed 2 min and ~1 in 4 billed 3 → **2.2 billed min/run**, ~3,214 min/mo over 1,461
+runs, ~1,214 past the free tier. (15 min would have been ≈$27/mo — see Phase 17 cost table.)
 
-This is *after* the jitter fix, which averted a far worse bill: until 2026-07-28 a 226-run
-measurement found the median job at 141 s — its `Run monitor` step ~130 s of that — against
-~10 s of real work, because the 240 s start jitter was a mean of 120 s of billed `time.sleep()`
-per run (92% of that ~130 s step), which would have put an honest `*/30` at **~4,154 min/mo**.
-At a GitHub Free account's default $0 spending limit that is not a bill — it is every
-private-repo Action stopping until the next billing cycle. Cutting the jitter to 20 s
-(`START_JITTER_MAX_SECONDS`) removed that 2.9× blowup; the residual ~2.2 min/run is real pacing
-plus setup, not sleep, and it is the modest overage above. **The constraint this leaves
-standing — nothing may push a no-change cycle materially higher, because per-job rounding bills
-every extra whole minute of wall clock — is a live GitHub Actions concern only while the poll
-stays on Actions, and dissolves as a *cost* concern when the repo goes public (Phase 17).** What
-remains after that is the in-code cycle **time** budget (`CYCLE_TIME_BUDGET_SECONDS`, 480 s) — a
-coverage/correctness limit, not a billing one — racing only GitHub's own `timeout-minutes: 15`
-(900 s), unchanged. The 226-run measurement and the 240 s→20 s jitter finding stay valid as
-durable evidence about the per-request pacing floor, and `START_JITTER_MAX_SECONDS` stays at
-20 s regardless — Phase 17 explains why an exact scheduler *restores* the jitter's desync
-rationale.
+**The jitter fix that averted a far worse bill stays on record as durable evidence.** Until
+2026-07-28 the start jitter was 240 s: a 226-run measurement found the median job at 141 s with
+~130 s of that billed `time.sleep()` (92% of the `Run monitor` step) against ~10 s of real work,
+which would have put an honest `*/30` at **~4,154 min/mo**. At a GitHub Free account's default $0
+spending limit that is not a bill — it is every private-repo Action stopping until the next cycle.
+Cutting the jitter to 20 s (`START_JITTER_MAX_SECONDS`) removed that 2.9× blowup; the residual is
+real pacing plus setup, not sleep. **`START_JITTER_MAX_SECONDS` stays at 20 s regardless** — the
+226-run finding is durable evidence about the per-request pacing floor, and Phase 17's exact-
+wall-clock trigger *restores* the jitter's desync rationale (a `schedule` cron already spread
+delivery; an exact scheduler does not).
 
-**Why 30 min and not 15:** the budget above (captain, 2026-07-31). On the private repo, 15 min
-is ≈$27/mo vs ≈$7 at 30, and it doubles request volume against a WAF already refusing one of our
-egress paths. The other lever the cadence question raised — GitHub's `schedule` trigger being
-best-effort and drifting to **1–3 h** regardless of minutes or repo visibility (measured; see
-Phase 17) — is fixed by Phase 17's AWS trigger, not by cadence. Once the repo is public (Phase
-17's late step) minutes are free at any cadence, so 15 min becomes a pure latency/politeness
-call and can be revisited then. A self-hosted **residential** runner survives only as a fallback
-if GitHub's own egress is ever refused — not the plan.
+**Why 30 min and not 15** (captain): now that minutes are $0, cadence is a latency/politeness
+call, not a money one, and **30 min stands** — cycle time, not money, is the ceiling (§ Cadence).
+15 min would double request volume against a WAF already refusing one of our egress paths without
+raising per-cycle capacity. The scheduler-drift half of the old cadence question (GitHub's
+`schedule` drifting **1–3 h**, measured) is Phase 17's to fix, not cadence's. A self-hosted
+**residential** runner survives only as a fallback if GitHub's own egress is ever refused — not
+the plan.
 
 ### Stack
 
 | Layer | Choice | Why |
 |---|---|---|
-| Scheduling | **Trigger:** Actions `schedule` cron `*/30` today (drifts 1–3 h); Phase 17 moves the trigger to an **AWS EventBridge Scheduler** → `workflow_dispatch` (exact wall clock), keeping `schedule` as an offset backstop. **Execution:** GitHub Actions, unchanged | GitHub's `schedule` is best-effort; an exact scheduler fires on the minute while the poll stays on the only accepted egress |
+| Scheduling | **Trigger (live, Phase 17):** an **AWS EventBridge Scheduler** → `workflow_dispatch` fires on the exact wall clock, with the Actions `schedule` cron `*/30` kept as the offset backstop (it still drifts 1–3 h). **Execution:** GitHub Actions, unchanged | GitHub's `schedule` is best-effort; an exact scheduler fires on the minute while the poll stays on the only accepted egress |
 | Language | Python 3.12 | available on Actions and in a `python:3.12-slim` container, no build step |
 | HTTP | `httpx[http2]` | HTTP/2 is required for APNs |
 | APNs auth | `PyJWT` + `cryptography` | ES256 JWT signed with the `.p8` key |
@@ -351,11 +347,12 @@ Dominated by the 1.2–2.8 s inter-request pacing (~2 s mean); the ≤20 s start
 at every row. Today's poll set is far smaller than the first row — the poll cycle itself
 measures 11–25 s end to end — but the *billed* job also carries GitHub Actions' fixed overhead
 (checkout + `setup-python` + `pip install`), which is why the whole job lands at ~109 s and
-bills ~2 min (the minutes table above). The scaling point is where the *growth* comes from:
+bills ~2 min (§ GitHub Actions minutes). The scaling point is where the *growth* comes from:
 20 poll units is ~19 gaps × ~2 s ≈ 38 s of pacing plus request time, and **past roughly 20 poll
 units the binding growth term of a no-change cycle is the per-request pacing, not the start
-jitter** — under per-job rounding each additional whole minute of wall clock is another billed
-minute, so pacing is the thing to watch as the pool grows. This is an observation about the
+jitter**. Now that the repo is public that wall clock is no longer a billing lever, but it is
+still the scaling term to watch — it races the in-code 480 s cycle-time budget as the pool grows.
+This is an observation about the
 budget: `INTER_REQUEST_DELAY_RANGE` is politeness toward the providers, is not a cost lever, and
 stays as it is.
 
@@ -927,18 +924,27 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 
 ## Phase 17 (campassist-monitor backend) — AWS-triggered GitHub Actions (fix the scheduler drift)
 
-**Repo half of Path A has shipped; no cloud resource has.** The trigger code
-(`trigger_lambda.py` + its offline tests) is in-repo and its build-side checkboxes are
-ticked, but every operator/cloud checkbox is deliberately unticked: no cloud resource has
-been provisioned and the live `monitor.yml` cron is untouched.
+**Path A is live: Phases A and B are done, Phase C (optional) is not.** The trigger code
+(`trigger_lambda.py` + its offline tests) is in-repo, the AWS cloud resources are provisioned,
+and the **exact-time trigger is firing in production**: the run history shows `workflow_dispatch`
+runs landing at exactly `:00` and `:30` every 30 min (e.g. `2026-08-02T00:00:14Z`,
+`23:30:15Z`, `23:00:14Z`, … — no gaps), which only the AWS Lambda can produce. The GitHub
+`schedule` cron is **deliberately kept running alongside it** as the offset backstop (its runs
+still drift — `23:26`, `22:25`, `21:22`, … — which is exactly why the exact-time trigger exists).
+**Both triggers running is the designed Phase-B state, not a defect.** Phase C — thinning the
+`schedule` backstop to hourly — is marked optional below and is **not** done, so the cron stays
+at `*/30`. (Verify anytime with `gh run list --workflow monitor.yml`; the AWS resources
+themselves live in the captain's account and are not visible from a repo clone — their absence
+from the clone is not evidence they are undeployed.)
 
 **This is a reliability fix, not a cost fix, and the poll does not move.** The
-`*/30 * * * *` Actions cron does not fire as configured: a 2026-07-31 measurement of the
+`*/30 * * * *` Actions cron did not fire as configured: a 2026-07-31 measurement of the
 20 most-recent scheduled runs found gaps of **1–3 hours** — ~12–13 runs/day, not the
 intended 48 — because GitHub's `schedule` trigger is best-effort and is delayed or dropped
-under load. Alerts therefore lag openings by hours, and catching a cancellation fast is the
-whole product. The fix is to stop relying on GitHub's `schedule`: an **AWS EventBridge
-Scheduler fires on the exact wall clock and calls `monitor.yml`'s `workflow_dispatch`**,
+under load. Alerts therefore lagged openings by hours, and catching a cancellation fast is the
+whole product. The fix, **now live**, is to stop firing the poll from GitHub's best-effort
+`schedule`: an **AWS EventBridge Scheduler fires on the exact wall clock and calls
+`monitor.yml`'s `workflow_dispatch`** (the `schedule` cron stays on as the offset backstop),
 while the poll itself keeps running on GitHub Actions — the one egress path proven to reach
 GoingToCamp. **AWS never talks to GoingToCamp; it only tells GitHub when to run.**
 
@@ -1005,41 +1011,42 @@ whose entire failure mode is *silent* missing. Path A's ~15-line Lambda logs eve
 and GitHub's exact HTTP status, and keeps the token in **SSM (free)**.
 (`monitor-aws-trigger-arch/report.md` §4.)
 
-### Cost — ~$7/mo interim, $0 once public; the AWS side is $0 forever
+### Cost — the poll is now $0 (public repo); the AWS trigger is $0 forever
 
-**The money decision is repo visibility, not AWS.** The AWS trigger is $0 at every cadence,
-this year and next — every service on the path sits inside a **permanent** free tier
-(EventBridge Scheduler 14 M invocations/mo; Lambda 1 M req + 400,000 GB-s/mo; SSM Standard
-parameters; CloudWatch 10 alarms + 5 GB logs/mo; SNS 1,000 emails/mo), and the trigger's
-usage (≤ 2,922 invocations/mo, ~36 GB-s) rounds to $0 even at list price. **No ECR-style
-year-two trap:** no container registry, no NAT gateway, no data-transfer line.
+**The money decision was repo visibility, not AWS**, and it is settled: the repo went public on
+2026-08-01, so the poll's Actions minutes are **$0**. The AWS trigger is $0 at every cadence, this
+year and next — every service on the path sits inside a **permanent** free tier (EventBridge
+Scheduler 14 M invocations/mo; Lambda 1 M req + 400,000 GB-s/mo; SSM Standard parameters;
+CloudWatch 10 alarms + 5 GB logs/mo; SNS 1,000 emails/mo), and the trigger's usage
+(≤ 2,922 invocations/mo, ~36 GB-s) rounds to $0 even at list price. **No ECR-style year-two
+trap:** no container registry, no NAT gateway, no data-transfer line.
 
-The only cost is GitHub Actions minutes on a **private** repo:
+**Historical — the private-repo window (accepted-cost record).** Until the flip the only cost was
+GitHub Actions minutes on the **private** repo, an **accepted ≈$7/mo interim** at 30-min cadence:
 
 | Cost line | 30 min · private | 15 min · private | public (any cadence) |
 |---|---:|---:|---:|
-| GitHub Actions poll (`monitor.yml`) | **≈ $7/mo** | **≈ $27/mo** | **$0** |
+| GitHub Actions poll (`monitor.yml`) | **≈ $7/mo** | **≈ $27/mo** | **$0 (now)** |
 | └ range across 2.0–3.0 billed-min/run | $6–$14 | $23–$41 | $0 |
 | └ if the account is **Pro** (3,000 free min) | ≈ $1/mo | ≈ $21/mo | $0 |
 | AWS trigger path | $0 | $0 | $0 |
 | **Total (Free plan, measured)** | **≈ $7/mo** | **≈ $27/mo** | **$0** |
 
-Figures use the **measured** average of **2.2 billed min/run** (n = 15 recent `monitor.yml`
-runs: 94–125 s wall clock, mean ~109 s; GitHub bills **per job, rounded up to the whole
-minute**, at the **verified $0.006/min** Linux rate — a correction from the stale $0.008
-prior monitor reports used) over **1,461 runs/mo** at 30 min (30.44-day month). Two honest
-caveats sit behind the private figures: the account's **Free-vs-Pro plan could not be read**
-from the worktree token (Pro's 3,000 free min drops the 30-min case to ≈$1); and the
-free-minute pool is **shared** across the owner's private repos (~+$2/mo if the ~375 min/mo
-prior estimate holds). The **public** column is a hard $0 — public repos get unlimited
-standard-runner minutes — and touches none of that math. Source:
+Figures used the **measured** average of **2.2 billed min/run** (n = 15 recent `monitor.yml`
+runs: 94–125 s wall clock, mean ~109 s; GitHub bills **per job, rounded up to the whole minute**,
+at the **verified $0.006/min** Linux rate — a correction from the stale $0.008 prior reports used)
+over **1,461 runs/mo** at 30 min (30.44-day month). Two caveats sat behind those private figures:
+the account's **Free-vs-Pro plan could not be read** from the worktree token (Pro's 3,000 free min
+would have dropped the 30-min case to ≈$1); and the free-minute pool was **shared** across the
+owner's private repos (~+$2/mo). The **public** column is a hard $0 — public repos get unlimited
+standard-runner minutes — and is where the poll sits now. Source:
 `monitor-aws-trigger-arch/report.md` §§1–3.
 
-**The captain's decisions (2026-07-31):** **30 minutes for now** — not 15, because on the
-private repo it is ~$7 vs ~$27/mo, and 15 min doubles request volume against a WAF already
-refusing our other egress; and **flip the repo public *after* the backend implementation is
-complete**, at which point minutes become free and the ~$7/mo goes to **$0**. The ~$7/mo is
-the **accepted interim cost** until that flip.
+**The captain's decisions:** **30 minutes** — not 15 (during the private window it was ~$7 vs
+~$27/mo, and 15 min still doubles request volume against a WAF already refusing our other egress);
+and **flip the repo public after the backend implementation was complete**, which happened on
+2026-08-01 and took the ~$7/mo to **$0**. The ~$7/mo was the **accepted interim cost** of the
+private window, now closed.
 
 ### The GitHub token — scope, storage, blast radius
 
@@ -1163,29 +1170,37 @@ incumbent path never stops, so there is no cutover window and no data migration.
 
 ### Ordered implementation steps
 
-**Phase A — stand up the trigger (no cutover):**
+**Phase A — stand up the trigger (no cutover): DONE.**
 
-- [ ] Mint the fine-grained PAT (single repo, Actions: Read and write, 90-day expiry) and
-  store it as an SSM SecureString.
-- [ ] Create the trigger Lambda (**code already in-repo: `trigger_lambda.py`, handler
+- [x] Mint the fine-grained PAT (single repo, Actions: Read and write, 90-day expiry) and
+  store it as an SSM SecureString. *(Necessarily done — the live Lambda reads it from SSM and
+  dispatches successfully.)*
+- [x] Create the trigger Lambda (**code already in-repo: `trigger_lambda.py`, handler
   `trigger_lambda.handler`** — read the PAT from SSM, `POST …/monitor.yml/dispatches`, log the
   HTTP status; deploy as a single file, no wheel build), its re-scoped execution role, the
   CloudWatch `Invocations` heartbeat alarm, and the SNS email (confirm the subscription).
-- [ ] Invoke the Lambda manually once; confirm it returns GitHub's `204` and a `monitor.yml`
-  run appears. This exercises the PAT, the SSM read, and the dispatch path end-to-end with no
-  schedule attached.
+  *(Deployed in the captain's AWS account — the run history proves the Lambda + role + PAT path;
+  whether the alarm actually **fires** on a disabled schedule is the separate check under Phase B
+  step 2 / Validate, still open.)*
+- [x] Invoke the Lambda manually once; confirm it returns GitHub's `204` and a `monitor.yml`
+  run appears. This exercises the PAT, the SSM read, and the dispatch path end-to-end. *(Proven by
+  the standing `workflow_dispatch` runs in the history — dispatches at exactly `:00`/`:30`.)*
 
-**Phase B — turn on the exact-time trigger alongside the backstop:**
+**Phase B — turn on the exact-time trigger alongside the backstop: DONE (per captain; drift-fix
+verified from run history).**
 
-- [ ] Attach the EventBridge schedule at **`*/30`** (exact wall clock),
+- [x] Attach the EventBridge schedule at **`*/30`** (exact wall clock),
   `MaximumRetryAttempts = 0`, and **leave `monitor.yml`'s `schedule` cron running** as the
   offset backstop. The `concurrency` guard serializes the two sources; **no stagger is
-  required** (see above).
+  required** (see above). *(Verified: `workflow_dispatch` runs land at exactly `:00`/`:30` while
+  the `schedule` cron still fires its own drifty runs alongside — both triggers running by design.)*
 - [ ] Run for several days; confirm from `run_summaries.ran_at` that runs now land on the
   exact minute (no 1–3 h drift), and that the heartbeat alarm and email fire when the schedule
-  is briefly disabled.
+  is briefly disabled. *(The exact-minute half is confirmed from the run history; the
+  heartbeat-alarm-fires-on-disable half is the one Phase-B check not yet evidenced here — see
+  Validate gate 3. Left unticked for that half alone.)*
 
-**Phase C — thin the backstop (optional):**
+**Phase C — thin the backstop (optional): NOT done — deliberately, the cron stays at `*/30`.**
 
 - [ ] Once the AWS trigger is proven, optionally thin the `schedule` cron to hourly (keeping
   it as a backstop, **not** removing it — it is the trigger-down safety net). Do **not** drop
@@ -1215,9 +1230,9 @@ secret scan came back clean and the repository is now public, which took the run
 - [x] Flip visibility. **Done 2026-08-01** — the repository is public. Actions minutes are now
   free at any cadence; 15-min polling is revisited on its merits (§ Cadence), no longer on price.
 
-### Cadence — 30 min now, a free knob once public
+### Cadence — 30 min, now a free knob (repo is public)
 
-**30 minutes now** (captain, 2026-07-31): on the private repo it is ~$7/mo vs ~$27 at 15 min,
+**30 minutes** (captain, 2026-07-31): during the private window it was ~$7/mo vs ~$27 at 15 min,
 and 15 min doubles daily request volume against GoingToCamp (~1,900 → ~3,800/day) — low
 absolute volume, but it spends politeness margin on a WAF already refusing one of our egress
 paths. 15 min does **not** raise per-cycle capacity (a cycle is still capped at the 480 s
@@ -1243,11 +1258,14 @@ work.
   else raise). Stdlib-only (`urllib` + runtime `boto3`), so it deploys as a single file with no
   bundled dependency; `requirements.txt`, `monitor.py`, and the whole poll pipeline are
   **untouched**. (PR: repo half of Phase A.)
-- [ ] Deploy that code as a Lambda + re-scoped execution role (`ssm:GetParameter` on the one
-  PAT parameter + Logs) — **operator stand-up**, no further repo change.
-- [ ] EventBridge schedule (`*/30`, exact wall clock, `MaximumRetryAttempts = 0`) targeting
+- [x] Deploy that code as a Lambda + re-scoped execution role (`ssm:GetParameter` on the one
+  PAT parameter + Logs) — **operator stand-up**, no further repo change. *(Live in the captain's
+  AWS account — proven by the standing `workflow_dispatch` runs.)*
+- [x] EventBridge schedule (`*/30`, exact wall clock, `MaximumRetryAttempts = 0`) targeting
   the Lambda; SSM SecureString holding the fine-grained PAT; CloudWatch `Invocations`
-  heartbeat alarm; SNS topic + confirmed email.
+  heartbeat alarm; SNS topic + confirmed email. *(Schedule + SSM + Lambda proven live from the
+  run history; the alarm/SNS are provisioned as Phase-A deliverables — the separate check that the
+  alarm **fires** on a disabled schedule is Validate gate 3, still open.)*
 - [x] `monitor.yml`: **no change required** — `workflow_dispatch` + `concurrency` already
   present (verified); `schedule` retained as the offset backstop.
 
@@ -1262,17 +1280,21 @@ work.
   with `make lambda-zip` and `deploy.yml`; the offline suite stays green without them (the
   9 shim tests are the only drop).
 - [ ] Live gates are manual, not offline tests: the Phase A manual invoke (`204` + a real
-  run), the Phase B on-time-run confirmation from `run_summaries.ran_at`, and the
-  heartbeat-alarm firing test. The suite makes no cloud calls.
+  run) and the Phase B on-time-run confirmation are both **now confirmed** from the live run
+  history; only the heartbeat-alarm firing test remains open. The suite makes no cloud calls.
 
 ### Validate (operator gates)
 
-- [ ] Manual Lambda invoke returns GitHub `204` and a `monitor.yml` run appears *(needs the
-  live PAT + AWS resources — not exercisable from a clone)*.
-- [ ] After Phase B, `run_summaries.ran_at` shows runs on the exact minute, no 1–3 h drift
-  *(same)*.
+- [x] Manual Lambda invoke returns GitHub `204` and a `monitor.yml` run appears. *(Confirmed by
+  the standing `workflow_dispatch` runs the AWS trigger produces — visible via
+  `gh run list --workflow monitor.yml`.)*
+- [x] After Phase B, `run_summaries.ran_at` shows runs on the exact minute, no 1–3 h drift.
+  *(The `workflow_dispatch` runs fire at exactly `:00`/`:30`, e.g. `2026-08-02T00:00:14Z`,
+  `23:30:15Z`, `23:00:14Z` — the drift is fixed. The drifty `schedule` runs remain as the
+  backstop.)*
 - [ ] Disabling the EventBridge schedule fires the heartbeat alarm and the SNS email within
-  the alarm window *(same)*.
+  the alarm window *(the one still-open Phase-B gate — the alarm's fire-on-disable behaviour is
+  not evidenced by the run history and needs the live AWS console; not exercisable from a clone)*.
 - [x] Phase D: the full-history secret scan is clean (or all hits rotated) before the
   irreversible public flip *(operator judgement — the gate is a blocker, not a test)*. Clean
   at 108 commits on 2026-07-31; re-run over any newer commits at flip time.
@@ -1293,9 +1315,9 @@ work.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Polling cadence | 30 min for now (captain, 2026-07-31); the poll stays on GitHub Actions | on the private repo 15 min is ≈$27/mo vs ≈$7 at 30, and doubles request volume against the WAF; once the repo is public (Phase 17), any cadence is $0 and 15 min is revisited on latency, not price |
+| Polling cadence | 30 min (captain, 2026-07-31); the poll stays on GitHub Actions | during the private window 15 min was ≈$27/mo vs ≈$7 at 30 and doubled request volume against the WAF; now the repo is public (2026-08-01) any cadence is $0, so 30 min stands on cycle-time/latency, not price — cycle time, not money, is the ceiling |
 | Hosting / trigger | **Path A — AWS EventBridge Scheduler → ~15-line Lambda → GitHub `workflow_dispatch`** (captain, 2026-07-31); the poll keeps running on **GitHub Actions**, only the trigger moves — see Phase 17. **Supersedes two abandoned poll-migration plans**: AWS Lambda running the poll (8×403 from GoingToCamp's Azure Front Door WAF) and Azure Container Apps Jobs (Phase 0 probe 403) | GitHub's `schedule` cron drifts 1–3 h, which only a real scheduler fixes; the WAF refuses AWS and general-Azure egress but not GitHub's runner range, so the poll must stay on Actions; the AWS trigger never touches GoingToCamp, so its 403 risk is nil |
-| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock AWS trigger Phase 17 introduces — so it is **not** dropped |
+| Start jitter | 20 s, cut from 240 s (captain, 2026-07-28) | 240 s was 92% of the billed minutes and bought nothing under `schedule`, which already spreads delivery uniformly; ≤20 s stayed inside the Actions 1-minute billing floor and keeps the desync for the exact-wall-clock AWS trigger now live in Phase 17 — so it is **not** dropped |
 | Repo visibility | **Public since 2026-08-01** (captain, 2026-07-31), flipped after the backend implementation completed and a clean full-history secret scan | Actions minutes are now **$0** (the ≈$7/mo at 30 min was the accepted interim during the private-repo window). Irreversible once cloned/indexed, so any historical secret must be rotated, not merely removed — a rule that now governs every future commit; see Phase 17 Phase D. A self-hosted **residential** runner survives only as a fallback if GitHub's own egress is ever refused |
 | Alerting (v1) | APNs push with a direct booking link — nothing else | free programmatic SMS no longer exists; carrier email gateways are defunct |
 | DB writes | Delta-only via `state_hash`, one summary row/cycle, 30-day pruning | naive per-watch writing blew the free tier ~6× |
@@ -1316,8 +1338,8 @@ work.
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| GitHub `schedule` drift | Alerts lag openings by **1–3 h** in practice (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — an AWS EventBridge Scheduler fires on the exact minute and calls `workflow_dispatch`; the poll stays on Actions |
-| Private-repo minute budget | Measured ~2.2 billed min/run → the monitor alone runs ~3,214 min/mo, over the 2,000 free tier | the budget table; binds until Phase 17's **public-repo flip** makes standard-runner minutes free — the interim ≈$7/mo at 30 min is accepted |
+| ~~GitHub `schedule` drift~~ (resolved) | The `schedule` cron drifted **1–3 h** (measured 2026-07-31), far past the intended 30 min | **resolved by Phase 17** — the AWS EventBridge Scheduler now fires `workflow_dispatch` on the exact minute (verified: dispatches land at exactly `:00`/`:30`); the poll stays on Actions. The drifty `schedule` cron is kept alongside as the offset backstop (Phase C thinning it is optional and not done) |
+| ~~Private-repo minute budget~~ (resolved) | Measured ~2.2 billed min/run → the monitor alone ran ~3,214 min/mo, over the 2,000 free tier | **resolved by the public flip (2026-08-01)** — standard-runner minutes are now free at any cadence; the ≈$7/mo at 30 min was the accepted interim cost of the private window |
 | Unofficial provider APIs | Could change, break, or block | defensive parsing, captured fixtures, jitter, backoff, residential-IP fallback |
 | GoingToCamp's Azure Front Door WAF blocks source networks by IP reputation | **Confirmed twice** — 8×403 from AWS Lambda and a 403 from the Azure Container Apps probe (both 2026-07-31), which killed both poll-migration plans. GitHub's Azure runner range is accepted, which is why the poll stays there; the AWS trigger never sends a packet to GoingToCamp, so it is unaffected | keep to plain `httpx` GET + browser UA + pacing, never a browser; the provider seam contains the blast radius to GTC; the residential-runner fallback stays available if the runner range is ever refused |
 | Supabase free tier pauses after 7 idle days | n/a — the cron hits it every 30 min | inherent keep-alive |
@@ -1325,7 +1347,7 @@ work.
 
 ## Backlog (backend)
 
-- 15-min polling — free once the repo is public (Phase 17's late step); on the private repo it is ≈$27/mo vs ≈$7 at 30 min, so it is deferred. The AWS trigger already fires on an exact cron, so no scheduler work is needed to enable it
+- 15-min polling — free now the repo is public (2026-08-01); it was deferred during the private window (≈$27/mo vs ≈$7 at 30 min). Now a pure latency/politeness call, not a cost one, and **30 min still stands** (captain: cycle time, not money, is the ceiling — § Cadence). The AWS exact-cron trigger is already live, so enabling 15 min needs no scheduler work — just widening the EventBridge cadence
 - A retry policy for errored watches, classified on `error_reason` (data first — see Decisions)
 - Moving past-date errored rows to `expired` in the expiry pass (tidier census, but it costs
   writes and mixes two concerns)
