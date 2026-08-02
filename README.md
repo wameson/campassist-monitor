@@ -540,8 +540,8 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 
 The poll runs on GitHub Actions, but GitHub's `schedule` cron is best-effort and
 **drifts 1–3 hours** in practice (measured 2026-07-31), so alerts lag openings.
-Phase 17 (Path A trigger code now in-repo as `trigger_lambda.py`; the AWS
-resources that run it are not yet stood up) fixes this by moving the **trigger**
+Phase 17 (Path A trigger code in-repo as `trigger_lambda.py`; the AWS
+resources that run it are now live) fixes this by moving the **trigger**
 to AWS while the **poll stays on GitHub Actions** — the one egress path
 GoingToCamp's WAF accepts:
 
