@@ -58,14 +58,19 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import date, timedelta
+from datetime import date
 from typing import NamedTuple
 
 import httpx
 
-from common import as_date, capped_line, date_in_watch
+from common import as_date
 
-from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
+from .base import (
+    PollKey,
+    fetch_with_backoff,
+    night_span_bounds,
+    single_unit_open_sites,
+)
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
 # A platform-wide UseDirect constant, not a per-tenant value.
@@ -183,13 +188,6 @@ def parse_campground_id(campground_id: str) -> tuple[Tenant, int]:
 
 # --- poll plan ------------------------------------------------------------
 
-def horizon_date(today: date) -> date:
-    """First-of-month containing today + POLL_HORIZON_MONTHS: a stay starting
-    after it is not polled yet."""
-    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
-    return date(today.year + years, month0 + 1, 1)
-
-
 def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     """The (first night, last night) to request, both INCLUSIVE, or None when
     there is nothing to poll — a stay whose last night has passed, or one still
@@ -203,13 +201,10 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     forward to today and back to the horizon, so no past or out-of-horizon night
     can reach a request, the state hash or an alert. `extract_relevant` still
     drops the check-out day and past nights from whatever the grid returns."""
-    last_night = end - timedelta(days=1) if end > start else start
-    if last_night < today:
+    bounds = night_span_bounds(start, end, today, POLL_HORIZON_MONTHS)
+    if bounds is None:
         return None
-    first = max(start, today)
-    horizon = horizon_date(today)
-    if first > horizon:
-        return None
+    first, last_night, horizon = bounds
     return first, min(last_night, horizon)
 
 
@@ -350,38 +345,13 @@ def poll_facility(
     }
     body = grid_body(facility_id, first, last)
     label = f"{campground_id}/{first.isoformat()}"
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.post(url, headers=headers, json=body)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{label}: {exc!r}"
-        if status == 200:
-            try:
-                data = resp.json()
-            except ValueError:
-                failure = f"{label}: invalid JSON"
-                break
-            parsed = parse_grid(data, label=label)  # may raise FacilityTooLarge
-            if parsed is not None:
-                return parsed
-            failure = f"{label}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{label}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None:
-                    not_found.add(campground_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+    return fetch_with_backoff(
+        lambda: http.post(url, headers=headers, json=body),
+        lambda data: parse_grid(data, label=label),  # may raise FacilityTooLarge
+        label=label,
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        not_found=not_found, not_found_id=campground_id,
+    )
 
 
 # --- the conformer --------------------------------------------------------
@@ -463,38 +433,13 @@ class UseDirectProvider:
         # since extract_relevant is the one entry point that runs inside per-watch
         # containment and can therefore report it as this watch's own failure.
         parse_campground_id(str(watch["campground_id"]))
-        keys = self.poll_plan(watch, today)
-        if not keys:
-            return None
-        parsed = availability.get(keys[0])
-        if parsed is None:
-            return None
-
-        start = as_date(watch["start_date"])
-        end = as_date(watch["end_date"])
-        wanted = {str(s) for s in (watch.get("site_ids") or [])}
-
-        current: dict[str, dict] = {}
-        for site_id, site in parsed.items():
-            # Matched on the stable UnitId alone (the shared-shape key and
-            # campsite_id are both it), never the `Name` label: the client
-            # persists the UnitId in `site_ids` and the label is display only.
-            if wanted and not ({site_id, site["campsite_id"]} & wanted):
-                continue
-            open_dates = sorted(
-                d
-                for d, open_night in site["availabilities"].items()
-                if open_night
-                and as_date(d) >= today
-                and date_in_watch(as_date(d), start, end)
-            )
-            if open_dates:
-                current[site_id] = {
-                    "campsite_id": site["campsite_id"],
-                    "site": site["site"],
-                    "dates": open_dates,
-                }
-        return current
+        # Matched on the stable UnitId alone (the shared-shape key and campsite_id
+        # are both it), never the `Name` label: the client persists the UnitId in
+        # `site_ids` and the label is display only. No exclusion — see above and
+        # the module docstring on `IsAda`.
+        return single_unit_open_sites(
+            availability, self.poll_plan(watch, today), watch, today
+        )
 
     def booking_url(self, watch: dict, openings: list[dict]) -> str:
         """The tenant's public booking site. Like going_to_camp's park-and-dates

@@ -42,9 +42,15 @@ from urllib.parse import urlencode
 
 import httpx
 
-from common import as_date, capped_line, date_in_watch
+from common import as_date, capped_line
 
-from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
+from .base import (
+    PollKey,
+    fetch_with_backoff,
+    horizon_month_start,
+    night_span_bounds,
+    single_unit_open_sites,
+)
 
 # The one host this provider talks to. A code constant, never provider_ref.
 HOST = "washington.goingtocamp.com"
@@ -210,8 +216,7 @@ def provider_ref_ids(watch: dict) -> tuple[int, int]:
 def horizon_date(today: date) -> date:
     """First-of-month containing today + POLL_HORIZON_MONTHS: a stay starting
     after it is not polled yet."""
-    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
-    return date(today.year + years, month0 + 1, 1)
+    return horizon_month_start(today, POLL_HORIZON_MONTHS)
 
 
 def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
@@ -233,13 +238,10 @@ def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:
     all, so its check-out day stays in the request (it is what the booking
     search is given) and is dropped from the result by `date_in_watch`, exactly
     as the other conformer drops it from a month it polled anyway."""
-    last_night = end - timedelta(days=1) if end > start else start
-    if last_night < today:
+    bounds = night_span_bounds(start, end, today, POLL_HORIZON_MONTHS)
+    if bounds is None:
         return None
-    first = max(start, today)
-    horizon = horizon_date(today)
-    if first > horizon:
-        return None
+    first, _last_night, horizon = bounds
     return first, max(min(end, horizon), first)
 
 
@@ -353,38 +355,13 @@ def fetch_map(
         "equipmentCategoryId": EQUIPMENT_CATEGORY_ID,
     }
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.get(AVAILABILITY_URL, params=params, headers=headers)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{label}: {exc!r}"
-        if status == 200:
-            try:
-                body = resp.json()
-            except ValueError:
-                failure = f"{label}: invalid JSON"
-                break
-            parsed = parse_map(body, start, end)
-            if parsed is not None:
-                return parsed
-            failure = f"{label}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{label}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None and not_found_id is not None:
-                    not_found.add(not_found_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+    return fetch_with_backoff(
+        lambda: http.get(AVAILABILITY_URL, params=params, headers=headers),
+        lambda body: parse_map(body, start, end),
+        label=label,
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        not_found=not_found, not_found_id=not_found_id,
+    )
 
 
 def poll_park(
@@ -1052,16 +1029,6 @@ class GoingToCampProvider:
         # extract_relevant is the one entry point that runs inside per-watch
         # containment and can therefore report it as this watch's own failure.
         provider_ref_ids(watch)
-        keys = self.poll_plan(watch, today)
-        if not keys:
-            return None
-        parsed = availability.get(keys[0])
-        if parsed is None:
-            return None
-
-        start = as_date(watch["start_date"])
-        end = as_date(watch["end_date"])
-        wanted = {str(s) for s in (watch.get("site_ids") or [])}
         # The per-watch opt-in, read the way the drift guard's WARN
         # classification of this column requires: `.get` with a default, so a
         # live DB that has not had 0003 applied yet reads exactly what a
@@ -1070,48 +1037,36 @@ class GoingToCampProvider:
         # this is the deliberate behaviour change the migration documents.
         include_ada_only = bool(watch.get("include_ada_only"))
 
-        current: dict[str, dict] = {}
-        for resource_id, site in parsed.items():
-            # Matched on the stable identifiers alone. `site` carries the
-            # catalog label, which reverts to the resourceId whenever the
-            # catalog fetch fails, so a watch naming labels would match every
-            # site on a healthy cycle and none at all on a degraded one —
-            # openings suppressed with nothing the user can see. The label is
-            # for display; the resourceId is the identity, and it is the
-            # resourceId the client persists in `site_ids` for a per-site
-            # GoingToCamp watch while showing the label.
-            if wanted and not ({resource_id, site["campsite_id"]} & wanted):
-                continue
-            # "ADA Only" on this platform means only campers with disabilities
-            # may reserve the site, so it is not an opening for a watch that
-            # did not ask for it — the platform's own search excludes these by
-            # default too. Three rules make that safe:
-            #   * it runs AFTER the `wanted` match, and only for an undirected
-            #     watch: a watch that named this site chose it deliberately and
-            #     the filter must not overrule the choice.
-            #   * it runs BEFORE the caller hashes this shape, so an ADA-only
-            #     site opening and closing is not a delta at all — no phantom
-            #     state_hash churn, no `sent_alerts` row, no `watches` write.
-            #   * it fails open: only a site the catalog positively marked
-            #     carries the flag (see `apply_site_metadata`), so a catalog
-            #     this cycle could not read suppresses nothing. A suppressed
-            #     opening is invisible to the user; a surplus one is only noise.
-            if site.get("ada_only") and not include_ada_only and not wanted:
-                continue
-            open_dates = sorted(
-                d
-                for d, open_night in site["availabilities"].items()
-                if open_night
-                and as_date(d) >= today
-                and date_in_watch(as_date(d), start, end)
-            )
-            if open_dates:
-                current[resource_id] = {
-                    "campsite_id": site["campsite_id"],
-                    "site": site["site"],
-                    "dates": open_dates,
-                }
-        return current
+        # Sites are matched on the stable identifiers alone (`single_unit_open_sites`
+        # does the id-only match). `site` carries the catalog label, which reverts
+        # to the resourceId whenever the catalog fetch fails, so a watch naming
+        # labels would match every site on a healthy cycle and none at all on a
+        # degraded one — openings suppressed with nothing the user can see. The
+        # label is for display; the resourceId is the identity, and it is the
+        # resourceId the client persists in `site_ids` for a per-site GoingToCamp
+        # watch while showing the label.
+        #
+        # The `exclude` predicate is the "ADA Only" exclusion: on this platform
+        # that means only campers with disabilities may reserve the site, so it is
+        # not an opening for a watch that did not ask for it — the platform's own
+        # search excludes these by default too. Three rules make that safe:
+        #   * it runs AFTER the `wanted` match (relevant_open_sites applies it
+        #     there) and only for an undirected watch (`not wanted`, the wanted-set
+        #     the helper passes in): a watch that named this site chose it
+        #     deliberately and the filter must not overrule the choice.
+        #   * it runs BEFORE the caller hashes this shape, so an ADA-only site
+        #     opening and closing is not a delta at all — no phantom state_hash
+        #     churn, no `sent_alerts` row, no `watches` write.
+        #   * it fails open: only a site the catalog positively marked carries the
+        #     flag (see `apply_site_metadata`), so a catalog this cycle could not
+        #     read suppresses nothing. A suppressed opening is invisible to the
+        #     user; a surplus one is only noise.
+        return single_unit_open_sites(
+            availability, self.poll_plan(watch, today), watch, today,
+            exclude=lambda site, wanted: bool(
+                site.get("ada_only") and not include_ada_only and not wanted
+            ),
+        )
 
     def booking_url(self, watch: dict, openings: list[dict]) -> str:
         """The park's booking search, pre-filled with the watch's dates.
