@@ -18,7 +18,7 @@ from typing import Callable, Protocol, runtime_checkable
 
 import httpx
 
-from common import capped_line
+from common import as_date, capped_line, date_in_watch
 
 # One unit of polling work, opaque to the cycle apart from its first element.
 #
@@ -77,6 +77,34 @@ def night_span_bounds(
     if first > horizon:
         return None
     return first, last_night, horizon
+
+
+def open_dates_in_window(
+    availabilities: dict,
+    today: date,
+    start: date,
+    end: date,
+    is_open: Callable[[object], bool] = bool,
+) -> list[str]:
+    """The sorted ISO dates in `availabilities` that are open and fall inside
+    the watch's remaining, in-window nights.
+
+    `availabilities` maps an ISO date to the provider's own per-night openness
+    value, and `is_open` decides open from it — a plain bool for the
+    boolean-shaped grids (going_to_camp, use_direct), a status test for
+    recreation.gov (`status == "Available"`). A date is kept only when it is not
+    in the past (`>= today`) and lies within the stay (`date_in_watch`): this is
+    the one date-window filter every conformer's `extract_relevant` applies
+    before hashing or alerting, so past nights and the check-out day count
+    toward neither the state hash nor a push.
+    """
+    return sorted(
+        d
+        for d, value in availabilities.items()
+        if is_open(value)
+        and as_date(d) >= today
+        and date_in_watch(as_date(d), start, end)
+    )
 
 
 def fetch_with_backoff(

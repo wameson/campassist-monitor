@@ -42,9 +42,15 @@ from urllib.parse import urlencode
 
 import httpx
 
-from common import as_date, capped_line, date_in_watch
+from common import as_date, capped_line
 
-from .base import PollKey, fetch_with_backoff, horizon_month_start, night_span_bounds
+from .base import (
+    PollKey,
+    fetch_with_backoff,
+    horizon_month_start,
+    night_span_bounds,
+    open_dates_in_window,
+)
 
 # The one host this provider talks to. A code constant, never provider_ref.
 HOST = "washington.goingtocamp.com"
@@ -1069,12 +1075,8 @@ class GoingToCampProvider:
             #     opening is invisible to the user; a surplus one is only noise.
             if site.get("ada_only") and not include_ada_only and not wanted:
                 continue
-            open_dates = sorted(
-                d
-                for d, open_night in site["availabilities"].items()
-                if open_night
-                and as_date(d) >= today
-                and date_in_watch(as_date(d), start, end)
+            open_dates = open_dates_in_window(
+                site["availabilities"], today, start, end
             )
             if open_dates:
                 current[resource_id] = {

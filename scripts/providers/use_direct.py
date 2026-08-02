@@ -63,9 +63,14 @@ from typing import NamedTuple
 
 import httpx
 
-from common import as_date, date_in_watch
+from common import as_date
 
-from .base import PollKey, fetch_with_backoff, night_span_bounds
+from .base import (
+    PollKey,
+    fetch_with_backoff,
+    night_span_bounds,
+    open_dates_in_window,
+)
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
 # A platform-wide UseDirect constant, not a per-tenant value.
@@ -446,12 +451,8 @@ class UseDirectProvider:
             # persists the UnitId in `site_ids` and the label is display only.
             if wanted and not ({site_id, site["campsite_id"]} & wanted):
                 continue
-            open_dates = sorted(
-                d
-                for d, open_night in site["availabilities"].items()
-                if open_night
-                and as_date(d) >= today
-                and date_in_watch(as_date(d), start, end)
+            open_dates = open_dates_in_window(
+                site["availabilities"], today, start, end
             )
             if open_dates:
                 current[site_id] = {

@@ -16,9 +16,14 @@ from datetime import date, timedelta
 
 import httpx
 
-from common import as_date, date_in_watch
+from common import as_date
 
-from .base import PollKey, fetch_with_backoff, horizon_month_start
+from .base import (
+    PollKey,
+    fetch_with_backoff,
+    horizon_month_start,
+    open_dates_in_window,
+)
 
 AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground/{campground_id}/month"
 BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
@@ -209,12 +214,8 @@ class RecreationGovProvider:
         for cs_id, cs in merged.items():
             if wanted and not ({cs_id, cs["campsite_id"], cs["site"]} & wanted):
                 continue
-            open_dates = sorted(
-                d
-                for d, status in cs["dates"].items()
-                if status == "Available"
-                and as_date(d) >= today
-                and date_in_watch(as_date(d), start, end)
+            open_dates = open_dates_in_window(
+                cs["dates"], today, start, end, lambda status: status == "Available"
             )
             if open_dates:
                 current[cs_id] = {
