@@ -65,7 +65,7 @@ import httpx
 
 from common import as_date, date_in_watch
 
-from .base import PollKey, fetch_with_backoff
+from .base import PollKey, fetch_with_backoff, horizon_month_start
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
 # A platform-wide UseDirect constant, not a per-tenant value.
@@ -186,8 +186,7 @@ def parse_campground_id(campground_id: str) -> tuple[Tenant, int]:
 def horizon_date(today: date) -> date:
     """First-of-month containing today + POLL_HORIZON_MONTHS: a stay starting
     after it is not polled yet."""
-    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
-    return date(today.year + years, month0 + 1, 1)
+    return horizon_month_start(today, POLL_HORIZON_MONTHS)
 
 
 def poll_range(start: date, end: date, today: date) -> tuple[date, date] | None:

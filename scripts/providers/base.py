@@ -40,6 +40,20 @@ BACKOFF_DELAYS_SECONDS = [2, 4, 8]
 RETRYABLE_STATUS = {403, 429}
 
 
+def horizon_month_start(today: date, horizon_months: int) -> date:
+    """First-of-month containing today + `horizon_months` — the last month a
+    provider's poll plan may include.
+
+    Shared because every conformer polls to the same rolling horizon with the
+    same month-rollover arithmetic (the `divmod` carries December into the next
+    year); centralizing it keeps that one non-obvious calculation in one place.
+    Each conformer names it in its own vocabulary and passes its own
+    POLL_HORIZON_MONTHS.
+    """
+    years, month0 = divmod(today.month - 1 + horizon_months, 12)
+    return date(today.year + years, month0 + 1, 1)
+
+
 def fetch_with_backoff(
     request: Callable[[], httpx.Response],
     parse: Callable[[object], object],

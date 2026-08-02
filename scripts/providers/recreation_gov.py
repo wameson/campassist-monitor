@@ -18,7 +18,7 @@ import httpx
 
 from common import as_date, date_in_watch
 
-from .base import PollKey, fetch_with_backoff
+from .base import PollKey, fetch_with_backoff, horizon_month_start
 
 AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground/{campground_id}/month"
 BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
@@ -31,8 +31,7 @@ POLL_HORIZON_MONTHS = 12
 def horizon_month(today: date) -> date:
     """First-of-month containing today + POLL_HORIZON_MONTHS: the last
     month the poll plan may include."""
-    years, month0 = divmod(today.month - 1 + POLL_HORIZON_MONTHS, 12)
-    return date(today.year + years, month0 + 1, 1)
+    return horizon_month_start(today, POLL_HORIZON_MONTHS)
 
 
 def months_for_watch(start: date, end: date, today: date) -> list[date]:
