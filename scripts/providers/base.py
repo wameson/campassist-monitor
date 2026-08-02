@@ -149,6 +149,44 @@ def relevant_open_sites(
     return current
 
 
+def single_unit_open_sites(
+    availability: dict,
+    keys: list[PollKey],
+    watch: dict,
+    today: date,
+    *,
+    exclude: Callable[[dict, set[str]], bool] | None = None,
+) -> dict[str, dict] | None:
+    """The watch's current open-site state for a provider whose whole poll is a
+    single unit (going_to_camp, use_direct), or None when that unit failed this
+    cycle — so the caller keeps the old state_hash and retries next run.
+
+    `keys` is the watch's own `poll_plan` output: empty means there is nothing
+    to poll yet (None), otherwise the one key's parsed result is read from
+    `availability`, where None is the failed-unit signal. The stay window and the
+    `site_ids` wanted-set are then derived the one way every conformer derives
+    them and handed to `relevant_open_sites`. This is the shared skeleton of the
+    two single-unit conformers' `extract_relevant`; each still runs its own
+    provider-ref backstop and supplies its own `exclude` before calling here.
+
+    `exclude`, when given, is the provider's site-hiding predicate and receives
+    `(site, wanted)` — going_to_camp's ADA-Only exclusion needs the wanted-set
+    this helper computes (it never hides a site the watch named). It is applied
+    exactly as `relevant_open_sites` documents: after the wanted match and before
+    the caller hashes the shape.
+    """
+    if not keys:
+        return None
+    parsed = availability.get(keys[0])
+    if parsed is None:
+        return None
+    start = as_date(watch["start_date"])
+    end = as_date(watch["end_date"])
+    wanted = {str(s) for s in (watch.get("site_ids") or [])}
+    site_exclude = None if exclude is None else (lambda site: exclude(site, wanted))
+    return relevant_open_sites(parsed, wanted, today, start, end, exclude=site_exclude)
+
+
 def fetch_with_backoff(
     request: Callable[[], httpx.Response],
     parse: Callable[[object], object],

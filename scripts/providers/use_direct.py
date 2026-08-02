@@ -69,7 +69,7 @@ from .base import (
     PollKey,
     fetch_with_backoff,
     night_span_bounds,
-    relevant_open_sites,
+    single_unit_open_sites,
 )
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
@@ -433,22 +433,13 @@ class UseDirectProvider:
         # since extract_relevant is the one entry point that runs inside per-watch
         # containment and can therefore report it as this watch's own failure.
         parse_campground_id(str(watch["campground_id"]))
-        keys = self.poll_plan(watch, today)
-        if not keys:
-            return None
-        parsed = availability.get(keys[0])
-        if parsed is None:
-            return None
-
-        start = as_date(watch["start_date"])
-        end = as_date(watch["end_date"])
-        wanted = {str(s) for s in (watch.get("site_ids") or [])}
-
         # Matched on the stable UnitId alone (the shared-shape key and campsite_id
         # are both it), never the `Name` label: the client persists the UnitId in
         # `site_ids` and the label is display only. No exclusion — see above and
         # the module docstring on `IsAda`.
-        return relevant_open_sites(parsed, wanted, today, start, end)
+        return single_unit_open_sites(
+            availability, self.poll_plan(watch, today), watch, today
+        )
 
     def booking_url(self, watch: dict, openings: list[dict]) -> str:
         """The tenant's public booking site. Like going_to_camp's park-and-dates
