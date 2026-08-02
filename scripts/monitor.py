@@ -470,6 +470,18 @@ def history_row(watch: dict, openings: list[dict], now: datetime) -> dict:
 
 # --- failure containment --------------------------------------------------
 
+def _response_body_dict(response) -> dict:
+    """A rejection's JSON body as a dict, or {} when it is missing, unparseable
+    or not an object. Only the response body is ever read — never the request,
+    whose headers carry the service-role key — which is the rule every reader of
+    a PostgREST rejection here shares."""
+    try:
+        body = response.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
 def rejection_reason(response, *, safe: bool) -> str:
     """The server's own account of why a request was rejected: PostgREST answers
     a bad write with a JSON body naming the column, constraint or payload at
@@ -482,15 +494,11 @@ def rejection_reason(response, *, safe: bool) -> str:
     `details`/`hint`, which on a constraint violation echo the offending key
     values (e.g. `Key (watch_id, …)=(…)`), for the operator-only Action log.
     """
-    try:
-        body = response.json()
-    except Exception:
-        body = None
-    if isinstance(body, dict):
-        keys = ("message",) if safe else ("message", "details", "hint")
-        parts = [str(body[key]) for key in keys if body.get(key)]
-        if parts:
-            return " ".join(parts)
+    body = _response_body_dict(response)
+    keys = ("message",) if safe else ("message", "details", "hint")
+    parts = [str(body[key]) for key in keys if body.get(key)]
+    if parts:
+        return " ".join(parts)
     if safe:
         return ""  # an opaque body could hold anything; keep it out of the row
     try:
@@ -566,12 +574,8 @@ def rejects_missing_column(exc: BaseException, column: str) -> bool:
     """
     if not is_permanent_failure(exc):
         return False
-    response = getattr(exc, "response", None)
-    try:
-        body = response.json()
-    except Exception:
-        return False
-    if not isinstance(body, dict) or str(body.get("code")) not in WRITE_MISSING_COLUMN_CODES:
+    body = _response_body_dict(getattr(exc, "response", None))
+    if str(body.get("code")) not in WRITE_MISSING_COLUMN_CODES:
         return False
     return column in str(body.get("message") or "")
 
