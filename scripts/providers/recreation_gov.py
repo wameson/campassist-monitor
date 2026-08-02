@@ -33,20 +33,15 @@ POLL_HORIZON_MONTHS = 12
 
 # --- poll plan ------------------------------------------------------------
 
-def horizon_month(today: date) -> date:
-    """First-of-month containing today + POLL_HORIZON_MONTHS: the last
-    month the poll plan may include."""
-    return horizon_month_start(today, POLL_HORIZON_MONTHS)
-
-
 def months_for_watch(start: date, end: date, today: date) -> list[date]:
     """First-of-month dates covering the stay's remaining nights — one API
     call each. The check-out day's month is not polled, and months entirely
     in the past or beyond the polling horizon (today + POLL_HORIZON_MONTHS)
     are skipped; a watch wholly beyond the horizon yields no months until
-    the horizon reaches it."""
+    the horizon reaches it. The horizon is the first-of-month containing
+    today + POLL_HORIZON_MONTHS — the last month the poll plan may include."""
     last_night = end - timedelta(days=1) if end > start else start
-    last_month = min(last_night, horizon_month(today))
+    last_month = min(last_night, horizon_month_start(today, POLL_HORIZON_MONTHS))
     months = []
     cur = max(start, today).replace(day=1)
     while cur <= last_month:
