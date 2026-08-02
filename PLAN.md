@@ -51,9 +51,10 @@ campassist-monitor (GitHub, PUBLIC since 2026-08-01)
 ```
 
 > **Phase 17 changes the *trigger*, not this topology.** The poll keeps running on GitHub
-> Actions — the one egress path proven to reach GoingToCamp — and is meant to stop being fired by
-> GitHub's best-effort `schedule` cron (which drifts 1–3 h): an **AWS EventBridge Scheduler fires
-> on the exact wall clock and calls `monitor.yml`'s `workflow_dispatch`** (captain, 2026-07-31).
+> Actions — the one egress path proven to reach GoingToCamp — with its **primary trigger now an
+> AWS EventBridge Scheduler that fires on the exact wall clock and calls `monitor.yml`'s
+> `workflow_dispatch`** (captain, 2026-07-31), fixing the 1–3 h drift of GitHub's best-effort
+> `schedule` cron, which is **retained as the offset backstop** and keeps firing by design.
 > AWS never talks to GoingToCamp; the diagram above — the poll, Supabase, APNs, the six secrets in
 > GitHub Actions Secrets — is unchanged. **Status: live.** The AWS trigger fires `workflow_dispatch`
 > on the exact wall clock (Phase B done — the run history shows dispatches at exactly `:00`/`:30`),
