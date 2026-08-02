@@ -16,9 +16,9 @@ from datetime import date, timedelta
 
 import httpx
 
-from common import as_date, capped_line, date_in_watch
+from common import as_date, date_in_watch
 
-from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
+from .base import PollKey, fetch_with_backoff
 
 AVAILABILITY_URL = "https://www.recreation.gov/api/camps/availability/campground/{campground_id}/month"
 BOOKING_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{campsite_id}"
@@ -124,38 +124,13 @@ def poll_with_backoff(
     url = AVAILABILITY_URL.format(campground_id=campground_id)
     params = {"start_date": f"{month.isoformat()}T00:00:00.000Z"}
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.get(url, params=params, headers=headers)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{campground_id}/{month.isoformat()}: {exc!r}"
-        if status == 200:
-            try:
-                body = resp.json()
-            except ValueError:
-                failure = f"{campground_id}/{month.isoformat()}: invalid JSON"
-                break
-            parsed = parse_availability(body)
-            if parsed is not None:
-                return parsed
-            failure = f"{campground_id}/{month.isoformat()}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{campground_id}/{month.isoformat()}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None:
-                    not_found.add(campground_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+    return fetch_with_backoff(
+        lambda: http.get(url, params=params, headers=headers),
+        parse_availability,
+        label=f"{campground_id}/{month.isoformat()}",
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        not_found=not_found, not_found_id=campground_id,
+    )
 
 
 # --- the conformer --------------------------------------------------------

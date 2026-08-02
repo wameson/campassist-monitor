@@ -14,7 +14,11 @@ so no provider may ever derive a host, URL or path from it (SSRF).
 from __future__ import annotations
 
 from datetime import date
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
+
+import httpx
+
+from common import capped_line
 
 # One unit of polling work, opaque to the cycle apart from its first element.
 #
@@ -34,6 +38,68 @@ PollKey = tuple[str, object]
 # after 2 s, 4 s, 8 s and then given up on for this cycle.
 BACKOFF_DELAYS_SECONDS = [2, 4, 8]
 RETRYABLE_STATUS = {403, 429}
+
+
+def fetch_with_backoff(
+    request: Callable[[], httpx.Response],
+    parse: Callable[[object], object],
+    *,
+    label: str,
+    sleep,
+    errors: list[str] | None,
+    budget_exhausted,
+    not_found: set[str] | None,
+    not_found_id: str | None,
+):
+    """One poll unit with the backoff every conformer shares: run `request`,
+    and on a 403/429/5xx retry after 2 s, 4 s, 8 s, then give up for this cycle
+    (return None) so the rest of the run continues.
+
+    A 200 whose body is invalid JSON, or whose `parse(body)` cannot recognize a
+    shape, is a NON-retryable failure — the unit counts as failed, never as "no
+    availability". A 404 records `not_found_id` into `not_found` (when both are
+    given) so the caller can drive the cycle's 404-strike lifecycle; a caller
+    that must not strike on 404 (going_to_camp's child maps) passes
+    `not_found_id=None`. Once `budget_exhausted()` reports the time budget spent,
+    remaining retries and their sleeps are skipped.
+
+    `request` and `parse` are the only provider-specific parts: `request` does
+    the GET/POST (its host/URL a pinned constant, never derived from a
+    client-writable value — SSRF), and `parse` is the conformer's own body
+    parser, which may itself raise a permanent per-unit fault (use_direct's
+    FacilityTooLarge) — such a raise propagates, unlike a returned None.
+    """
+    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
+        try:
+            resp = request()
+            status = resp.status_code
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            status = None
+            failure = f"{label}: {exc!r}"
+        if status == 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                failure = f"{label}: invalid JSON"
+                break
+            parsed = parse(body)
+            if parsed is not None:
+                return parsed
+            failure = f"{label}: unrecognized response body"
+            break
+        if status is not None:
+            failure = f"{label}: HTTP {status}"
+            if not (status in RETRYABLE_STATUS or status >= 500):
+                if status == 404 and not_found is not None and not_found_id is not None:
+                    not_found.add(not_found_id)
+                break
+        if attempt < len(BACKOFF_DELAYS_SECONDS):
+            if budget_exhausted():
+                break
+            sleep(BACKOFF_DELAYS_SECONDS[attempt])
+    if errors is not None:
+        errors.append(capped_line(failure))
+    return None
 
 
 @runtime_checkable

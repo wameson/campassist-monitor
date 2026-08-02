@@ -44,7 +44,7 @@ import httpx
 
 from common import as_date, capped_line, date_in_watch
 
-from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
+from .base import PollKey, fetch_with_backoff
 
 # The one host this provider talks to. A code constant, never provider_ref.
 HOST = "washington.goingtocamp.com"
@@ -353,38 +353,13 @@ def fetch_map(
         "equipmentCategoryId": EQUIPMENT_CATEGORY_ID,
     }
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.get(AVAILABILITY_URL, params=params, headers=headers)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{label}: {exc!r}"
-        if status == 200:
-            try:
-                body = resp.json()
-            except ValueError:
-                failure = f"{label}: invalid JSON"
-                break
-            parsed = parse_map(body, start, end)
-            if parsed is not None:
-                return parsed
-            failure = f"{label}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{label}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None and not_found_id is not None:
-                    not_found.add(not_found_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+    return fetch_with_backoff(
+        lambda: http.get(AVAILABILITY_URL, params=params, headers=headers),
+        lambda body: parse_map(body, start, end),
+        label=label,
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        not_found=not_found, not_found_id=not_found_id,
+    )
 
 
 def poll_park(

@@ -63,9 +63,9 @@ from typing import NamedTuple
 
 import httpx
 
-from common import as_date, capped_line, date_in_watch
+from common import as_date, date_in_watch
 
-from .base import BACKOFF_DELAYS_SECONDS, RETRYABLE_STATUS, PollKey
+from .base import PollKey, fetch_with_backoff
 
 # The availability grid endpoint, appended to each tenant's `base`/`rdr_path`.
 # A platform-wide UseDirect constant, not a per-tenant value.
@@ -350,38 +350,13 @@ def poll_facility(
     }
     body = grid_body(facility_id, first, last)
     label = f"{campground_id}/{first.isoformat()}"
-
-    for attempt in range(len(BACKOFF_DELAYS_SECONDS) + 1):
-        try:
-            resp = http.post(url, headers=headers, json=body)
-            status = resp.status_code
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            status = None
-            failure = f"{label}: {exc!r}"
-        if status == 200:
-            try:
-                data = resp.json()
-            except ValueError:
-                failure = f"{label}: invalid JSON"
-                break
-            parsed = parse_grid(data, label=label)  # may raise FacilityTooLarge
-            if parsed is not None:
-                return parsed
-            failure = f"{label}: unrecognized response body"
-            break
-        if status is not None:
-            failure = f"{label}: HTTP {status}"
-            if not (status in RETRYABLE_STATUS or status >= 500):
-                if status == 404 and not_found is not None:
-                    not_found.add(campground_id)
-                break
-        if attempt < len(BACKOFF_DELAYS_SECONDS):
-            if budget_exhausted():
-                break
-            sleep(BACKOFF_DELAYS_SECONDS[attempt])
-    if errors is not None:
-        errors.append(capped_line(failure))
-    return None
+    return fetch_with_backoff(
+        lambda: http.post(url, headers=headers, json=body),
+        lambda data: parse_grid(data, label=label),  # may raise FacilityTooLarge
+        label=label,
+        sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+        not_found=not_found, not_found_id=campground_id,
+    )
 
 
 # --- the conformer --------------------------------------------------------
