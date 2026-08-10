@@ -256,10 +256,12 @@ def test_write_budget():
     summary, apns = run_cycle(db, payload)
     assert apns.alerts == []
     assert db.write_count <= 5
-    # exactly: 1 batched last_checked_at PATCH + 1 run_summaries INSERT + 2 retention DELETEs
+    # exactly: 1 batched last_checked_at PATCH + 1 run_summaries INSERT + 3 retention
+    # DELETEs (sent_alerts, run_summaries, alert_history). 100 watches < the 150-id
+    # chunk, so the PATCH is still a single request.
     assert len(db.calls_of("patch")) == 1
     assert len(db.calls_of("insert")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     assert summary["watches_checked"] == 100
     assert summary["campgrounds_polled"] == 1
 

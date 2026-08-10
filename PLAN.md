@@ -300,9 +300,14 @@ cannot be verified without a write. Both incidents to date were missing columns.
 
 ### Write budget
 A no-change cycle performs **≤5 Supabase writes** regardless of watch count: 1 batched
-`last_checked_at` PATCH, 1 `run_summaries` INSERT, 2 retention DELETEs. Enforced by
-`test_write_budget`. **Do not add per-watch writes** — the free tier is the constraint, and
-delta-only writing is what keeps ~200–500 writes/day at any scale instead of ~9,600.
+`last_checked_at` PATCH, 1 `run_summaries` INSERT, 3 retention DELETEs (`sent_alerts`,
+`run_summaries`, `alert_history`). Enforced by `test_write_budget`. **Do not add per-watch
+writes** — the free tier is the constraint, and delta-only writing is what keeps ~200–500
+writes/day at any scale instead of ~9,600. The `last_checked_at` PATCH is chunked into ≤150-id
+batches (`PATCH_ID_CHUNK_MAX`) so its `id=in.(…)` URL cannot outgrow a gateway URI limit as the
+fleet grows; a pool within one chunk is still the single write the budget assumes. The per-cycle
+monitoring read is column-scoped (`WATCH_READ_COLUMNS`, with a `select=*` fallback on a drifted
+DB) and keyset-paginated by `id` so a PostgREST `max-rows` cap cannot silently truncate it.
 
 ### Anti-blocking (jittered, polite)
 Random 0–20 s start delay per run; 1.2–2.8 s inter-request delays; randomized poll order;

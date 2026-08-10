@@ -80,8 +80,11 @@ def test_the_errored_population_is_reported_every_cycle():
     assert result["watch_errors"] == 0 and result["systemic_failure"] is False
     assert monitor.exit_code(result) == 0
 
-    # and it costs one select and no writes: the errored rows are never touched
-    assert db.calls_of("select", "watches")[1][2] == CENSUS_PARAMS
+    # and it costs one census select and no writes: the errored rows are never
+    # touched. (The monitoring read is paginated, so locate the census by its own
+    # status filter rather than by position among the watches selects.)
+    census = [c for c in db.calls_of("select", "watches") if c[2].get("status") == "eq.error"]
+    assert len(census) == 1 and census[0][2] == CENSUS_PARAMS
     assert not [c for c in db.calls_of("patch", "watches") if "w-dead" in str(c[2])]
 
 

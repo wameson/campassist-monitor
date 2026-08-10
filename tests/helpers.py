@@ -32,8 +32,17 @@ def load_fixture(name: str):
     return jsonlib.loads((FIXTURES / f"{name}.json").read_text())
 
 
+# PostgREST params that steer the query rather than filter rows; FakeDB.select
+# applies these itself so keyset pagination (order + limit + id=gt.<cursor>)
+# behaves like the real gateway. `select` is a projection column list, handled
+# separately too.
+_CONTROL_PARAMS = ("order", "limit", "offset", "select")
+
+
 def _matches(row: dict, params: dict | None) -> bool:
     for col, expr in (params or {}).items():
+        if col in _CONTROL_PARAMS:
+            continue
         op, _, arg = str(expr).partition(".")
         val = str(row.get(col))
         if op == "eq":
@@ -44,6 +53,9 @@ def _matches(row: dict, params: dict | None) -> bool:
                 return False
         elif op == "lt":
             if not val < arg:
+                return False
+        elif op == "gt":
+            if not val > arg:
                 return False
         elif op == "gte":
             if not val >= arg:
@@ -93,13 +105,24 @@ def postgrest_error(
 
 
 class FakeDB:
-    def __init__(self, tables: dict | None = None, fail_on=None):
+    def __init__(
+        self, tables: dict | None = None, fail_on=None, *, project=False, max_rows=None
+    ):
         self.tables: dict[str, list[dict]] = {t: [] for t in TABLES}
         for name, rows in (tables or {}).items():
             self.tables[name] = [dict(r) for r in rows]
         self.calls: list[tuple] = []
         # fail_on(call_tuple) -> exception to raise, or None to let it through
         self.fail_on = fail_on or (lambda call: None)
+        # When True, a select carrying a `select=col,col` projection returns only
+        # those columns (as real PostgREST does), so a cycle that reads a column
+        # its projection omits fails loudly in tests instead of silently seeing a
+        # `.get()` default. Off by default to keep other tests' rows intact.
+        self.project = project
+        # Emulates PostgREST's `max-rows` cap: every select returns at most this
+        # many rows regardless of the requested limit, so a test can prove the
+        # paginated read still returns the whole set instead of a truncated one.
+        self.max_rows = max_rows
 
     def _guard(self, call: tuple) -> None:
         """Raise for an injected fault after recording the attempt — a real
@@ -119,7 +142,22 @@ class FakeDB:
         call = ("select", table, params)
         self.calls.append(call)
         self._guard(call)
-        return [dict(r) for r in self.tables[table] if _matches(r, params)]
+        params = params or {}
+        rows = [dict(r) for r in self.tables[table] if _matches(r, params)]
+        order = params.get("order")
+        if order:
+            column = str(order).split(".")[0]
+            rows.sort(key=lambda r: str(r.get(column)))
+        limit = params.get("limit")
+        if limit is not None:
+            rows = rows[: int(limit)]
+        if self.max_rows is not None:
+            rows = rows[: self.max_rows]
+        projection = params.get("select")
+        if self.project and projection and projection != "*":
+            columns = [c for c in str(projection).split(",") if c]
+            rows = [{c: r[c] for c in columns if c in r} for r in rows]
+        return rows
 
     def insert(self, table, rows):
         call = ("insert", table, rows)

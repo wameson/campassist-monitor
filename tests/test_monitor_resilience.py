@@ -98,7 +98,7 @@ def test_isolated_write_failure_completes_the_cycle():
 
     # end-of-cycle bookkeeping still ran
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     assert result["watches_checked"] == 3  # the failed watch is not "checked"
 
     # isolated -> the run stays green, with the failure recorded as the log
@@ -305,7 +305,7 @@ def test_systemic_failure_exits_nonzero():
 
     # the summary row and pruning still run: the cycle reports, then fails
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     # systemic breakage is the operator's to fix, so the pool is left intact
     # rather than erroring every watch and making users recreate them
     assert all(r["status"] == "monitoring" for r in db.tables["watches"])
@@ -326,7 +326,7 @@ def test_summary_and_retention_failures_are_systemic():
     assert "run_summaries insert" in result["cycle_errors"]
     assert result["watch_errors"] == 0  # no watch is to blame
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
-    assert len(db.calls_of("delete")) == 2  # pruning still ran
+    assert len(db.calls_of("delete")) == 3  # pruning still ran
     assert "::error::" in monitor.failure_annotation(result)
     # the watches themselves were served normally
     assert all(r["last_checked_at"] is not None for r in db.tables["watches"])
@@ -482,7 +482,7 @@ def test_failing_to_mark_a_watch_errored_is_systemic():
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
     # the run still reported and pruned before going red
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
 
 
 @pytest.mark.parametrize(
@@ -706,7 +706,7 @@ def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
     # the cycle still served everyone and reached its end-of-cycle bookkeeping
     assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     assert monitor.exit_code(result) == 1  # every served watch failed: loud
 
 
@@ -735,7 +735,7 @@ def test_run_anchors_the_fanout_deadline_to_process_start():
     assert all(r["status"] == "monitoring" for r in db.tables["watches"])
     assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     assert monitor.exit_code(result) == 1
 
 
@@ -1033,7 +1033,7 @@ def test_prune_failure_makes_the_persisted_label_systemic():
     assert "(systemic)" in db.tables["run_summaries"][-1]["errors"]
     # the summary row and both prunes were still attempted before going red
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
 
 
 # --- Phase 2, finding 3: run_summaries.errors is sanitized -----------------

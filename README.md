@@ -304,8 +304,17 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 ## Operating notes
 
 - **Write budget:** a cycle with no availability changes performs ≤5 Supabase
-  writes (1 batched `last_checked_at` PATCH, 1 `run_summaries` INSERT, 2
-  retention DELETEs) regardless of watch count — enforced by `test_write_budget`.
+  writes (1 batched `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3
+  retention DELETEs — `sent_alerts`, `run_summaries`, `alert_history`)
+  regardless of watch count — enforced by `test_write_budget`. The `last_checked_at`
+  PATCH is one request per **chunk** of ≤150 ids (`PATCH_ID_CHUNK_MAX`), so a
+  pool small enough to fit one chunk is still a single write; larger pools are
+  chunked to keep each `id=in.(…)` URL under the gateway's URI limit.
+- **Reading the watch pool:** each cycle reads the monitoring set scoped to the
+  columns it uses (`monitor.WATCH_READ_COLUMNS`) and keyset-paginated by `id`, so
+  a PostgREST `max-rows` cap can never silently truncate it. On a live database
+  missing a WARN column the projection names (an unapplied migration), the scoped
+  read is rejected and the cycle falls back to the tolerant `select=*` read.
 - **Politeness / anti-blocking:** one rotating browser User-Agent per run,
   randomized campground order, 1.2–2.8 s inter-request delays, exponential
   backoff (2 s → 4 s → 8 s, then skip the campground for this cycle).
@@ -365,8 +374,9 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   write, a malformed row — is caught, recorded, and skipped; it never
   aborts the cycle. The other watches are still polled and alerted, and the
   run still writes its `run_summaries` row and prunes. Batched watch writes
-  (`id=in.(…)`) are attempted as one write, as the write budget assumes.
-  Only a *permanently* rejected batch (a PostgREST 4xx other than 429:
+  (`id=in.(…)`) are split into chunks of ≤150 ids and each chunk is attempted as
+  one write (a pool within one chunk is still the single write the budget
+  assumes). Only a *permanently* rejected batch (a PostgREST 4xx other than 429:
   missing column, constraint violation) falls back to one write per id, so a
   single unwritable row cannot silently drop everyone else's update. A
   transient batch failure (429, 5xx, timeout, transport error) is never
@@ -535,8 +545,17 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   is the operator's to fix, not something users should have to recreate
   their watches over. Failures before any of that — an unreachable Supabase,
   a malformed `APNS_P8_KEY`, a missing secret — still exit non-zero.
-- **Retention:** `sent_alerts` and `run_summaries` rows older than 30 days are
-  pruned every run.
+- **Retention:** `sent_alerts`, `run_summaries`, and `alert_history` rows older
+  than 30 days are pruned every run. (`alert_history` is otherwise unbounded — one
+  row per delivered push — so the app's Alert History shows the last 30 days.)
+- **Per-user watch cap:** a database trigger (`enforce_watch_cap`, in
+  `schema.sql` / migration `0008`) caps each user at **20 active watches**
+  (`status IN ('monitoring','paused')`; terminal `expired`/`error` rows never
+  count). It fires only when a row *enters* the active set, so the monitor's own
+  writes are never blocked. A breach is rejected with HTTP 400 and the hint
+  `WATCH_CAP_EXCEEDED` so the app can show a friendly message. It is a backend
+  abuse guardrail against a runaway client, not the primary cost control (the
+  cross-user dedup, chunked write, and scoped read are).
 - **Keep-alive:** GitHub disables cron workflows after 60 days without repo
   activity; `keepalive.yml` commits a timestamp monthly to prevent that.
 
