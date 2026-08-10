@@ -172,11 +172,11 @@ table is never opened to all. Dates are `DATE` and stored verbatim from the watc
 must treat them as timezone-independent calendar days (do **not** re-introduce the Issue 1
 UTC-vs-local shift on read).
 
-**Retention:** not pruned in this build (unlike `sent_alerts`/`run_summaries`) — history is
-meant to persist for the user, and adding a per-cycle prune would spend the last slot of the
-≤5-write no-change budget. Delivered-alert volume is low (one row per delivered push, deduped
-by the alert cooldown), so growth is bounded in practice; a retention prune can be added later
-if needed.
+**Retention:** pruned on the shared `RETENTION_DAYS` (30-day) window alongside
+`sent_alerts`/`run_summaries` (added 2026-08-10; it was previously unbounded, one row per
+delivered push forever). That prune is the third and last retention DELETE, keeping the
+no-change cycle at exactly the ≤5-write budget. Delivered-alert volume is low (deduped by the
+alert cooldown), so the app's Alert History still shows the last 30 days.
 
 ### Migrations
 
@@ -189,6 +189,7 @@ if needed.
 | `0005_alert_history.sql` | `alert_history` table + RLS policy | `WARN` (write-only, fully contained — an unapplied migration keeps monitoring) |
 | `0006_watches_flexible_dates.sql` | `date_mode`, `flex_min_nights`, `flex_max_nights` | `WARN` (read via `.get` with a `'fixed'`/None default — unmigrated DB reads every watch as fixed) |
 | `0007_watches_provider_use_direct.sql` | widens the `provider` CHECK to admit `'use_direct'` (no new column) | n/a — no column, so `preflight.REQUIRED` is unchanged |
+| `0008_watches_user_cap.sql` | `enforce_watch_cap` trigger — caps each user at 20 active watches (`status IN ('monitoring','paused')`), rejecting a breach with `check_violation`/hint `WATCH_CAP_EXCEEDED` | n/a — a trigger, not a column, so `preflight.REQUIRED` is unchanged (like `0007`) |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
 deliberate.** There is no auto-apply anywhere: not in CI, not in the monitor, not behind a
