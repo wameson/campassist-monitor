@@ -1,7 +1,14 @@
 name: Monitor Campsites
 on:
-  schedule:
-    - cron: '*/30 * * * *'
+  # GitHub's built-in cron is DORMANT (not deleted). AWS EventBridge Scheduler
+  # drives the poll on the exact wall clock by firing the workflow_dispatch path
+  # below via trigger_lambda.py (PLAN.md Phase 17). Running both duplicated ~a
+  # quarter of polls, and GitHub's schedule drops runs under load, so it is the
+  # less reliable of the two. To restore the 30-minute GitHub cron, uncomment the
+  # two lines below. Do NOT `gh workflow disable` this workflow: that would also
+  # kill workflow_dispatch, silently stopping ALL monitoring.
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:

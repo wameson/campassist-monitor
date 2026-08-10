@@ -31,7 +31,7 @@ per cycle.
 
 ```
 campassist-monitor (GitHub, PUBLIC since 2026-08-01)
-  .github/workflows/monitor.yml   cron */30 + workflow_dispatch, timeout-minutes: 15
+  .github/workflows/monitor.yml   workflow_dispatch (EventBridge-driven); schedule cron dormant, timeout-minutes: 15
     ├── preflight: read-only schema-drift probe (before the jitter)
     ├── start jitter: sleep rand(0–20s)
     ├── read status=eq.monitoring watches + errored-watch census
@@ -54,12 +54,13 @@ campassist-monitor (GitHub, PUBLIC since 2026-08-01)
 > Actions — the one egress path proven to reach GoingToCamp — with its **primary trigger now an
 > AWS EventBridge Scheduler that fires on the exact wall clock and calls `monitor.yml`'s
 > `workflow_dispatch`** (captain, 2026-07-31), fixing the 1–3 h drift of GitHub's best-effort
-> `schedule` cron, which is **retained as the offset backstop** and keeps firing by design.
-> AWS never talks to GoingToCamp; the diagram above — the poll, Supabase, APNs, the six secrets in
-> GitHub Actions Secrets — is unchanged. **Status: live.** The AWS trigger fires `workflow_dispatch`
-> on the exact wall clock (Phase B done — the run history shows dispatches at exactly `:00`/`:30`),
-> with the GitHub `schedule` cron kept running alongside it as the offset backstop; Phase C
-> (thinning that backstop) is optional and not done, so both triggers run by design (see Phase 17).
+> `schedule` cron. AWS never talks to GoingToCamp; the diagram above — the poll, Supabase, APNs,
+> the six secrets in GitHub Actions Secrets — is unchanged. **Status: live.** The AWS trigger fires
+> `workflow_dispatch` on the exact wall clock (Phase B done — the run history shows dispatches at
+> exactly `:00`/`:30`). The GitHub `schedule` cron that ran alongside it as an offset backstop has
+> since been made **dormant** (commented out in `monitor.yml`, 2026-08-10): running both duplicated
+> ~a quarter of polls and GitHub's cron dropped runs under load, so EventBridge is now the sole
+> trigger. Re-enabling is a one-line uncomment; Phase C (thinning the backstop) is thus moot.
 > Two earlier plans that tried to move the *poll itself* off Actions (AWS Lambda, then Azure
 > Container Apps Jobs) were both refused by GoingToCamp's Azure Front Door WAF; see Phase 17
 > "Approaches tried and rejected." A later step (Phase D) flipped the repo **public on 2026-08-01**,
@@ -110,7 +111,7 @@ the plan.
 
 | Layer | Choice | Why |
 |---|---|---|
-| Scheduling | **Trigger (live, Phase 17):** an **AWS EventBridge Scheduler** → `workflow_dispatch` fires on the exact wall clock, with the Actions `schedule` cron `*/30` kept as the offset backstop (it still drifts 1–3 h). **Execution:** GitHub Actions, unchanged | GitHub's `schedule` is best-effort; an exact scheduler fires on the minute while the poll stays on the only accepted egress |
+| Scheduling | **Trigger (live, Phase 17):** an **AWS EventBridge Scheduler** → `workflow_dispatch` fires on the exact wall clock — now the **sole** trigger. The Actions `schedule` cron `*/30` that ran as an offset backstop is **dormant** (commented out, 2026-08-10; one-line uncomment to restore). **Execution:** GitHub Actions, unchanged | GitHub's `schedule` is best-effort; an exact scheduler fires on the minute while the poll stays on the only accepted egress |
 | Language | Python 3.12 | available on Actions and in a `python:3.12-slim` container, no build step |
 | HTTP | `httpx[http2]` | HTTP/2 is required for APNs |
 | APNs auth | `PyJWT` + `cryptography` | ES256 JWT signed with the `.p8` key |
@@ -682,7 +683,7 @@ A summary INSERT that itself fails is the one unrepresentable case — there is 
 **Build:**
 - [x] Supabase project created; schema SQL applied; RLS policies active; Anonymous Sign-In enabled
 - [x] `campassist-monitor` **private** repo: `scripts/monitor.py` (jittered polling, dedupe, delta, cooldown, expiry, pruning), `scripts/apns.py`, `scripts/db.py`, `requirements.txt`
-- [x] `monitor.yml` (30-min cron + `workflow_dispatch`), `keepalive.yml`, `ci.yml` (pytest on PR)
+- [x] `monitor.yml` (`workflow_dispatch`, EventBridge-driven; 30-min `schedule` cron dormant since 2026-08-10), `keepalive.yml`, `ci.yml` (pytest on PR)
 - [x] All 6 GitHub Secrets configured; setup documented in README
 
 **Tests (pytest, all must pass in CI):**
@@ -930,11 +931,11 @@ Layered on the shared availability shape **after** `extract_relevant` and **befo
 and the **exact-time trigger is firing in production**: the run history shows `workflow_dispatch`
 runs landing at exactly `:00` and `:30` every 30 min (e.g. `2026-08-02T00:00:14Z`,
 `23:30:15Z`, `23:00:14Z`, … — no gaps), which only the AWS Lambda can produce. The GitHub
-`schedule` cron is **deliberately kept running alongside it** as the offset backstop (its runs
-still drift — `23:26`, `22:25`, `21:22`, … — which is exactly why the exact-time trigger exists).
-**Both triggers running is the designed Phase-B state, not a defect.** Phase C — thinning the
-`schedule` backstop to hourly — is marked optional below and is **not** done, so the cron stays
-at `*/30`. (Verify anytime with `gh run list --workflow monitor.yml`; the AWS resources
+`schedule` cron ran alongside it as an offset backstop through Phase B, but was made **dormant
+on 2026-08-10** (commented out in `monitor.yml`): running both duplicated ~a quarter of polls and
+GitHub's cron dropped runs under load, so EventBridge is now the **sole** trigger. Phase C —
+thinning the `schedule` backstop to hourly — is therefore moot; re-enabling the cron is a one-line
+uncomment. (Verify the live trigger anytime with `gh run list --workflow monitor.yml`; the AWS resources
 themselves live in the captain's account and are not visible from a repo clone — their absence
 from the clone is not evidence they are undeployed.)
 
@@ -945,7 +946,8 @@ intended 48 — because GitHub's `schedule` trigger is best-effort and is delaye
 under load. Alerts therefore lagged openings by hours, and catching a cancellation fast is the
 whole product. The fix, **now live**, is to stop firing the poll from GitHub's best-effort
 `schedule`: an **AWS EventBridge Scheduler fires on the exact wall clock and calls
-`monitor.yml`'s `workflow_dispatch`** (the `schedule` cron stays on as the offset backstop),
+`monitor.yml`'s `workflow_dispatch`** (the `schedule` cron ran as an offset backstop through
+Phase B, now dormant — see above),
 while the poll itself keeps running on GitHub Actions — the one egress path proven to reach
 GoingToCamp. **AWS never talks to GoingToCamp; it only tells GitHub when to run.**
 
@@ -1097,10 +1099,12 @@ email is ever sent, because no run happens.** This is the same silent-miss class
 budget-exhaustion bug: a normal Actions failure email covers a run that *runs and fails*, not
 a *trigger that never fires*. Three complementary layers, all within free tiers:
 
-1. **Keep `schedule` as a low-frequency backstop.** Leave a `schedule` entry (at `*/30`, or
-   thinned to hourly), **offset** (e.g. minute `:07`) so it rarely coincides with the
-   exact-time trigger. If the AWS trigger dies, the monitor **degrades to today's best-effort
-   cadence, not to zero.** (This is also why the repo change is nearly nil — see below.)
+1. ~~**Keep `schedule` as a low-frequency backstop.**~~ **Retired 2026-08-10.** The `schedule`
+   cron was made dormant (commented out in `monitor.yml`) because running it alongside the
+   EventBridge trigger duplicated ~a quarter of polls and GitHub's cron dropped runs under
+   load. If the AWS trigger dies the monitor now degrades to **zero**, not to best-effort
+   cadence — so silent-miss coverage rests on layers 2 and 3 below. Re-enabling this backstop
+   is a one-line uncomment of the `schedule:` block.
 2. **AWS heartbeat alarm.** A CloudWatch alarm on the trigger Lambda's `Invocations` metric —
    `Sum < 1` over a window (e.g. 45 min), **treat-missing-data = breaching** → SNS email.
    Catches "Scheduler stopped invoking." One of the 10 always-free alarms.
@@ -1165,9 +1169,10 @@ exactly what the Azure two-host plan lacked. So Path A needs **no staggered para
 window**; the trigger can be added while `schedule` keeps running, with the concurrency guard
 doing the serialization for free.
 
-**Rollback is instant and zero-risk:** disable or delete the EventBridge schedule. The
-`schedule` backstop cron is still running and simply resumes as the sole trigger — the
-incumbent path never stops, so there is no cutover window and no data migration.
+**Rollback is instant and zero-risk:** disable or delete the EventBridge schedule, then
+uncomment the `schedule:` block in `monitor.yml` (dormant since 2026-08-10) so the GitHub cron
+resumes as the sole trigger. There is no data migration; the only gap is between the two steps,
+which is why the cron is kept as a one-line uncomment rather than deleted.
 
 ### Ordered implementation steps
 
