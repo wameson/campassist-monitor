@@ -256,6 +256,38 @@ def test_alert_history_is_pruned_on_the_retention_window():
     assert len(pruned) == 1 and pruned[0][2]["delivered_at"].startswith("lt.")
 
 
+def test_alert_history_prune_failure_is_reported_but_never_reddens_the_run():
+    # alert_history is WARN-classified in preflight.REQUIRED: a database missing
+    # 0005 has no table to prune, and that must keep a quiet cycle GREEN, exactly
+    # like the insert path. The failure still surfaces in the run summary errors.
+    def fail_on(call):
+        if call[0] == "delete" and call[1] == "alert_history":
+            return postgrest_error(404, "relation \"alert_history\" does not exist")
+        return None
+
+    db = FakeDB({"watches": [make_watch()]}, fail_on=fail_on)
+    summary, _ = quiet_cycle(db)
+
+    assert summary["systemic_failure"] is False
+    assert monitor.exit_code(summary) == 0
+    assert "alert_history prune" in (summary["errors"] or "")
+
+
+def test_sent_alerts_prune_failure_reddens_the_run():
+    # Contrast with alert_history above: sent_alerts is a HALT table preflight
+    # guarantees exists, so its prune failing is genuine breakage and stays rated.
+    def fail_on(call):
+        if call[0] == "delete" and call[1] == "sent_alerts":
+            return postgrest_error(503, "upstream connect error")
+        return None
+
+    db = FakeDB({"watches": [make_watch()]}, fail_on=fail_on)
+    summary, _ = quiet_cycle(db)
+
+    assert summary["systemic_failure"] is True
+    assert monitor.exit_code(summary) == 1
+
+
 # --- 4. per-user active-watch cap (backend trigger) ------------------------
 
 SCHEMA_SQL = (Path(__file__).resolve().parents[1] / "supabase" / "schema.sql").read_text()

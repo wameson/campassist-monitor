@@ -1491,11 +1491,17 @@ def run(
     contained("run_summaries prune", db.delete, "run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
     # alert_history is otherwise unbounded — one row per delivered push, forever —
     # a slow storage leak toward the free-tier DB cap. Pruned on the same
-    # RETENTION_DAYS window and the same contained path as the other two tables;
-    # the app's Alert History therefore shows the last RETENTION_DAYS of alerts.
-    contained(
-        "alert_history prune", db.delete, "alert_history", {"delivered_at": f"lt.{retention_cutoff}"}
-    )
+    # RETENTION_DAYS window as the other two tables — but NOT via `contained`:
+    # alert_history is WARN-classified in preflight.REQUIRED (unlike the HALT
+    # tables sent_alerts/run_summaries above), so a database missing 0005 has no
+    # table to delete from. Mirroring the insert path, the failure is reported to
+    # both audiences but UNRATED — it never joins cycle_failures and so an
+    # unapplied 0005 (or any delete failure) cannot redden the run.
+    try:
+        db.delete("alert_history", {"delivered_at": f"lt.{retention_cutoff}"})
+    except Exception as exc:  # reported, never rated
+        errors.append(capped_line(f"alert_history prune: {summarize_exception(exc, safe=True)}"))
+        detail_only.append(capped_line(f"alert_history prune: {summarize_exception(exc)}"))
 
     # The persisted verdict must match the exit code, which is systemic OR any
     # failure belonging to no watch, so fold cycle_failures in before labelling.
