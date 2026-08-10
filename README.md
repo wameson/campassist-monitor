@@ -2,7 +2,9 @@
 
 CampAssist backend: centralized campsite availability monitor for recreation.gov
 and GoingToCamp (Washington State Parks).
-A GitHub Actions cron job (every 30 minutes, in this **public** repo) polls all
+A GitHub Actions workflow (`monitor.yml`, in this **public** repo), triggered
+every ~30 minutes by an AWS EventBridge Scheduler on the exact wall clock (see
+[Scheduling](#scheduling-fixing-the-schedule-drift-phase-17)), polls all
 users' watches through the conformer each one's `provider` names — deduplicated
 to one request per unique poll unit per cycle (see [Providers](#providers)) —
 detects new openings via state hashes, and sends APNs push notifications with a
@@ -26,7 +28,7 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 | `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
 | `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
 | `supabase/migrations/` | Ordered, idempotent SQL applied **by hand** to keep **existing** DBs in sync (see [Database migrations](#database-migrations)) |
-| `.github/workflows/monitor.yml` | 30-minute cron + manual `workflow_dispatch` |
+| `.github/workflows/monitor.yml` | The poll; triggered by `workflow_dispatch` (fired by AWS EventBridge). Its GitHub `schedule` cron is **dormant** (commented out) — EventBridge drives the poll; uncomment to restore the 30-min cron |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
 | `.github/workflows/secret-scan.yml` | gitleaks on every PR — fails the check on any finding (see [Secret scanning](#secret-scanning)) |
@@ -208,9 +210,11 @@ Repo → **Settings → Secrets and variables → Actions** → add all six:
 ### 4. First run
 
 Actions → **Monitor Campsites** → **Run workflow**. A run with zero watches
-completes cleanly and writes one `run_summaries` row. Scheduled runs then fire
-every 30 minutes (GitHub adds its own cron delay; the script adds a random
-0–20 s start delay on top by design — see `START_JITTER_MAX_SECONDS`).
+completes cleanly and writes one `run_summaries` row. Thereafter the AWS
+EventBridge Scheduler fires `workflow_dispatch` every ~30 minutes on the exact
+wall clock (the GitHub `schedule` cron is dormant — see
+[Scheduling](#scheduling-fixing-the-schedule-drift-phase-17)); the script adds a
+random 0–20 s start delay on top by design — see `START_JITTER_MAX_SECONDS`.
 
 ## Database migrations
 
@@ -550,8 +554,12 @@ GoingToCamp's WAF accepts:
   single-repo, `Actions: Read and write` fine-grained PAT from an SSM
   SecureString; POSTs the dispatch; logs the HTTP status). AWS never talks to
   GoingToCamp.
-- `schedule` stays as an **offset backstop**, and a CloudWatch heartbeat alarm
-  plus a `run_summaries.ran_at` freshness check catch a silently-stopped trigger.
+- The GitHub `schedule` cron is now **dormant** (commented out in `monitor.yml`,
+  2026-08-10) because running both duplicated ~a quarter of polls and GitHub's
+  cron dropped runs under load — EventBridge is the sole trigger. Uncomment the
+  `schedule:` block to restore it as an offset backstop. Silent-miss coverage now
+  rests on the AWS `Invocations` heartbeat alarm (fires on **absence** of
+  invocations) plus a `run_summaries.ran_at` freshness check.
 - The repo has been **flipped public** (2026-08-01, after the backend was complete
   and a full-history secret scan came back clean), which took Actions minutes to $0.
 
@@ -593,8 +601,9 @@ just this code and its tests.
    the alarm fires, by design (the trigger's failure mode is *silent missing*, so
    every attempt is logged and every non-204 is loud).
 
-Phase B (attach the EventBridge schedule alongside the retained `schedule`
-backstop) and beyond are operator steps in PLAN.md — no repo change.
+Phase B (attach the EventBridge schedule) and beyond are operator steps in
+PLAN.md — no repo change. (The GitHub `schedule` cron that Phase B ran alongside
+has since been made dormant — see above.)
 
 **Two earlier plans that tried to move the poll *itself* off Actions were both
 refused by the WAF** — AWS Lambda (8×403) and Azure Container Apps Jobs (probe
