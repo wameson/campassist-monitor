@@ -327,7 +327,7 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 - **Politeness / anti-blocking:** one rotating browser User-Agent per run,
   randomized campground order, 1.2–2.8 s inter-request delays, exponential
   backoff (2 s → 4 s → 8 s, then skip the campground for this cycle).
-- **Per-provider poll jobs:** the poll is split into one GitHub Actions job per
+- <a id="per-provider-poll-jobs"></a>**Per-provider poll jobs:** the poll is split into one GitHub Actions job per
   provider (`monitor.yml`). A `plan` job — the one job that runs every cycle —
   reads which providers currently have watches (`providers_with_watches`), emits
   a dynamic matrix so an idle provider runs no job, and **owns the once-per-cycle

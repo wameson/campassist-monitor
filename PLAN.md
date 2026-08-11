@@ -31,7 +31,8 @@ per cycle.
 
 ```
 campassist-monitor (GitHub, PUBLIC since 2026-08-01)
-  .github/workflows/monitor.yml   workflow_dispatch (EventBridge-driven); schedule cron dormant, timeout-minutes: 15
+  .github/workflows/monitor.yml   workflow_dispatch (EventBridge-driven); schedule cron dormant
+    plan job → dynamic matrix: one poll job per provider with watches (15-min jobs; going_to_camp 20-min)
     ├── preflight: read-only schema-drift probe (before the jitter)
     ├── start jitter: sleep rand(0–20s)
     ├── read status=eq.monitoring watches + errored-watch census
@@ -40,7 +41,7 @@ campassist-monitor (GitHub, PUBLIC since 2026-08-01)
     ├── poll via each watch's Provider conformer — paced, backed off, time-budgeted
     ├── per watch: extract_relevant → state_hash → delta → alert dedup/cooldown → APNs
     ├── lifecycle writes (error/strike), batched last_checked_at PATCH
-    └── run_summaries row + 30-day retention prune
+    └── per-provider run_summaries row (30-day retention prune owned by the plan job)
   .github/workflows/keepalive.yml  monthly commit (GitHub disables crons after 60 idle days)
   .github/workflows/ci.yml         pytest on PR + push to main (ubuntu)
   .github/workflows/secret-scan.yml  gitleaks on every PR — fails on any finding (Phase D gate)
@@ -301,11 +302,14 @@ cannot be verified without a write. Both incidents to date were missing columns.
 ## Poll / alert pipeline
 
 ### Write budget
-A no-change cycle performs **≤5 Supabase writes** regardless of watch count: 1 batched
+A no-change whole-fleet cycle performs **≤5 Supabase writes** regardless of watch count: 1 batched
 `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3 retention DELETEs (`sent_alerts`,
 `run_summaries`, `alert_history`). Enforced by `test_write_budget`. **Do not add per-watch
 writes** — the free tier is the constraint, and delta-only writing is what keeps ~200–500
-writes/day at any scale instead of ~9,600. The `last_checked_at` PATCH is chunked into ≤150-id
+writes/day at any scale instead of ~9,600. Under the per-provider poll split (§ Time budget)
+those 5 are **divided by owner, not multiplied**: each provider's poll job (`run(provider=…,
+prune=False)`) does only the 2 writes for its own slice, and the plan job does the 3 retention
+DELETEs once for the whole cycle (`prune_retention`), so three jobs never each prune the fleet. The `last_checked_at` PATCH is chunked into ≤150-id
 batches (`PATCH_ID_CHUNK_MAX`) so its `id=in.(…)` URL cannot outgrow a gateway URI limit as the
 fleet grows; a pool within one chunk is still the single write the budget assumes. The per-cycle
 monitoring read is column-scoped (`WATCH_READ_COLUMNS`, with a `select=*` fallback on a drifted
@@ -318,26 +322,31 @@ one realistic browser User-Agent per run, rotated across runs; exponential backo
 runner (residential IP).
 
 ### Time budget
-Polling stops once an 8-minute per-cycle budget (`CYCLE_TIME_BUDGET_SECONDS = 480`) is spent,
-keeping every run — even under sustained blocking — inside the workflow's 15-minute timeout.
-Skipped units retry next cycle; skipped watches keep their old `last_checked_at`; the summary
-counts only what was polled.
+The poll is **one job per provider** (`monitor.yml`; README "Per-provider poll jobs"), each on
+its own budget from `POLL_PROFILES`: the cheap providers keep the 8-minute per-cycle budget
+(`CYCLE_TIME_BUDGET_SECONDS = 480`) inside a 15-minute job timeout, while GoingToCamp — the
+costliest per unit — gets a 720 s budget inside a 20-minute job. The whole-fleet `run()` (no
+flags) keeps the 480 s budget. Whichever job, polling stops once its budget is spent — even
+under sustained blocking — and the job-timeout arithmetic closes for each profile
+(`test_provider_budget_arithmetic_closes_for_each_job`). Skipped units retry next cycle; skipped
+watches keep their old `last_checked_at`; the summary counts only what was polled.
 
-**A budget-exhausted cycle goes red, not green.** Serial per-request politeness caps one cycle
-at **~40 GoingToCamp parks** (≈11 s/park against the 480 s budget); past that the poll loop runs
+**A budget-exhausted cycle goes red, not green.** Serial per-request politeness caps GoingToCamp's
+job at **~65 parks** (≈11 s/park against its 720 s budget); past that the poll loop runs
 out of budget and leaves the remaining parks unpolled — their watches simply do not fire that
 cycle. That is a *completed miss*, not an in-cycle transient the next run heals, and it belongs
 to no single watch (the poll plan is shared across every user), so it is recorded through
 `record_cycle_failure` (systemic by definition → non-zero exit, `::error::`), and the skipped
 count is surfaced on the result as `polls_skipped`, mirroring the errored-watch census (no added
-read or write — the ≤5-write budget holds; no watch is moved to `status='error'`). **There is
+read or write — the ≤2-write per-job budget holds; no watch is moved to `status='error'`). **There is
 deliberately no tolerant threshold:** the budget only trips once serial work already exceeds one
-cycle's capacity, so any skip already means the fleet (or a stalled upstream) is over capacity;
-a `K>0` threshold would silently under-serve up to `K` parks every cycle — the exact silent-miss
-class the census exists to prevent. Before this, a budget-exhausted cycle appended a bare warning
-to the world-readable `run_summaries.errors` and **exited 0 (green)**, so a fleet growing past
-~40 parks would silently stop polling its cold parks with nothing an operator watches saying so.
-The ~40-park ceiling is now visible: it makes the run red instead of hiding behind a warning line.
+cycle's capacity, so any skip already means that provider's fleet (or a stalled upstream) is over
+capacity; a `K>0` threshold would silently under-serve up to `K` parks every cycle — the exact
+silent-miss class the census exists to prevent. Before this, a budget-exhausted cycle appended a
+bare warning to the world-readable `run_summaries.errors` and **exited 0 (green)**, so a fleet
+growing past the ceiling would silently stop polling its cold parks with nothing an operator
+watches saying so. The ceiling is now visible: it makes the run red instead of hiding behind a
+warning line.
 
 ### Poll horizon
 Every provider clamps a watch's request to today → today + 12 months. "Today" uses a fixed
@@ -403,8 +412,10 @@ run. So a live DB missing `alert_history` keeps monitoring and keeps delivering;
 history rows go unwritten until the migration is applied.
 
 ### Retention
-`sent_alerts` and `run_summaries` rows older than 30 days are pruned every run, before the
-summary INSERT so prune failures land in the row's verdict.
+`sent_alerts`, `run_summaries` and `alert_history` rows older than 30 days are pruned once per
+cycle by the **plan job** (`plan_main` → `prune_retention`), which fails the cycle red on a
+HALT-table prune failure; the per-provider poll jobs never prune (`run(prune=False)`). The
+whole-fleet `run()` (no flags) still prunes inline, before its summary INSERT.
 
 ---
 
