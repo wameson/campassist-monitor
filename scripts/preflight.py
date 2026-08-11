@@ -143,6 +143,7 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         "duration_ms":        (HALT, None),   # inserted in run()'s summary row
         "errors":             (HALT, None),   # inserted in run()'s summary row
         "ran_at":             (HALT, None),   # the retention prune filters on it
+        "provider":           (WARN, "0013_run_summaries_provider.sql"),  # written, drift-tolerant
         "id":                 (WARN, None),   # monitor never reads or writes it
     },
 }
@@ -209,6 +210,16 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          setting last_found_at — only the history rows go unwritten until
 #                          the migration is applied. Classifying it HALT would halt every
 #                          cycle over a table that only feeds the app's read-facing history.
+#   run_summaries.provider the per-provider poll label, written but never read, and the
+#                          exception is demonstrated rather than assumed: run()'s
+#                          `insert_summary` includes it only on a scoped (per-provider) run
+#                          and, when PostgREST rejects the insert for want of this column
+#                          (42703, or PGRST204 — `monitor.rejects_missing_column`), drops it
+#                          and re-inserts once without it. The whole-fleet run omits the
+#                          column entirely. So an unmigrated database still writes its summary
+#                          row and still monitors — only the provider label is absent.
+#                          Classifying it HALT would stop every cycle over a column that only
+#                          labels which provider a summary row is for.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read

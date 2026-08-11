@@ -1,0 +1,38 @@
+-- 0013: add run_summaries.provider (per-provider poll split)
+--
+-- Why: the poll used to run once per cycle and write one run_summaries row. It
+-- now runs one GitHub Actions job PER PROVIDER (each with its own time budget, so
+-- a slow provider can no longer starve a fast one — .github/workflows/monitor.yml,
+-- scripts/monitor.POLL_PROFILES). Three jobs therefore write three rows per
+-- cycle, each summarizing only its own provider's slice. Without this column
+-- those rows are indistinguishable — each an unlabelled slice that reads like the
+-- whole cycle. `provider` names which provider a row is for.
+--
+-- NULL for two cases, both intended: the whole-fleet `python scripts/monitor.py`
+-- run (which serves every provider in one row and omits the column), and every
+-- row written before this migration. No backfill: historical rows legitimately
+-- have no single provider, and the retention prune drops them on the 30-day
+-- window regardless.
+--
+-- Nullable, no CHECK, no default: the value is a machine label the backend
+-- writes, not a client-facing constraint, and keeping it unconstrained means a
+-- future provider name needs no migration here. run_summaries stays world-
+-- readable (its existing "read summaries" RLS policy is unchanged); a provider
+-- name is not sensitive.
+--
+-- Preflight class WARN (scripts/preflight.REQUIRED): the monitor writes this
+-- column but never reads it, and the write is drift-tolerant — run()'s
+-- insert_summary drops `provider` and retries the insert once when PostgREST
+-- rejects it for want of this column (42703 / PGRST204, monitor.rejects_missing_
+-- column). So a live DB on which this migration is not yet applied keeps
+-- monitoring and keeps writing its summary row; only the provider label is
+-- absent until it is applied. That tolerance is what lets this file's manifest
+-- entry merge before it is applied (a HALT class would halt every cycle until an
+-- operator reached the SQL editor).
+--
+-- Idempotent: IF NOT EXISTS makes the ALTER safe to re-run. Apply it BY HAND in
+-- the Supabase SQL editor, like every file here (see README "Database
+-- migrations"); CI does not run migrations.
+
+ALTER TABLE run_summaries
+    ADD COLUMN IF NOT EXISTS provider TEXT;
