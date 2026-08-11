@@ -71,11 +71,15 @@ CREATE TABLE watches (
 );
 
 CREATE TABLE device_tokens (
-    user_id      UUID PRIMARY KEY DEFAULT auth.uid(),
+    -- Composite PK (user_id, apns_token): one row per device, so a user can hold
+    -- more than one push token and an alert fans out to every device (migration
+    -- 0012; scripts/apns.py send_alert). user_id alone was the PK before 0012.
+    user_id      UUID NOT NULL DEFAULT auth.uid(),
     apns_token   TEXT NOT NULL,
     environment  TEXT NOT NULL DEFAULT 'production'
                  CHECK (environment IN ('production','sandbox')),
-    updated_at   TIMESTAMPTZ DEFAULT NOW()
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, apns_token)
 );
 
 CREATE TABLE sent_alerts (
