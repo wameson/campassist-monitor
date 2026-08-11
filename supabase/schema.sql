@@ -84,7 +84,7 @@ CREATE TABLE watches (
 CREATE TABLE poll_units (
     unit_key      TEXT PRIMARY KEY,      -- monitor.unit_key(provider, PollKey)
     raw_hash      TEXT NOT NULL,         -- SHA-256 of the last-seen raw availability
-    campground_id TEXT,                  -- operator legibility / campground-scoped prune
+    campground_id TEXT,                  -- operator legibility (table is not pruned; see migrations/0010)
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

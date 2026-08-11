@@ -19,16 +19,18 @@
 --
 -- unit_key is the monitor's stable string for a (provider, PollKey) pair
 -- (monitor.unit_key). raw_hash is a SHA-256 hex digest. campground_id is stored
--- for operator legibility and to let a future prune be campground-scoped; it is
--- not otherwise read by the cycle (the changed-campground set comes from the
--- live poll results, not from this table).
+-- for operator legibility; it is not otherwise read by the cycle (the
+-- changed-campground set comes from the live poll results, not from this table).
 --
--- Growth is naturally bounded — one row per distinct unit the active fleet polls
--- to the rolling horizon — so no per-cycle prune is required (adding one would
--- also break the 5-write budget). The cycle opportunistically deletes rows older
--- than the retention window only on runs that already write here (a unit
--- changed), so stale month-units age out without ever costing a quiet cycle a
--- write.
+-- This table is intentionally NOT pruned per cycle. Growth is naturally bounded
+-- — one row per distinct unit the active fleet polls to the rolling horizon —
+-- and read egress stays bounded because the cycle reads it scoped/chunked to
+-- only the units it actually polls, never the whole table. A prune is
+-- deliberately omitted rather than merely deferred: updated_at is bumped ONLY
+-- when a unit's availability changes, so a stable-but-active unit (a popular,
+-- fully-booked campground polled every cycle) goes stale, and an updated_at-based
+-- prune would evict exactly those rows — then force a re-read of their watches,
+-- defeating the reduction for the units it helps most.
 --
 -- Service-role only: RLS is enabled with NO policy, so no anon/user role can
 -- read or write it. Only the monitor (service role, which bypasses RLS) touches
@@ -48,7 +50,7 @@
 CREATE TABLE IF NOT EXISTS poll_units (
     unit_key      TEXT PRIMARY KEY,      -- monitor.unit_key(provider, PollKey)
     raw_hash      TEXT NOT NULL,         -- SHA-256 of the last-seen raw availability
-    campground_id TEXT,                  -- operator legibility / campground-scoped prune
+    campground_id TEXT,                  -- operator legibility (table is not pruned)
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

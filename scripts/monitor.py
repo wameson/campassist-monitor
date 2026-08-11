@@ -1570,6 +1570,28 @@ def run(
             + ", ".join(f"{reason}: {count}" for reason, count in error_reason_census(errored))
         ))
 
+    # The active-monitoring fleet size, for the systemic-vs-isolated
+    # determinations below (pool-wide-unpollable and the end-of-cycle error
+    # rate). The read-reduction means `active`/`served` are only the process
+    # subset, so dividing by them would misread a couple of genuinely-isolated
+    # bad watches on a quiet cycle as a shared cause and leave them monitoring
+    # forever. A metadata-only count (limit=0, count=exact — zero rows cross the
+    # wire, so no per-watch egress and the ≤5-write budget is untouched) gives
+    # the true denominator. Scoped to this provider on a per-provider poll job so
+    # a job judges its own fleet, not a denominator diluted by other providers'
+    # watches (which could leave one provider's total breakage looking isolated,
+    # green); the whole-fleet run counts every provider. Contained: a failed/None
+    # count (including a pre-0002 DB where the provider filter is unusable) falls
+    # back to the local process-set size at each use site, itself provider-scoped,
+    # never a reason to abort the cycle.
+    try:
+        count_filter = {"status": "eq.monitoring"}
+        if scoped_provider is not None:
+            count_filter["provider"] = f"eq.{scoped_provider}"
+        monitoring_count = db.count("watches", count_filter)
+    except Exception:  # optimization input only; never reddens a run
+        monitoring_count = None
+
     # Backend-owned lifecycle: expire past-date watches (one batched write).
     # An expiring watch is leaving the pool either way, so a failure here is
     # recorded but never turned into status='error' (errorable=False).
@@ -1647,7 +1669,15 @@ def run(
         # breakage is broadest. A shared cause (a client writing the wrong key
         # name on every row it creates) is the operator's to fix, so the pool is
         # left intact and the run goes red instead of erroring every watch.
-        pool_wide = is_systemic(len(unpollable), len(active))
+        #
+        # The denominator is the WHOLE active-monitoring fleet, not the reduced
+        # process set: an unpollable watch enters the process set only via the
+        # ~1h updated_at watermark after creation, so on a quiet cycle a handful
+        # of genuinely-isolated bad rows would otherwise dominate `len(active)`
+        # and be misread as pool-wide — left monitoring forever, never re-read,
+        # the invisible-unmonitored harm this pass exists to prevent.
+        denom = monitoring_count if monitoring_count is not None else len(active)
+        pool_wide = is_systemic(len(unpollable), denom)
         # The reason names only the field at fault, never what the client wrote,
         # but the world-readable row still gets the count alone — the field name
         # is what tells the operator which client is writing bad rows, and that
@@ -1894,8 +1924,15 @@ def run(
 
     # Threshold gate (B): the watch-error rate over the served set, counting
     # only the failures that describe the cycle's own health (see `rated`).
+    # `considered` still reports what was served this cycle (the tally line and
+    # watches_considered describe the served set), but the systemic-vs-isolated
+    # rate divides by the WHOLE active fleet, not the reduced served set — the
+    # same principle as the pool-wide-unpollable check above: a couple of
+    # genuinely-isolated failures on an otherwise-quiet reduced cycle must not be
+    # misread as systemic just because the served set they sit in is small.
     considered = len(served)
     failed_served = sum(1 for watch_id in rated_ids if watch_id in served_ids)
+    rate_denom = monitoring_count if monitoring_count is not None else considered
     # Pool-wide APNs wipeout backstop (C): a distinct systemic condition, kept
     # separate from the per-watch rated flag. Even a rejection reason we did not
     # enumerate as a config fault cannot yield a silent green outage — when
@@ -1907,7 +1944,7 @@ def run(
         apns_rejected_served >= APNS_WIPEOUT_FLOOR
         and apns_rejected_served > considered * APNS_WIPEOUT_RATE
     )
-    systemic = is_systemic(failed_served, considered) or apns_wipeout
+    systemic = is_systemic(failed_served, rate_denom) or apns_wipeout
 
     # Isolated, permanent failures surface on the watch itself (A) so the user
     # sees a broken watch instead of one that silently stops updating. Systemic

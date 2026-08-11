@@ -156,7 +156,7 @@ class FakeDB:
 
     @property
     def write_count(self) -> int:
-        return sum(1 for c in self.calls if c[0] != "select")
+        return sum(1 for c in self.calls if c[0] not in ("select", "count"))
 
     def calls_of(self, op: str, table: str | None = None) -> list[tuple]:
         return [c for c in self.calls if c[0] == op and (table is None or c[1] == table)]
@@ -203,6 +203,14 @@ class FakeDB:
             rows = [{c: r[c] for c in columns if c in r} for r in rows]
         self.reads.append((table, len(rows)))
         return rows
+
+    def count(self, table, params=None):
+        call = ("count", table, params)
+        self.calls.append(call)
+        self._guard(call)
+        params = params or {}
+        source = self._monitoring_plan_rows() if table == "monitoring_plan" else self.tables[table]
+        return sum(1 for r in source if _matches(r, params))
 
     def insert(self, table, rows):
         call = ("insert", table, rows)

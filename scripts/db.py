@@ -36,6 +36,25 @@ class SupabaseClient:
         resp.raise_for_status()
         return resp.json()
 
+    def count(self, table: str, params: dict | None = None) -> int | None:
+        """The exact number of rows matching `params`, read as metadata only: a
+        GET with `limit=0` so no rows cross the wire and `Prefer: count=exact` so
+        PostgREST still reports the full total in `Content-Range`. Returns None
+        when the gateway did not report a total. Lets a systemic-vs-isolated
+        determination divide by the whole active fleet without a full-fleet row
+        read."""
+        resp = self._client.get(
+            f"{self._base}/{table}",
+            params={**(params or {}), "limit": 0},
+            headers={
+                **self._headers,
+                "Accept": "application/json",
+                "Prefer": "count=exact",
+            },
+        )
+        resp.raise_for_status()
+        return _content_range_total(resp.headers.get("content-range"))
+
     def insert(self, table: str, rows: dict | list[dict]) -> None:
         resp = self._client.post(
             f"{self._base}/{table}",

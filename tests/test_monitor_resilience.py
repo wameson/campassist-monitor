@@ -1012,6 +1012,40 @@ def test_pool_wide_apns_wipeout_trips_the_backstop():
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
 
 
+def test_isolated_write_failures_stay_isolated_against_the_whole_fleet():
+    # the read-reduction serves only the changed/edited/striking rows, so a
+    # mostly-quiet cycle can serve a handful even in a large fleet. A couple of
+    # isolated write failures inside that small served set must be judged against
+    # the WHOLE monitoring fleet, not the served set — else is_systemic reads two
+    # broken rows as a systemic outage and refuses to error them, leaving those
+    # users with watches that silently stopped updating.
+    served = [make_watch(id=f"s{i}", user_id=f"su{i}") for i in range(2)]
+    # ten more monitoring watches wholly beyond the poll horizon: counted in the
+    # fleet by the metadata count, but never served this cycle (no unit to poll)
+    idle = [
+        make_watch(id=f"i{i}", user_id=f"iu{i}", campground_id="999999",
+                   start_date="2028-06-01", end_date="2028-06-05")
+        for i in range(10)
+    ]
+    db = FakeDB(
+        {"watches": served + idle},
+        fail_on=fails_watch_patch("s0", "s1", columns=("state_hash",)),
+    )
+
+    result, _ = run_cycle(db)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    # both served watches failed the write pinned to their own row (isolated), so
+    # each is errored — not left 'monitoring' as dividing by the served set would
+    assert rows["s0"]["status"] == "error" and rows["s1"]["status"] == "error"
+    assert "2 of 2 served watch(es) failed this cycle (isolated)" in result["errors"]
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    # the ten idle watches stay monitoring and the denominator came from a
+    # metadata count of the fleet, not the reduced served set
+    assert all(rows[f"i{i}"]["status"] == "monitoring" for i in range(10))
+    assert db.calls_of("count", "watches")
+
+
 def test_state_hash_write_failure_still_errors_the_watch():
     # the counterpart: a failure of the one write pinned to the watch's own row
     # (its state_hash PATCH) is isolated, so a permanent rejection still surfaces
