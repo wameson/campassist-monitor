@@ -81,6 +81,13 @@ campassist-monitor (GitHub, PUBLIC since 2026-08-01)
 > (Phase 17 moves only the *trigger*), but the job's minutes cost nothing. What survives the flip
 > is the in-code cycle **time** budget (`CYCLE_TIME_BUDGET_SECONDS`, 480 s), a coverage/correctness
 > limit racing only GitHub's own `timeout-minutes: 15` (900 s) — never a billing one.
+>
+> **Superseded (`fm/monitor-provider-shard`):** the single all-providers cycle described here —
+> one job on a 480 s budget under `timeout-minutes: 15` — is no longer the live shape. The poll is
+> now **sharded into one job per provider**, each on its own `POLL_PROFILES` budget/timeout
+> (GoingToCamp: 20-min job / 720 s; the cheap providers: 15-min / 480 s), with a once-per-cycle
+> plan job that owns the retention prune. See README "Per-provider poll jobs",
+> `scripts/monitor.POLL_PROFILES`, and `.github/workflows/monitor.yml`.
 
 **Historical, kept as an accepted-cost record.** During the private-repo window the monitor ran
 against the 2,000 free min/month tier and overran it, an **accepted ≈$7/mo interim cost** at
@@ -1290,6 +1297,14 @@ governor is still the in-code `CYCLE_TIME_BUDGET_SECONDS` (480 s) against GitHub
 change (shard by host, tiered cadence, per-host async), owned by the cycle-budget
 re-derivation (`monitor-cycle-budget-rederive`) and camp-assist's Phase 17 — not this trigger
 work.
+
+> **Superseded (`fm/monitor-provider-shard`):** the ~40-parks-per-cycle ceiling stated above as
+> the live governor no longer applies as written — the "shard by host" architectural change named
+> here as future work has since landed. The poll now runs **one job per provider**, each on its
+> own `POLL_PROFILES` budget/timeout (GoingToCamp gets a 20-min job / 720 s ≈ 65 parks), so a
+> slow provider can no longer starve a fast one within a shared 480 s budget, and the plan job
+> owns the once-per-cycle prune. See README "Per-provider poll jobs",
+> `scripts/monitor.POLL_PROFILES`, and `.github/workflows/monitor.yml`.
 
 ### Build
 
