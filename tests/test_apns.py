@@ -225,6 +225,69 @@ def test_fanout_dead_token_pruned_without_touching_sibling(signing_key):
     ]
 
 
+def test_fanout_delivered_withholds_sibling_dead_token_400(signing_key):
+    # deviceA is a dead-token 400 (BadDeviceToken) while deviceB delivers: the
+    # aggregate is DELIVERED, deviceA's row is pruned, and — unlike the
+    # single-token 400 path — its rejection is WITHHELD from the caller's
+    # failures. Once a device received the push, a sibling's dead token is
+    # already-pruned housekeeping and must not be rated toward the run's rate.
+    _, pem = signing_key
+
+    def handler(request):
+        if request.url.path.endswith("deviceA"):
+            return httpx.Response(400, json={"reason": "BadDeviceToken"})
+        return httpx.Response(200)
+
+    client = make_client(pem, handler=handler)
+    db = multi_token_db()
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, db, failures=failures)
+
+    assert outcome == apns.DELIVERED
+    assert failures == []
+    assert db.tables["device_tokens"] == [
+        {"user_id": "u1", "apns_token": "deviceB", "environment": "production"},
+    ]
+    assert db.calls_of("delete", "device_tokens") == [
+        ("delete", "device_tokens", {"user_id": "eq.u1", "apns_token": "eq.deviceA"})
+    ]
+
+
+def test_fanout_delivered_still_surfaces_sibling_retryable(signing_key):
+    # a delivered aggregate withholds only per-device rejections, not a sibling
+    # retryable (5xx): that still surfaces so the operator sees the transient
+    # fault even though the opening reached another device.
+    _, pem = signing_key
+
+    def handler(request):
+        return httpx.Response(200 if request.url.path.endswith("deviceA") else 503)
+
+    client = make_client(pem, handler=handler)
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, multi_token_db(), failures=failures)
+
+    assert outcome == apns.DELIVERED
+    assert len(failures) == 1 and isinstance(failures[0], httpx.HTTPStatusError)
+
+
+def test_fanout_no_delivery_surfaces_dead_token_and_retryable(signing_key):
+    # nothing delivered: a dead-token 400 and a 503 both surface (the aggregate
+    # is RETRYABLE), exactly as before — withholding is delivered-only.
+    _, pem = signing_key
+
+    def handler(request):
+        if request.url.path.endswith("deviceA"):
+            return httpx.Response(400, json={"reason": "BadDeviceToken"})
+        return httpx.Response(503)
+
+    client = make_client(pem, handler=handler)
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, multi_token_db(), failures=failures)
+
+    assert outcome == apns.RETRYABLE_FAILURE
+    assert len(failures) == 2 and all(isinstance(f, httpx.HTTPStatusError) for f in failures)
+
+
 def test_fanout_all_dead_tokens_is_permanent(signing_key):
     # every device is a dead token: all rows pruned, aggregate PERMANENT so the
     # caller advances the hash and does not retry dead tokens forever

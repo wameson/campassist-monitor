@@ -136,7 +136,8 @@ class APNsClient:
         )
 
     def _send_to_token(
-        self, watch: dict, token_row: dict, payload: dict, db, failures: list[BaseException] | None
+        self, watch: dict, token_row: dict, payload: dict, db,
+        collected: list[tuple[str, BaseException]],
     ) -> str:
         """Push to one device token and classify the single-device outcome:
         DELIVERED; PERMANENT_FAILURE (a per-device rejection — a dead device
@@ -146,15 +147,19 @@ class APNsClient:
         push URL cannot be built); CONFIG_FAILURE (a pool-wide provider/config
         fault — 403 Expired/Invalid/MissingProviderToken, 400 BadTopic /
         TopicDisallowed); or RETRYABLE_FAILURE (5xx, 429, or a transport-level
-        error). send_alert aggregates these across a user's tokens."""
+        error). Any push that did not land appends its (outcome, exception) pair
+        to `collected` — send_alert aggregates across a user's tokens and only
+        then decides which of those exceptions reach the caller's failures list
+        (a per-device rejection is suppressed once a sibling device delivered)."""
         try:
             resp = self.send(token_row["apns_token"], token_row.get("environment", "production"), payload)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            if failures is not None:
-                failures.append(exc)
             if isinstance(exc, httpx.InvalidURL):
-                return PERMANENT_FAILURE
-            return RETRYABLE_FAILURE
+                outcome = PERMANENT_FAILURE
+            else:
+                outcome = RETRYABLE_FAILURE
+            collected.append((outcome, exc))
+            return outcome
         if resp.status_code == 200:
             return DELIVERED
         reason = apns_reason(resp)
@@ -172,23 +177,25 @@ class APNsClient:
                 {"user_id": f"eq.{watch['user_id']}", "apns_token": f"eq.{token_row['apns_token']}"},
             )
             # A 410 is a clean prune, not an operator-facing failure, so it is
-            # reported to neither audience. A 400 rejection is still surfaced
+            # reported to neither audience. A 400 rejection is still collected
             # below for parity with every other 4xx (unrated all the same).
             if resp.status_code == 410:
                 return PERMANENT_FAILURE
-        if failures is not None:
-            failures.append(
-                httpx.HTTPStatusError(
-                    f"apns push rejected with {resp.status_code}",
-                    request=resp.request,
-                    response=resp,
-                )
-            )
         if resp.status_code == 429 or resp.status_code >= 500:
-            return RETRYABLE_FAILURE
-        if reason in CONFIG_FAILURE_REASONS:
-            return CONFIG_FAILURE
-        return PERMANENT_FAILURE
+            outcome = RETRYABLE_FAILURE
+        elif reason in CONFIG_FAILURE_REASONS:
+            outcome = CONFIG_FAILURE
+        else:
+            outcome = PERMANENT_FAILURE
+        collected.append((
+            outcome,
+            httpx.HTTPStatusError(
+                f"apns push rejected with {resp.status_code}",
+                request=resp.request,
+                response=resp,
+            ),
+        ))
+        return outcome
 
     def send_alert(
         self, watch: dict, openings: list[dict], db, failures: list[BaseException] | None = None
@@ -217,11 +224,17 @@ class APNsClient:
         to N devices. A dead token is pruned per (user_id, apns_token), never by
         user_id, so cleaning up one device never silences another.
 
-        Each push that did not land appends the *exception* behind it to
+        Each push that did not land contributes the *exception* behind it to
         `failures` — the transport error itself, or an HTTPStatusError carrying
-        the APNs response. Attribution and rendering are the caller's: nothing
-        here names the watch, so an APNs failure cannot put a watch UUID into
-        the world-readable run summary."""
+        the APNs response — EXCEPT when the aggregate is DELIVERED: a per-device
+        rejection (PERMANENT_FAILURE) whose token's row is already pruned is
+        housekeeping once a sibling device received the push, so it is withheld
+        so the caller cannot rate a delivered watch toward the exit-status rate
+        (mirroring the 410 clean-prune, which reaches neither audience).
+        Retryable and config faults still surface on a non-delivered aggregate.
+        Attribution and rendering are the caller's: nothing here names the
+        watch, so an APNs failure cannot put a watch UUID into the
+        world-readable run summary."""
         rows = db.select("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
         if not rows:
             return PERMANENT_FAILURE
@@ -244,17 +257,33 @@ class APNsClient:
             "booking_url": provider_for(watch).booking_url(watch, openings),
             "watch_id": watch["id"],
         }
+        collected: list[tuple[str, BaseException]] = []
         outcomes = [
-            self._send_to_token(watch, token_row, payload, db, failures)
+            self._send_to_token(watch, token_row, payload, db, collected)
             for token_row in rows
         ]
         # Aggregate by priority: any delivery wins; otherwise the most
         # operator-actionable still-open outcome (config > retryable) wins over a
         # plain per-device rejection.
         if DELIVERED in outcomes:
-            return DELIVERED
-        if CONFIG_FAILURE in outcomes:
-            return CONFIG_FAILURE
-        if RETRYABLE_FAILURE in outcomes:
-            return RETRYABLE_FAILURE
-        return PERMANENT_FAILURE
+            aggregate = DELIVERED
+        elif CONFIG_FAILURE in outcomes:
+            aggregate = CONFIG_FAILURE
+        elif RETRYABLE_FAILURE in outcomes:
+            aggregate = RETRYABLE_FAILURE
+        else:
+            aggregate = PERMANENT_FAILURE
+        # Only now decide which collected exceptions the caller sees. On a
+        # delivered fan-out, a sibling token's per-device rejection is already
+        # pruned housekeeping — withhold it so the caller cannot rate a watch
+        # that actually reached a device. On any non-delivered aggregate, every
+        # exception (retryable, config, or the final all-dead rejection) still
+        # surfaces exactly as before.
+        if failures is not None:
+            if aggregate == DELIVERED:
+                failures.extend(
+                    exc for outcome, exc in collected if outcome != PERMANENT_FAILURE
+                )
+            else:
+                failures.extend(exc for _, exc in collected)
+        return aggregate
