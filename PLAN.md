@@ -237,7 +237,7 @@ PostgREST answers `400 / 42703`. Two production incidents took exactly that shap
 Incident 2 is the load-bearing lesson: the guard checks the schema **the product** depends on,
 not only what the monitor would crash without.
 
-**How it probes:** one `GET <table>?select=<all manifest columns>&limit=0` per table, four
+**How it probes:** one `GET <table>?select=<all manifest columns>&limit=0` per table, six
 total, before the start jitter. Zero writes, no row data crosses the wire, no new secret
 (reuses `SUPABASE_URL` / `SUPABASE_SERVICE_KEY`). PostgREST validates the `select` list while
 planning, so `limit=0` still proves the columns exist.
@@ -816,7 +816,7 @@ Design, classification and rationale are in [Schema-drift guard](#schema-drift-g
 - [x] Per-column confirmation obligation: for each `WARN`-classified read column, record the citation proving the fallback. Anything unproven moves to `HALT` before merge.
 - [x] Classify each probe outcome: `200` → clean; 4xx carrying `42703` / `42P01` / `PGRST205` → **drift**; everything else → **transient**.
 - [x] Wire into `main()`: build the client and run the preflight **before** the start jitter so a halting run fails fast. Halt-set drift → `::error::` + `SystemExit(1)` without entering `run()`; warn-set drift → `::warning::` and continue; transient → `::warning::` and continue. When a run turns up both, the halt wins and the message lists every missing object.
-- [x] Account for the probe in the budget arithmetic comment: up to four `GET`s on the healthy path, charged against `FANOUT_DEADLINE_SECONDS`; the narrowing pass costs at worst one extra `GET` per column of a drifted table.
+- [x] Account for the probe in the budget arithmetic comment: up to six `GET`s on the healthy path (one per manifest table), charged against `FANOUT_DEADLINE_SECONDS`; the narrowing pass costs at worst one extra `GET` per column of a drifted table.
 - [x] `README.md` "Database migrations" gains the guard's behaviour; `AGENTS.md` gains the clause that a schema change means `schema.sql` + a migration **+ the `preflight.REQUIRED` entry**, classified `WARN` only with a proven fallback — and states the **apply-first ordering**.
 
 **Tests (offline, reusing `tests/helpers.py`):**
