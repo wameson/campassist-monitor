@@ -8,8 +8,11 @@ every ~30 minutes by an AWS EventBridge Scheduler on the exact wall clock (see
 users' watches through the conformer each one's `provider` names — deduplicated
 to one request per unique poll unit per cycle (see [Providers](#providers)) —
 detects new openings via state hashes, and sends APNs push notifications with a
-direct booking link. Supabase (free tier) is the shared database; there is no
-server.
+direct booking link. Each cycle runs **one poll job per provider** (a `plan` job
+emits the matrix and owns the once-per-cycle retention prune; see
+[Per-provider poll jobs](#per-provider-poll-jobs)), so a slow provider can never
+starve a fast one of poll time in the same run. Supabase (free tier) is the
+shared database; there is no server.
 
 See [`PLAN.md`](PLAN.md) in this repo for the full backend design: schema and
 migration rules, the monitor workflow, the poll/alert pipeline, the provider
@@ -28,7 +31,7 @@ seam, and the backend phase checklists. The iOS/product plan lives in the
 | `scripts/common.py` | Primitives shared by the cycle and its providers (date coercion, the error-line cap) |
 | `supabase/schema.sql` | Fresh-install schema + RLS policies — paste into the Supabase SQL editor for a **new** DB |
 | `supabase/migrations/` | Ordered, idempotent SQL applied **by hand** to keep **existing** DBs in sync (see [Database migrations](#database-migrations)) |
-| `.github/workflows/monitor.yml` | The poll; triggered by `workflow_dispatch` (fired by AWS EventBridge). Its GitHub `schedule` cron is **dormant** (commented out) — EventBridge drives the poll; uncomment to restore the 30-min cron |
+| `.github/workflows/monitor.yml` | The poll; triggered by `workflow_dispatch` (fired by AWS EventBridge). One `plan` job (matrix + retention prune) fans out to **one poll job per provider** that has watches (see [Per-provider poll jobs](#per-provider-poll-jobs)). Its GitHub `schedule` cron is **dormant** (commented out) — EventBridge drives the poll; uncomment to restore the 30-min cron |
 | `.github/workflows/keepalive.yml` | Monthly bot commit so GitHub never auto-disables the scheduled workflow (60-day rule) |
 | `.github/workflows/ci.yml` | pytest on every PR and push to `main` (ubuntu) |
 | `.github/workflows/secret-scan.yml` | gitleaks on every PR — fails the check on any finding (see [Secret scanning](#secret-scanning)) |
@@ -210,7 +213,9 @@ Repo → **Settings → Secrets and variables → Actions** → add all six:
 ### 4. First run
 
 Actions → **Monitor Campsites** → **Run workflow**. A run with zero watches
-completes cleanly and writes one `run_summaries` row. Thereafter the AWS
+completes cleanly: the `plan` job prunes and emits an empty matrix, so no poll
+job runs and no `run_summaries` row is written for a provider with no watches.
+Thereafter the AWS
 EventBridge Scheduler fires `workflow_dispatch` every ~30 minutes on the exact
 wall clock (the GitHub `schedule` cron is dormant — see
 [Scheduling](#scheduling-fixing-the-schedule-drift-phase-17)); the script adds a
@@ -303,10 +308,14 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 
 ## Operating notes
 
-- **Write budget:** a cycle with no availability changes performs ≤5 Supabase
-  writes (1 batched `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3
+- **Write budget:** a whole-fleet cycle with no availability changes performs ≤5
+  Supabase writes (1 batched `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3
   retention DELETEs — `sent_alerts`, `run_summaries`, `alert_history`)
-  regardless of watch count — enforced by `test_write_budget`. The `last_checked_at`
+  regardless of watch count — enforced by `test_write_budget`. Under the
+  per-provider poll split (see [Per-provider poll jobs](#per-provider-poll-jobs))
+  those 5 are divided by owner, not multiplied: each provider's poll job does
+  only the 2 writes for its own slice, and the plan job does the 3 retention
+  DELETEs once for the whole cycle. The `last_checked_at`
   PATCH is one request per **chunk** of ≤150 ids (`PATCH_ID_CHUNK_MAX`), so a
   pool small enough to fit one chunk is still a single write; larger pools are
   chunked to keep each `id=in.(…)` URL under the gateway's URI limit.
@@ -318,18 +327,39 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 - **Politeness / anti-blocking:** one rotating browser User-Agent per run,
   randomized campground order, 1.2–2.8 s inter-request delays, exponential
   backoff (2 s → 4 s → 8 s, then skip the campground for this cycle).
-- **Time budget:** polling (including backoff retries) stops once an
-  8-minute per-cycle budget (`CYCLE_TIME_BUDGET_SECONDS = 480`) is spent,
-  keeping every run — even under sustained 403/429 blocking — inside the
-  workflow's 15-minute timeout. Skipped campgrounds are simply retried next
-  cycle; skipped watches keep their old `last_checked_at`, and the run
-  summary counts only what was actually polled. But a cycle that runs out of
-  budget **mid-plan goes red, not green**: the parks it never reached were not
+- <a id="per-provider-poll-jobs"></a>**Per-provider poll jobs:** the poll is split into one GitHub Actions job per
+  provider (`monitor.yml`). A `plan` job — the one job that runs every cycle —
+  reads which providers currently have watches (`providers_with_watches`), emits
+  a dynamic matrix so an idle provider runs no job, and **owns the once-per-cycle
+  retention prune** (`plan_main` → `prune_retention`); it fails the cycle red on a
+  HALT-table prune failure while the poll jobs still run (`if: !cancelled()`).
+  Each poll job then runs `python scripts/monitor.py --provider <name>` — the same
+  `run()` scoped to that provider's watches (`run(provider=…, prune=False)`) on
+  that provider's own budget (`POLL_PROFILES`), writing its own labelled
+  `run_summaries` row (`run_summaries.provider`, migration `0013`) and never
+  pruning. The jobs are independent (`fail-fast: false`), so one provider
+  failing, being blocked, or exhausting its budget cannot stop the others — which
+  is the reliability point: a GoingToCamp-heavy fleet (~11 s/park) can no longer
+  consume a shared budget and starve recreation.gov (~2.5–3 s/campground-month) of
+  poll time in the same run. This changes **how many jobs run per cycle** (visible
+  in the Actions tab): a `plan` job plus one poll job per active provider. The
+  whole-fleet `python scripts/monitor.py` (no flags) still works — one run, all
+  providers, prune included — so a workflow revert keeps monitoring.
+- **Time budget:** polling (including backoff retries) stops once a per-cycle
+  budget is spent — 480 s (`CYCLE_TIME_BUDGET_SECONDS`) for the whole-fleet run
+  and for the cheap providers' 15-minute jobs, 720 s for GoingToCamp's 20-minute
+  job (`POLL_PROFILES`; it is the costliest per unit, so it is sized up rather
+  than left to share) — keeping every run, even under sustained 403/429 blocking,
+  inside its job's timeout. The job-timeout arithmetic closes for each provider
+  (`test_provider_budget_arithmetic_closes_for_each_job`). Skipped campgrounds are
+  simply retried next cycle; skipped watches keep their old `last_checked_at`, and
+  the run summary counts only what was actually polled. But a cycle that runs out
+  of budget **mid-plan goes red, not green**: the parks it never reached were not
   served this cycle, which is a completed miss belonging to no single watch, so
   it is recorded as a cycle failure (systemic → non-zero exit, `::error::`) with
   the skipped count surfaced on the result as `polls_skipped`. There is no
-  tolerant threshold — serial per-request politeness caps a cycle at ~40
-  GoingToCamp parks, so any skip already means the fleet is over one cycle's
+  tolerant threshold — serial per-request politeness caps GoingToCamp's job at ~65
+  parks, so any skip already means that provider's fleet is over one cycle's
   capacity. See PLAN.md "Time budget" for the arithmetic.
 - **Poll horizon:** every provider clamps what it requests for a watch to
   today through today + 12 months; "today" uses a fixed UTC-8 offset so

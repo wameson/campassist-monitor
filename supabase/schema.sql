@@ -117,7 +117,14 @@ CREATE TABLE run_summaries (
     campgrounds_polled INT,
     alerts_sent   INT,
     duration_ms   INT,
-    errors        TEXT
+    errors        TEXT,
+    -- Which provider this row summarizes, so the one-job-per-provider poll can
+    -- write a labelled per-provider row instead of an unlabelled slice that
+    -- reads like the whole cycle (migrations/0013). NULL for the whole-fleet
+    -- `python scripts/monitor.py` run and for rows predating the column. The
+    -- monitor writes it drift-tolerantly (drops+retries without it on a database
+    -- missing this column), so it is WARN in preflight.REQUIRED, not HALT.
+    provider      TEXT
 );
 
 ALTER TABLE watches       ENABLE ROW LEVEL SECURITY;

@@ -19,15 +19,54 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  monitor:
+  # One cycle = one plan job + one poll job per provider that has watches. The
+  # plan job runs every cycle: it emits the poll matrix (only providers with
+  # watches, so an idle provider runs no job) and OWNS the once-per-cycle
+  # retention prune, which is whole-fleet and must not be replicated across the
+  # poll jobs. Each poll job then serves only its provider's watches on that
+  # provider's own time budget (scripts/monitor.POLL_PROFILES), so a slow
+  # provider can no longer starve a fast one within a single run.
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run_poll: ${{ steps.plan.outputs.run_poll }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: 'pip' }
       - run: pip install -r requirements.txt
-      - name: Run monitor
+      - name: Plan providers and prune retention
+        id: plan
+        env:
+          # DB only — the plan job neither polls a campground nor sends a push.
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/monitor.py --plan
+
+  poll:
+    needs: plan
+    # Run even if the plan job went red on a prune failure (!cancelled() drops the
+    # implicit success() gate); skip entirely when no provider has watches, so an
+    # empty fleet expands no matrix and produces no misleading job.
+    if: ${{ !cancelled() && needs.plan.outputs.run_poll == 'true' }}
+    runs-on: ubuntu-latest
+    # Per-provider runner timeout: the plan job derives it from POLL_PROFILES, so
+    # going_to_camp's longer job and the cheap providers' 15-minute one stay in
+    # one source of truth with their poll budgets.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # One provider's failure, block, or budget exhaustion must not stop the
+      # others: each is an independent job.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - name: Poll ${{ matrix.provider }}
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -35,4 +74,4 @@ jobs:
           APNS_TEAM_ID:         ${{ secrets.APNS_TEAM_ID }}
           APNS_BUNDLE_ID:       ${{ secrets.APNS_BUNDLE_ID }}
           APNS_P8_KEY:          ${{ secrets.APNS_P8_KEY }}
-        run: python scripts/monitor.py
+        run: python scripts/monitor.py --provider ${{ matrix.provider }}

@@ -33,8 +33,10 @@ non-zero so the Action turns red.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import time
@@ -266,6 +268,10 @@ WATCH_READ_COLUMNS = (
 # yields to the summary row and the pruning when it does; it just no longer
 # binds on a healthy run. test_fanout_deadline_fits_inside_the_job_timeout
 # holds the jitter-plus-poll term of that arithmetic, not the whole worst case.
+# These are the whole-fleet run's profile and the default provider profile (the
+# 15-minute job). going_to_camp's per-provider job uses a longer timeout and a
+# larger derived fanout deadline — see POLL_PROFILES below, which reuses the same
+# JOB_SETUP_RESERVE_SECONDS/SHUTDOWN_RESERVE_SECONDS reserves.
 JOB_TIMEOUT_SECONDS = 900.0
 JOB_SETUP_RESERVE_SECONDS = 120.0
 SHUTDOWN_RESERVE_SECONDS = 180.0
@@ -273,6 +279,55 @@ FANOUT_DEADLINE_SECONDS = (
     JOB_TIMEOUT_SECONDS - JOB_SETUP_RESERVE_SECONDS - SHUTDOWN_RESERVE_SECONDS
 )
 PER_ID_FALLBACK_BUDGET_SECONDS = 100.0
+
+# --- per-provider poll profiles -------------------------------------------
+#
+# CYCLE_TIME_BUDGET_SECONDS above is the whole-fleet budget the monolithic
+# `python scripts/monitor.py` still uses. The workflow instead runs one poll job
+# per provider (.github/workflows/monitor.yml), so each provider polls in its own
+# runner with its own budget below and their ~4x spread in per-unit cost —
+# recreation.gov ~2.5-3 s per campground-month, going_to_camp ~11 s per park,
+# use_direct ~one POST per facility — no longer competes for a single budget. That
+# is the reliability fix: a going_to_camp-heavy fleet can no longer consume the
+# shared budget and starve recreation.gov of poll time in the same run, because
+# every provider now gets the full budget below to itself instead of the three
+# sharing one.
+#
+# Each profile pins a job timeout and a poll budget, and the SAME arithmetic that
+# ties CYCLE_TIME_BUDGET_SECONDS to JOB_TIMEOUT_SECONDS above must still close for
+# each job:
+#     JOB_SETUP_RESERVE + fanout_deadline + SHUTDOWN_RESERVE <= job_timeout
+#     START_JITTER_MAX  + time_budget                        <= fanout_deadline
+# test_provider_budget_arithmetic_closes_for_each_job holds both, per provider.
+# going_to_camp — the costliest per unit, and the provider a fleet leans on — gets
+# a longer 20-minute job and a 720 s budget (~65 parks/cycle) so its larger real
+# cost is not capped at the ~43 parks a 480 s budget buys; the cheap providers
+# keep the standard 15-minute job, whose 480 s already over-serves their fleet.
+class PollProfile(NamedTuple):
+    job_timeout_seconds: float
+    time_budget_seconds: float
+
+    @property
+    def fanout_deadline_seconds(self) -> float:
+        return self.job_timeout_seconds - JOB_SETUP_RESERVE_SECONDS - SHUTDOWN_RESERVE_SECONDS
+
+
+DEFAULT_POLL_PROFILE = PollProfile(JOB_TIMEOUT_SECONDS, CYCLE_TIME_BUDGET_SECONDS)
+# Keyed by `watches.provider`. A test holds the keys to exactly the registered
+# providers, so a new conformer without a profile fails loudly rather than
+# silently polling on the default budget.
+POLL_PROFILES: dict[str, PollProfile] = {
+    "recreation_gov": DEFAULT_POLL_PROFILE,        # 15-minute job / 480 s budget
+    "use_direct":     DEFAULT_POLL_PROFILE,        # 15-minute job / 480 s budget
+    "going_to_camp":  PollProfile(1200.0, 720.0),  # 20-minute job / 720 s budget
+}
+
+
+def poll_profile(provider: str) -> PollProfile:
+    """The poll profile for a provider, defaulting to the 15-minute profile so an
+    unmapped provider still polls rather than crashing the job."""
+    return POLL_PROFILES.get(provider, DEFAULT_POLL_PROFILE)
+
 
 # Process start, captured at import — before main() sleeps its start jitter —
 # so the fan-out deadline covers the jitter instead of stacking on top of it.
@@ -668,8 +723,9 @@ def paginated_select(db, table: str, params: dict, *, page_size: int = SELECT_PA
     return rows
 
 
-def read_monitoring_watches(db) -> list[dict]:
-    """The cycle's monitoring set: column-scoped and paginated.
+def read_monitoring_watches(db, provider: str | None = None) -> list[dict]:
+    """The cycle's monitoring set: column-scoped and paginated, optionally
+    scoped to one provider so a per-provider poll job reads only its own slice.
 
     Scoped to WATCH_READ_COLUMNS to trim per-row egress vs select=* (the
     dominant Supabase egress term at scale). On a live database missing a WARN
@@ -680,13 +736,27 @@ def read_monitoring_watches(db) -> list[dict]:
     before, aborting the cycle: without the monitoring set there is nothing to
     poll. Both the projected and the fallback read are paginated so a max-rows
     cap cannot silently drop watches.
+
+    The `provider` scope is applied server-side on the healthy path. But
+    `watches.provider` is itself a WARN column: on a database where 0002 has not
+    been applied the column is absent, which makes an `eq.<provider>` filter on
+    it unusable too. So the drift fallback drops the filter and re-derives the
+    scope client-side through `provider_name` — which `.get()`-defaults an absent
+    column to recreation_gov — preserving the exact WARN tolerance the projected
+    read already had. On such a database every watch reads as recreation_gov, so
+    the recreation_gov job serves them all and the other providers' jobs serve
+    none, which is correct: a pre-0002 database has only recreation.gov watches.
     """
     base = {"status": "eq.monitoring"}
+    scoped = {**base, "provider": f"eq.{provider}"} if provider is not None else base
     try:
-        return paginated_select(db, "watches", {**base, "select": ",".join(WATCH_READ_COLUMNS)})
+        return paginated_select(db, "watches", {**scoped, "select": ",".join(WATCH_READ_COLUMNS)})
     except Exception as exc:  # containment: retry drift-tolerantly, re-raise the rest
         if is_missing_column_rejection(exc):
-            return paginated_select(db, "watches", base)
+            rows = paginated_select(db, "watches", base)
+            if provider is not None:
+                rows = [w for w in rows if provider_name(w) == provider]
+            return rows
         raise
 
 
@@ -862,6 +932,44 @@ def _patch_id_batch(
     return PatchOutcome(failures, frozenset(isolated))
 
 
+# --- retention pruning (once per cycle, one owner) -------------------------
+#
+# The three time-scoped tables and the column each is pruned on. They are
+# whole-fleet and provider-neutral, so when the poll is split into one job per
+# provider they must NOT be pruned once per provider — that would triple the
+# writes and have three jobs delete the same rows. The plan job owns pruning for
+# the whole cycle (see plan_main); the per-provider poll jobs pass prune=False.
+# sent_alerts and run_summaries are HALT tables (a prune failure is systemic);
+# alert_history is WARN (its table may be absent pre-0005), so its failure is
+# reported but never rated — mirroring the insert path.
+RETENTION_RATED_TABLES = (("sent_alerts", "sent_at"), ("run_summaries", "ran_at"))
+RETENTION_WARN_TABLE = ("alert_history", "delivered_at")
+
+
+def prune_retention(db, now: datetime) -> tuple[dict[str, BaseException], BaseException | None]:
+    """Delete rows older than RETENTION_DAYS from the three time-scoped tables.
+
+    Each delete is contained so one failure never stops the others. Returns
+    (rated_failures, warn_failure): rated_failures maps a `<table> prune` label
+    to the exception for the HALT tables (systemic when non-empty), and
+    warn_failure is the alert_history exception (reported, never rated) or None.
+    """
+    cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
+    rated: dict[str, BaseException] = {}
+    for table, column in RETENTION_RATED_TABLES:
+        try:
+            db.delete(table, {column: f"lt.{cutoff}"})
+        except Exception as exc:  # containment boundary
+            rated[f"{table} prune"] = exc
+    table, column = RETENTION_WARN_TABLE
+    try:
+        db.delete(table, {column: f"lt.{cutoff}"})
+        warn: BaseException | None = None
+    except Exception as exc:  # reported, never rated
+        warn = exc
+    return rated, warn
+
+
 def is_systemic(failed: int, considered: int) -> bool:
     """Whether this cycle's contained watch failures are broad enough to fail
     the run (see SYSTEMIC_ERROR_RATE / SYSTEMIC_ERROR_FLOOR). Both counts are
@@ -878,6 +986,8 @@ def run(
     apns,
     http,
     *,
+    provider: str | None = None,
+    prune: bool = True,
     rng: random.Random | None = None,
     sleep=time.sleep,
     now_fn=lambda: datetime.now(timezone.utc),
@@ -887,6 +997,19 @@ def run(
     per_id_fallback_budget_seconds: float = PER_ID_FALLBACK_BUDGET_SECONDS,
     fanout_deadline_seconds: float = FANOUT_DEADLINE_SECONDS,
 ) -> dict:
+    # `provider` scopes the whole cycle to one provider's watches, for the
+    # per-provider poll jobs the workflow runs; None serves every provider (the
+    # monolithic `python scripts/monitor.py` path, and every existing test). When
+    # scoped, the read, the errored-watch census and the summary row all narrow to
+    # that provider, so three jobs never each poll the whole fleet nor write a
+    # summary claiming to describe the whole cycle. `prune` is False for those
+    # poll jobs: retention pruning is whole-fleet and belongs to a single owner
+    # (the plan job), never replicated per provider (see prune_retention).
+    #
+    # `provider` is captured here because the per-watch loops below rebind the
+    # name to `provider_for(watch)` (a Provider object); the cycle-scope value is
+    # this string (or None) and must survive them.
+    scoped_provider = provider
     rng = rng or random.Random()
     started = monotonic()
     deadline = started + time_budget_seconds
@@ -1029,7 +1152,7 @@ def run(
     def blocked(watch: dict) -> bool:
         return str(watch["id"]) in blocked_ids
 
-    watches = read_monitoring_watches(db)
+    watches = read_monitoring_watches(db, scoped_provider)
 
     # Visibility: how many watches are sitting in status='error'. That state is
     # terminal — an errored watch is absent from the select above and no code
@@ -1063,6 +1186,12 @@ def run(
         errored = None
         errors.append("errored-watch census unavailable")
         detail_only.append(capped_line(f"errored-watch census: {summarize_exception(exc)}"))
+    # A per-provider poll job counts only its own provider's errored watches, so
+    # its summary reports the population that job is responsible for. Filtered
+    # client-side (not with a `provider=eq.` filter) to keep the census read the
+    # single drift-tolerant select=* it must stay — see the note above.
+    if errored is not None and scoped_provider is not None:
+        errored = [w for w in errored if provider_name(w) == scoped_provider]
     watches_errored = None if errored is None else len(errored)
     if errored:
         # The count is an aggregate that names nobody, so it goes on the
@@ -1486,22 +1615,24 @@ def run(
         except Exception as exc:  # containment boundary
             record_cycle_failure(label, exc)
 
-    retention_cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
-    contained("sent_alerts prune", db.delete, "sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
-    contained("run_summaries prune", db.delete, "run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
-    # alert_history is otherwise unbounded — one row per delivered push, forever —
-    # a slow storage leak toward the free-tier DB cap. Pruned on the same
-    # RETENTION_DAYS window as the other two tables — but NOT via `contained`:
-    # alert_history is WARN-classified in preflight.REQUIRED (unlike the HALT
-    # tables sent_alerts/run_summaries above), so a database missing 0005 has no
-    # table to delete from. Mirroring the insert path, the failure is reported to
-    # both audiences but UNRATED — it never joins cycle_failures and so an
-    # unapplied 0005 (or any delete failure) cannot redden the run.
-    try:
-        db.delete("alert_history", {"delivered_at": f"lt.{retention_cutoff}"})
-    except Exception as exc:  # reported, never rated
-        errors.append(capped_line(f"alert_history prune: {summarize_exception(exc, safe=True)}"))
-        detail_only.append(capped_line(f"alert_history prune: {summarize_exception(exc)}"))
+    # Retention pruning is whole-fleet and provider-neutral, so a per-provider
+    # poll job (prune=False) never runs it — that is the plan job's job, once per
+    # cycle (see prune_retention / plan_main). When this is the monolithic run
+    # (prune=True), it prunes here, before the summary row's verdict is chosen, so
+    # a HALT-table prune failure (systemic) lands on the label. The alert_history
+    # failure is reported to both audiences but UNRATED, mirroring its insert
+    # path, so an unapplied 0005 cannot redden the run.
+    if prune:
+        rated_prune_failures, alert_history_prune_failure = prune_retention(db, now)
+        for label, exc in rated_prune_failures.items():
+            record_cycle_failure(label, exc)
+        if alert_history_prune_failure is not None:
+            errors.append(capped_line(
+                f"alert_history prune: {summarize_exception(alert_history_prune_failure, safe=True)}"
+            ))
+            detail_only.append(capped_line(
+                f"alert_history prune: {summarize_exception(alert_history_prune_failure)}"
+            ))
 
     # The persisted verdict must match the exit code, which is systemic OR any
     # failure belonging to no watch, so fold cycle_failures in before labelling.
@@ -1556,9 +1687,26 @@ def run(
         "alerts_sent": alerts_sent,
         "duration_ms": int((monotonic() - started) * 1000),
         "errors": "; ".join(public_errors) or None,
+        # Names which provider this row summarizes, so three per-cycle rows are not
+        # each an unlabeled slice reading like the whole cycle. Only written when
+        # scoped: the monolithic run omits it, keeping its row byte-identical and
+        # needing no 0013. WARN-classified: run_summaries.provider is dropped and
+        # retried on a database without 0013 (insert_summary), so an unapplied
+        # migration cannot redden every run.
+        **({"provider": scoped_provider} if scoped_provider is not None else {}),
     }
+
+    def insert_summary(*_ignored) -> None:
+        try:
+            db.insert("run_summaries", summary)
+        except Exception as exc:  # drift tolerance for the WARN `provider` column
+            if "provider" in summary and rejects_missing_column(exc, "provider"):
+                db.insert("run_summaries", {k: v for k, v in summary.items() if k != "provider"})
+            else:
+                raise
+
     # Written last, so both prunes' outcomes are already in the verdict above.
-    contained("run_summaries insert", db.insert, "run_summaries", summary)
+    contained("run_summaries insert", insert_summary)
 
     return {
         **summary,
@@ -1620,13 +1768,48 @@ def exit_code(result: dict) -> int:
     return 1 if result.get("systemic_failure") else 0
 
 
+def _execute(
+    db,
+    rng: random.Random,
+    process_started: float | None,
+    *,
+    provider: str | None,
+    prune: bool,
+    time_budget_seconds: float,
+    fanout_deadline_seconds: float,
+) -> None:
+    """The shared post-preflight body: jitter, poll, print, annotate, exit. The
+    monolithic and per-provider entrypoints differ only in what they hand it."""
+    delay = start_delay(rng)
+    print(f"start jitter: sleeping {delay:.0f}s", flush=True)
+    time.sleep(delay)
+
+    apns = APNsClient.from_env()
+    with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
+        result = run(
+            db, apns, http, rng=rng, process_started=process_started,
+            provider=provider, prune=prune,
+            time_budget_seconds=time_budget_seconds,
+            fanout_deadline_seconds=fanout_deadline_seconds,
+        )
+    print(json.dumps(result), flush=True)
+    for annotation in (error_annotation(result), failure_annotation(result)):
+        if annotation:
+            print(annotation, flush=True)
+    raise SystemExit(exit_code(result))
+
+
 def main(process_started: float | None = PROCESS_STARTED) -> None:
+    # The whole-fleet path (`python scripts/monitor.py`, no flags): polls every
+    # provider in one run and owns pruning, exactly as before the per-provider
+    # split. Kept working so a revert of the workflow still monitors, and it is
+    # the path run()'s existing tests exercise.
+    #
     # `process_started` is plumbing, not policy: the default is the import-time
-    # anchor the CLI entrypoint has always used, so `python scripts/monitor.py`
-    # behaves exactly as before. The parameter exists so a long-lived host (one
-    # reusing a warm process across invocations) could forward a *fresh* reading
-    # each time, because run() binds its own process_started default once at
-    # import; the CLI is the only caller today and takes the default.
+    # anchor the CLI entrypoint has always used, so this path behaves exactly as
+    # before. The parameter exists so a long-lived host (one reusing a warm
+    # process across invocations) could forward a *fresh* reading each time,
+    # because run() binds its own process_started default once at import.
     rng = random.Random()
     db = SupabaseClient.from_env()
     # Schema-drift guard, deliberately ahead of the jitter sleep: a run halted by
@@ -1638,20 +1821,108 @@ def main(process_started: float | None = PROCESS_STARTED) -> None:
     # SystemExit(1) here, before run()'s first write; everything else warns and
     # falls through.
     preflight(db)
+    _execute(
+        db, rng, process_started,
+        provider=None, prune=True,
+        time_budget_seconds=CYCLE_TIME_BUDGET_SECONDS,
+        fanout_deadline_seconds=FANOUT_DEADLINE_SECONDS,
+    )
 
-    delay = start_delay(rng)
-    print(f"start jitter: sleeping {delay:.0f}s", flush=True)
-    time.sleep(delay)
 
-    apns = APNsClient.from_env()
-    with httpx.Client(http2=True, timeout=20, follow_redirects=True) as http:
-        result = run(db, apns, http, rng=rng, process_started=process_started)
-    print(json.dumps(result), flush=True)
-    for annotation in (error_annotation(result), failure_annotation(result)):
-        if annotation:
-            print(annotation, flush=True)
-    raise SystemExit(exit_code(result))
+def poll_main(provider: str, process_started: float | None = PROCESS_STARTED) -> None:
+    """One provider's poll job (`--provider <name>`): reads and serves only that
+    provider's watches, on that provider's own budget, and never prunes."""
+    profile = poll_profile(provider)
+    rng = random.Random()
+    db = SupabaseClient.from_env()
+    preflight(db)  # each poll job guards drift independently, as the whole-fleet run did
+    _execute(
+        db, rng, process_started,
+        provider=provider, prune=False,
+        time_budget_seconds=profile.time_budget_seconds,
+        fanout_deadline_seconds=profile.fanout_deadline_seconds,
+    )
+
+
+def providers_with_watches(db) -> list[str]:
+    """The registered providers that currently have at least one monitoring
+    watch, sorted. On any read failure it falls back to EVERY registered provider
+    rather than skipping one: a plan-side blip must never silently drop a
+    provider's whole poll for the cycle. `watches.provider` is a WARN column, so
+    a database without 0002 rejects the projected read; it is retried without the
+    column, and provider_name() `.get()`-defaults every row to recreation_gov —
+    correct, since a pre-0002 database has only recreation.gov watches."""
+    try:
+        try:
+            rows = paginated_select(
+                db, "watches", {"status": "eq.monitoring", "select": "id,provider"}
+            )
+        except Exception as exc:
+            if not is_missing_column_rejection(exc):
+                raise
+            rows = paginated_select(db, "watches", {"status": "eq.monitoring", "select": "id"})
+        return sorted({provider_name(r) for r in rows} & set(PROVIDERS))
+    except Exception:  # fail-safe: a plan blip runs every provider, never none
+        return sorted(PROVIDERS)
+
+
+def _emit_github_output(name: str, value: str) -> None:
+    """Set a GitHub Actions step output (and echo to stdout for local runs)."""
+    print(f"{name}={value}", flush=True)
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{name}={value}\n")
+
+
+def plan_main() -> None:
+    """The plan job (`--plan`): emit the per-provider poll matrix, then own the
+    once-per-cycle retention prune. It is the one job that runs every cycle, so
+    pruning — whole-fleet and provider-neutral — belongs here and not replicated
+    across the poll jobs. A HALT-table prune failure reddens this job (the split
+    equivalent of the systemic verdict the monolithic run gave a prune failure);
+    the alert_history prune stays reported-but-unrated, as its insert path is."""
+    db = SupabaseClient.from_env()
+    providers = providers_with_watches(db)
+    matrix = {
+        "include": [
+            {"provider": name, "timeout": int(poll_profile(name).job_timeout_seconds // 60)}
+            for name in providers
+        ]
+    }
+    # A provider with no watches is absent from the matrix, so it runs no poll
+    # job at all; an empty fleet emits run_poll=false and the workflow skips the
+    # whole matrix rather than expanding an empty one.
+    _emit_github_output("run_poll", "true" if providers else "false")
+    _emit_github_output("matrix", json.dumps(matrix, separators=(",", ":")))
+
+    rated, warn = prune_retention(db, datetime.now(timezone.utc))
+    if warn is not None:
+        print(f"::warning::alert_history prune: {summarize_exception(warn)}", flush=True)
+    if rated:
+        for label, exc in sorted(rated.items()):
+            print(f"::error::{label}: {summarize_exception(exc)}", flush=True)
+        raise SystemExit(1)
+
+
+def cli(argv: list[str] | None = None) -> None:
+    """Dispatch the three run modes. No flags is the whole-fleet run; --provider
+    is one provider's poll job; --plan emits the matrix and prunes."""
+    parser = argparse.ArgumentParser(description="CampAssist availability monitor")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--provider", help="poll only this provider's watches (one poll job)")
+    group.add_argument(
+        "--plan", action="store_true",
+        help="emit the per-provider job matrix and run the retention prune (the plan job)",
+    )
+    args = parser.parse_args(argv)
+    if args.plan:
+        plan_main()
+    elif args.provider:
+        poll_main(args.provider)
+    else:
+        main()
 
 
 if __name__ == "__main__":
-    main()
+    cli()
