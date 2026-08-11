@@ -1291,7 +1291,10 @@ def test_a_pool_wide_unpollable_condition_goes_red_without_erroring_the_pool():
     summary = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
 
     assert [r["status"] for r in db.tables["watches"]] == ["monitoring"] * 4
-    assert not [c for c in db.calls if c[0] == "patch"]
+    # no watch is errored or otherwise status-changed — the only write is the
+    # filter-scoped blanket freshness stamp (last_checked_at), which cannot
+    # exclude these still-'monitoring' rows. The pool is left intact.
+    assert not [c for c in db.calls if c[0] == "patch" and "status" in c[3]]
     # loud: red, with the count on the world-readable row and the field at
     # fault operator-only, exactly as the isolated case renders it
     assert monitor.exit_code(summary) == 1

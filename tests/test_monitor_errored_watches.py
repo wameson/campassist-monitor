@@ -363,7 +363,8 @@ def test_only_a_missing_column_is_retried_without_the_reason(exc):
 
     result, _ = run_cycle(db)
 
-    assert len(db.calls_of("patch", "watches")) == 1
+    # one error write (exclude the filter-scoped blanket freshness stamp)
+    assert len([c for c in db.calls_of("patch", "watches") if "id" in c[2]]) == 1
     assert db.tables["watches"][0]["status"] == "monitoring"  # the write never landed
     assert result["watch_errors"] == 1  # recorded, not swallowed
 
@@ -452,7 +453,7 @@ def test_a_rejection_that_is_not_the_drift_still_fans_out_and_isolates():
 
     per_id = [
         c for c in db.calls_of("patch", "watches")
-        if c[2]["id"].startswith("eq.")
+        if "id" in c[2] and c[2]["id"].startswith("eq.")
         and c[3].get("error_reason") == monitor.ERROR_REASON_CAMPGROUND_NOT_FOUND
     ]
     assert [c[2]["id"] for c in per_id] == ["eq.w0", "eq.w1", "eq.w2"]

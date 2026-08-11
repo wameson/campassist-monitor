@@ -385,7 +385,8 @@ def test_preflight_manifest_matches_schema_sql():
     # Sanity first, so a parser that silently matched nothing fails loudly
     # instead of agreeing with an empty manifest.
     assert set(parsed) == {
-        "watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries"
+        "watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries",
+        "poll_units",
     }
     assert sum(len(c) for c in parsed.values()) >= 25
     assert all(len(c) >= 4 for c in parsed.values())

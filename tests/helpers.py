@@ -11,6 +11,7 @@ touches the network or real secrets.
 
 from __future__ import annotations
 
+import inspect
 import json as jsonlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,8 +22,18 @@ from apns import DELIVERED
 from providers.going_to_camp import ATTRIBUTES_URL, EQUIPMENT_URL, RESOURCES_URL
 
 NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+# make_watch's default updated_at: well before any test cycle's watermark, so a
+# watch is picked up by the read-reduction's "edited since last cycle" read only
+# when a test sets a recent value on purpose (the edited/unpaused-watch cases).
+OLD_UPDATED_AT = "2020-01-01T00:00:00+00:00"
 
-TABLES = ("watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries")
+TABLES = (
+    "watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries",
+    "poll_units",
+)
+# The monitoring_plan view's columns (== monitor.PLAN_COLUMNS): a derived,
+# read-only DISTINCT over the monitoring watches, which FakeDB.select computes.
+_PLAN_COLUMNS = ("provider", "campground_id", "provider_ref", "start_date", "end_date")
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -112,6 +123,9 @@ class FakeDB:
         for name, rows in (tables or {}).items():
             self.tables[name] = [dict(r) for r in rows]
         self.calls: list[tuple] = []
+        # (table, rows_returned) per successful select — the egress read-reduction
+        # tests sum the `watches` rows a cycle actually pulled over the wire.
+        self.reads: list[tuple[str, int]] = []
         # fail_on(call_tuple) -> exception to raise, or None to let it through
         self.fail_on = fail_on or (lambda call: None)
         # When True, a select carrying a `select=col,col` projection returns only
@@ -126,8 +140,17 @@ class FakeDB:
 
     def _guard(self, call: tuple) -> None:
         """Raise for an injected fault after recording the attempt — a real
-        client also issues the request before learning it was rejected."""
-        exc = self.fail_on(call)
+        client also issues the request before learning it was rejected.
+
+        A fail_on that declares a second parameter is handed `self` too, so it can
+        model a filter-scoped write faithfully — e.g. the blanket last_checked
+        stamp fails only if a still-'monitoring' bad row is in its scope. One-arg
+        fail_ons (the common `lambda call: …`) are called unchanged."""
+        try:
+            params = len(inspect.signature(self.fail_on).parameters)
+        except (TypeError, ValueError):
+            params = 1
+        exc = self.fail_on(call, self) if params >= 2 else self.fail_on(call)
         if exc is not None:
             raise exc
 
@@ -138,16 +161,37 @@ class FakeDB:
     def calls_of(self, op: str, table: str | None = None) -> list[tuple]:
         return [c for c in self.calls if c[0] == op and (table is None or c[1] == table)]
 
+    def _monitoring_plan_rows(self) -> list[dict]:
+        """The monitoring_plan view: a DISTINCT projection of the monitoring
+        watches to the poll-planning columns, computed on the fly the way the real
+        view is (PostgREST exposes a view as a selectable relation)."""
+        seen: set = set()
+        rows: list[dict] = []
+        for w in self.tables["watches"]:
+            if str(w.get("status")) != "monitoring":
+                continue
+            row = {c: w.get(c) for c in _PLAN_COLUMNS}
+            key = jsonlib.dumps(row, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        return rows
+
     def select(self, table, params=None):
         call = ("select", table, params)
         self.calls.append(call)
         self._guard(call)
         params = params or {}
-        rows = [dict(r) for r in self.tables[table] if _matches(r, params)]
+        source = self._monitoring_plan_rows() if table == "monitoring_plan" else self.tables[table]
+        rows = [dict(r) for r in source if _matches(r, params)]
         order = params.get("order")
         if order:
             column = str(order).split(".")[0]
             rows.sort(key=lambda r: str(r.get(column)))
+        offset = params.get("offset")
+        if offset is not None:
+            rows = rows[int(offset):]
         limit = params.get("limit")
         if limit is not None:
             rows = rows[: int(limit)]
@@ -157,6 +201,7 @@ class FakeDB:
         if self.project and projection and projection != "*":
             columns = [c for c in str(projection).split(",") if c]
             rows = [{c: r[c] for c in columns if c in r} for r in rows]
+        self.reads.append((table, len(rows)))
         return rows
 
     def insert(self, table, rows):
@@ -164,7 +209,16 @@ class FakeDB:
         self.calls.append(call)
         self._guard(call)
         rows = [rows] if isinstance(rows, dict) else rows
-        self.tables[table].extend(dict(r) for r in rows)
+        stored = []
+        for r in rows:
+            r = dict(r)
+            # Mirror the DEFAULT now() the real schema stamps on these columns, so
+            # a cross-cycle read that depends on them (the read-reduction's
+            # watermark reads run_summaries.ran_at) behaves like PostgREST.
+            if table == "run_summaries" and "ran_at" not in r:
+                r["ran_at"] = NOW.isoformat()
+            stored.append(r)
+        self.tables[table].extend(stored)
 
     def upsert(self, table, rows, on_conflict=None):
         call = ("upsert", table, rows)
@@ -189,9 +243,12 @@ class FakeDB:
         call = ("patch", table, params, data)
         self.calls.append(call)
         self._guard(call)
+        matched = 0
         for row in self.tables[table]:
             if _matches(row, params):
                 row.update(data)
+                matched += 1
+        return matched  # mirrors PostgREST's count=exact Content-Range total
 
     def delete(self, table, params):
         call = ("delete", table, params)
@@ -362,6 +419,7 @@ def make_watch(**overrides) -> dict:
         "created_at": None,
         "last_checked_at": None,
         "last_found_at": None,
+        "updated_at": OLD_UPDATED_AT,
     }
     watch.update(overrides)
     return watch

@@ -67,7 +67,25 @@ CREATE TABLE watches (
     consecutive_not_found INT NOT NULL DEFAULT 0,    -- cycles the campground 404ed; status='error' at 3
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     last_checked_at TIMESTAMPTZ,
-    last_found_at   TIMESTAMPTZ
+    last_found_at   TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- bumped ONLY on a user edit
+                                                     -- (status/dates/site_ids/…), never by the
+                                                     -- monitor's own bookkeeping writes — see the
+                                                     -- watches_touch_updated_at trigger below and
+                                                     -- migrations/0009. The egress read-reduction's
+                                                     -- watermark reads this to find newly created,
+                                                     -- edited, or unpaused watches on a unit whose
+                                                     -- availability did not change.
+);
+
+-- One row per distinct poll unit, holding the hash of its last-seen RAW
+-- availability, so the cycle can read back watch rows only for units that
+-- actually changed (egress read-reduction; migrations/0010). Service-role only.
+CREATE TABLE poll_units (
+    unit_key      TEXT PRIMARY KEY,      -- monitor.unit_key(provider, PollKey)
+    raw_hash      TEXT NOT NULL,         -- SHA-256 of the last-seen raw availability
+    campground_id TEXT,                  -- operator legibility / campground-scoped prune
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE device_tokens (
@@ -132,6 +150,9 @@ ALTER TABLE device_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sent_alerts   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alert_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_summaries ENABLE ROW LEVEL SECURITY;
+-- poll_units carries no user data and is service-role only: RLS on, NO policy,
+-- so no anon/user role can touch it (the monitor's service role bypasses RLS).
+ALTER TABLE poll_units    ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "own watches"  ON watches       FOR ALL    USING (user_id = auth.uid());
 CREATE POLICY "own token"    ON device_tokens FOR ALL    USING (user_id = auth.uid());
@@ -177,3 +198,46 @@ DROP TRIGGER IF EXISTS watch_cap ON watches;
 CREATE TRIGGER watch_cap
     BEFORE INSERT OR UPDATE ON watches
     FOR EACH ROW EXECUTE FUNCTION enforce_watch_cap();
+
+-- Bump watches.updated_at only on a user-meaningful edit (migrations/0009).
+-- The monitor's own bookkeeping columns (state_hash, last_found_at,
+-- last_checked_at, consecutive_not_found, error_reason) are deliberately absent
+-- from the change test: if a monitor write bumped updated_at, every row it wrote
+-- would re-enter the read-reduction's watermark window and be re-read next cycle,
+-- defeating the reduction. So "updated_at" means "a user changed something the
+-- monitor must re-evaluate", not "any write touched this row".
+CREATE OR REPLACE FUNCTION watches_touch_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.updated_at := now();
+    ELSIF (NEW.status           IS DISTINCT FROM OLD.status
+        OR NEW.site_ids         IS DISTINCT FROM OLD.site_ids
+        OR NEW.start_date        IS DISTINCT FROM OLD.start_date
+        OR NEW.end_date          IS DISTINCT FROM OLD.end_date
+        OR NEW.campground_id     IS DISTINCT FROM OLD.campground_id
+        OR NEW.provider          IS DISTINCT FROM OLD.provider
+        OR NEW.provider_ref      IS DISTINCT FROM OLD.provider_ref
+        OR NEW.include_ada_only  IS DISTINCT FROM OLD.include_ada_only
+        OR NEW.date_mode         IS DISTINCT FROM OLD.date_mode
+        OR NEW.flex_min_nights   IS DISTINCT FROM OLD.flex_min_nights
+        OR NEW.flex_max_nights   IS DISTINCT FROM OLD.flex_max_nights) THEN
+        NEW.updated_at := now();
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS watches_touch_updated_at ON watches;
+CREATE TRIGGER watches_touch_updated_at
+    BEFORE INSERT OR UPDATE ON watches
+    FOR EACH ROW EXECUTE FUNCTION watches_touch_updated_at();
+
+-- Deduped poll-planning inputs, computed server-side so the cycle reads ~one row
+-- per real unit instead of one per watch (egress read-reduction; migrations/0011).
+-- Columns are exactly what the providers' poll_plan reads; deduplication
+-- collapses everything watch-specific. provider_ref carries identifiers only —
+-- request hosts stay pinned constants in code (SSRF invariant).
+CREATE OR REPLACE VIEW monitoring_plan AS
+    SELECT DISTINCT provider, campground_id, provider_ref, start_date, end_date
+    FROM watches
+    WHERE status = 'monitoring';
