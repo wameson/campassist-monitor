@@ -237,7 +237,16 @@ CREATE TRIGGER watches_touch_updated_at
 -- Columns are exactly what the providers' poll_plan reads; deduplication
 -- collapses everything watch-specific. provider_ref carries identifiers only —
 -- request hosts stay pinned constants in code (SSRF invariant).
-CREATE OR REPLACE VIEW monitoring_plan AS
+--
+-- Security: security_invoker = true makes the view enforce `watches` RLS ('own
+-- watches', user_id = auth.uid()) for the querying role, and the default public
+-- grants are REVOKEd, so no anon/authenticated caller can read any camper's
+-- planning inputs over /rest/v1. The monitor's service role bypasses RLS, so it
+-- still sees EVERY monitoring watch's units — the plan stays complete and the
+-- egress win is unaffected; the explicit service_role GRANT self-documents that.
+CREATE OR REPLACE VIEW monitoring_plan WITH (security_invoker = true) AS
     SELECT DISTINCT provider, campground_id, provider_ref, start_date, end_date
     FROM watches
     WHERE status = 'monitoring';
+REVOKE ALL ON monitoring_plan FROM anon, authenticated;
+GRANT SELECT ON monitoring_plan TO service_role;
