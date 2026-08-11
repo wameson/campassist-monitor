@@ -132,7 +132,7 @@ shape, abridged:
 | Table | Columns | Notes |
 |---|---|---|
 | `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `date_mode`, `flex_min_nights`, `flex_max_nights`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site; `date_mode ∈ fixed/flexible` (Phase 16) |
-| `device_tokens` | `user_id` (PK), `apns_token`, `environment`, `updated_at` | `environment ∈ production/sandbox` — per-token APNs host routing |
+| `device_tokens` | `user_id`, `apns_token` (composite PK since 0012), `environment`, `updated_at` | `environment ∈ production/sandbox` — per-token APNs host routing; composite key lets one user hold several devices |
 | `sent_alerts` | `id`, `watch_id`, `site_id`, `date`, `sent_at` | `UNIQUE(watch_id, site_id, date)` — the dedup key; **never read by the app** |
 | `alert_history` | `id`, `watch_id`, `campground_name`, `start_date`, `end_date`, `site_count`, `delivered_at` | **the app's server-truth Alert History** — one row per DELIVERED push; RLS scoped to the owning user like `sent_alerts` |
 | `run_summaries` | `id`, `ran_at`, `watches_checked`, `campgrounds_polled`, `alerts_sent`, `duration_ms`, `errors` | **world-readable** (`USING (true)`) — see Rendering channels |
@@ -190,6 +190,7 @@ alert cooldown), so the app's Alert History still shows the last 30 days.
 | `0006_watches_flexible_dates.sql` | `date_mode`, `flex_min_nights`, `flex_max_nights` | `WARN` (read via `.get` with a `'fixed'`/None default — unmigrated DB reads every watch as fixed) |
 | `0007_watches_provider_use_direct.sql` | widens the `provider` CHECK to admit `'use_direct'` (no new column) | n/a — no column, so `preflight.REQUIRED` is unchanged |
 | `0008_watches_user_cap.sql` | `enforce_watch_cap` trigger — caps each user at 20 active watches (`status IN ('monitoring','paused')`), rejecting a breach with `check_violation`/hint `WATCH_CAP_EXCEEDED` | n/a — a trigger, not a column, so `preflight.REQUIRED` is unchanged (like `0007`) |
+| `0012_device_tokens_multi.sql` | widens `device_tokens` PK to the composite `(user_id, apns_token)` so one user can hold several devices and an alert fans out to every token (0009–0011 owned by a concurrent worker) | n/a — no new column, so `preflight.REQUIRED` is unchanged (`user_id`/`apns_token` already in the manifest) |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
 deliberate.** There is no auto-apply anywhere: not in CI, not in the monitor, not behind a
@@ -369,8 +370,9 @@ APNs HTTP/2 with an ES256 JWT (`iss`=team, `kid`=key, cached ~50 min), `apns-pus
 `apns-priority: 10`, `apns-topic`=bundle id, host routed by `device_tokens.environment`.
 A `410` (Unregistered) deletes the dead token row; so does a `400` naming the token itself
 dead (`BadDeviceToken` / `Unregistered`, `apns.DEAD_TOKEN_REASONS`) — the app re-registers a
-fresh token on next launch (Phase 15). Both are keyed on `device_tokens.user_id` (the PK), so
-the prune removes exactly that one user's token and no other's, and only when a push was being
+fresh token on next launch (Phase 15). Both are keyed on the full `(user_id, apns_token)` (the
+composite PK since 0012), so the prune removes exactly that one dead device's token — never the
+same user's other live devices, and no other user's — and only when a push was being
 sent (no per-watch write on a no-change cycle). A `410` is a clean prune reported to neither
 audience; a `400` still surfaces to the operator like every other 4xx (unrated all the same).
 
