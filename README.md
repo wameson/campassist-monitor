@@ -420,12 +420,22 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   cycle. Strike-count (`consecutive_not_found`) writes are pure bookkeeping: a
   rejected one is recorded, but the watch is still delta-checked, alerted, and
   stamped `last_checked_at`.
-- **Alert delivery:** an APNs 5xx/429 or transient transport error keeps
+- **Alert delivery:** a user can register more than one device (the
+  `device_tokens` PK is the composite `(user_id, apns_token)` since migration
+  0012), so an alert **fans out to every one of that user's tokens** in a single
+  send. It is still one alert *event* — deduped once by `(watch_id, site_id,
+  date)` — simply delivered to N devices. The per-user outcome is aggregated:
+  **delivered** if at least one token returned 200 (the caller marks
+  `sent_alerts` and advances the `state_hash`; a device that missed it is
+  covered by APNs store-and-forward); otherwise **retryable** if any token was
+  5xx/429/transport (keep the old hash, retry the whole set next cycle);
+  otherwise **permanent**. An APNs 5xx/429 or transient transport error keeps
   the watch's old `state_hash` so the alert is retried next cycle; a 410
   (Unregistered), or a 400 naming the token itself dead (`BadDeviceToken` /
-  `Unregistered`), means the device token is dead and its row is deleted —
-  keyed on `device_tokens.user_id` (the PK), so exactly that one user's token
-  goes and no other's, and the app re-registers a fresh token on next launch.
+  `Unregistered`), means that device token is dead and **only its own row** is
+  deleted — keyed on the full `(user_id, apns_token)`, so one dead device never
+  wipes out the same user's other, live devices and no other user's token is
+  touched; the app re-registers a fresh token on next launch.
   The rest of the 4xx space is split by *who can fix it*:
   - A **per-device** rejection (400 `BadDeviceToken` [now pruned] /
     `DeviceTokenNotForTopic`, a reason code we don't enumerate, a missing token

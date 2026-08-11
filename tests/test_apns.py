@@ -88,8 +88,10 @@ def test_apns_410_cleanup(signing_key):
 
     assert outcome == apns.PERMANENT_FAILURE
     assert db.tables["device_tokens"] == []
+    # keyed on the composite (user_id, apns_token) PK, not user_id alone, so a
+    # dead token prunes exactly its own row and never a sibling device's
     assert db.calls_of("delete", "device_tokens") == [
-        ("delete", "device_tokens", {"user_id": "eq.u1"})
+        ("delete", "device_tokens", {"user_id": "eq.u1", "apns_token": "eq.devicetoken"})
     ]
 
 
@@ -108,7 +110,7 @@ def test_apns_400_dead_token_pruned(signing_key, reason):
     assert outcome == apns.PERMANENT_FAILURE
     assert db.tables["device_tokens"] == []
     assert db.calls_of("delete", "device_tokens") == [
-        ("delete", "device_tokens", {"user_id": "eq.u1"})
+        ("delete", "device_tokens", {"user_id": "eq.u1", "apns_token": "eq.devicetoken"})
     ]
     # unlike a 410 (a clean prune), a 400 rejection is still surfaced to the
     # caller so it renders in the operator annotation like every other 4xx
@@ -116,8 +118,8 @@ def test_apns_400_dead_token_pruned(signing_key, reason):
 
 
 def test_apns_400_dead_token_prunes_only_this_user(signing_key):
-    # device_tokens.user_id is the PK: pruning this user's dead token leaves
-    # every other user's token untouched.
+    # pruning this user's dead token leaves every other user's token untouched
+    # (the (user_id, apns_token) filter scopes the delete to this user's row).
     _, pem = signing_key
     client = make_client(pem, handler=lambda request: httpx.Response(400, json={"reason": "BadDeviceToken"}))
     db = FakeDB({"device_tokens": [
@@ -130,6 +132,108 @@ def test_apns_400_dead_token_prunes_only_this_user(signing_key):
     assert db.tables["device_tokens"] == [
         {"user_id": "u2", "apns_token": "livetoken", "environment": "production"},
     ]
+
+
+def multi_token_db():
+    # one user, two devices — the shape migration 0012 enables
+    return FakeDB({"device_tokens": [
+        {"user_id": "u1", "apns_token": "deviceA", "environment": "production"},
+        {"user_id": "u1", "apns_token": "deviceB", "environment": "production"},
+    ]})
+
+
+def test_fanout_pushes_to_every_device(signing_key):
+    # an alert reaches all of a user's registered devices in one call, and the
+    # per-opening dedup still sees exactly one DELIVERED event
+    _, pem = signing_key
+    pushed = []
+
+    def handler(request):
+        pushed.append(request.url.path)
+        return httpx.Response(200)
+
+    client = make_client(pem, handler=handler)
+    outcome = client.send_alert(make_watch(), OPENINGS, multi_token_db())
+
+    assert outcome == apns.DELIVERED
+    assert sorted(pushed) == ["/3/device/deviceA", "/3/device/deviceB"]
+
+
+def test_fanout_partial_failure_is_delivered(signing_key):
+    # one device 200s, the other 500s: the opening reached a phone, so the
+    # aggregate is DELIVERED (caller advances the hash); the 5xx is still
+    # surfaced to the operator but does not hold the whole set back
+    _, pem = signing_key
+
+    def handler(request):
+        return httpx.Response(200 if request.url.path.endswith("deviceA") else 500)
+
+    client = make_client(pem, handler=handler)
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, multi_token_db(), failures=failures)
+
+    assert outcome == apns.DELIVERED
+    assert len(failures) == 1 and isinstance(failures[0], httpx.HTTPStatusError)
+
+
+def test_fanout_no_delivery_all_retryable_is_retryable(signing_key):
+    # nobody delivered and at least one device was 5xx/429: keep the hash and
+    # retry the whole set next cycle
+    _, pem = signing_key
+
+    def handler(request):
+        return httpx.Response(503 if request.url.path.endswith("deviceA") else 429)
+
+    client = make_client(pem, handler=handler)
+    assert client.send_alert(make_watch(), OPENINGS, multi_token_db()) == apns.RETRYABLE_FAILURE
+
+
+def test_fanout_config_fault_outranks_retryable(signing_key):
+    # no delivery, one retryable + one pool-wide config fault: the config fault
+    # is the operator-actionable signal, so it wins (still rated, hash kept)
+    _, pem = signing_key
+
+    def handler(request):
+        if request.url.path.endswith("deviceA"):
+            return httpx.Response(503)
+        return httpx.Response(403, json={"reason": "ExpiredProviderToken"})
+
+    client = make_client(pem, handler=handler)
+    assert client.send_alert(make_watch(), OPENINGS, multi_token_db()) == apns.CONFIG_FAILURE
+
+
+def test_fanout_dead_token_pruned_without_touching_sibling(signing_key):
+    # deviceA is dead (410) while deviceB delivers: only deviceA's row is
+    # pruned, deviceB survives, and the aggregate is DELIVERED
+    _, pem = signing_key
+
+    def handler(request):
+        if request.url.path.endswith("deviceA"):
+            return httpx.Response(410, json={"reason": "Unregistered"})
+        return httpx.Response(200)
+
+    client = make_client(pem, handler=handler)
+    db = multi_token_db()
+    outcome = client.send_alert(make_watch(), OPENINGS, db)
+
+    assert outcome == apns.DELIVERED
+    assert db.tables["device_tokens"] == [
+        {"user_id": "u1", "apns_token": "deviceB", "environment": "production"},
+    ]
+    assert db.calls_of("delete", "device_tokens") == [
+        ("delete", "device_tokens", {"user_id": "eq.u1", "apns_token": "eq.deviceA"})
+    ]
+
+
+def test_fanout_all_dead_tokens_is_permanent(signing_key):
+    # every device is a dead token: all rows pruned, aggregate PERMANENT so the
+    # caller advances the hash and does not retry dead tokens forever
+    _, pem = signing_key
+    client = make_client(pem, handler=lambda request: httpx.Response(410, json={"reason": "Unregistered"}))
+    db = multi_token_db()
+
+    assert client.send_alert(make_watch(), OPENINGS, db) == apns.PERMANENT_FAILURE
+    assert db.tables["device_tokens"] == []
 
 
 def test_apns_400_config_fault_does_not_prune_token(signing_key):

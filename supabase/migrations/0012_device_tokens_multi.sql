@@ -1,0 +1,48 @@
+-- 0012: let one user hold more than one device token (cross-device push fan-out)
+--
+-- Why: device_tokens.user_id was the PRIMARY KEY — exactly one push token per
+-- user. Once the app lets a second device adopt the same anonymous identity
+-- (the cross-device watch-sync feature; the iOS half ships separately), that
+-- device's RegisterDeviceUseCase upsert would overwrite the first device's
+-- token and the first phone would silently stop receiving alerts. This widens
+-- the primary key to the composite (user_id, apns_token) so each device gets
+-- its own row, and the sender fans an alert out to every one of a user's tokens
+-- (scripts/apns.py send_alert).
+--
+-- Why (user_id, apns_token) and not a surrogate device_id: the token IS the
+-- device's push address and is already NOT NULL, so it is the natural key —
+-- no new column, no app-side id to mint and keep in sync, and the RLS policy
+-- keeps working unchanged. A surrogate would buy nothing here: a device that
+-- rotates its APNs token re-registers, and an (user_id, apns_token) key lets
+-- that land as a fresh row (the old, now-dead token is pruned the first time a
+-- push to it 410s), which is exactly the behaviour we want.
+--
+-- RLS: the "own token" policy stays `user_id = auth.uid()` and remains correct
+-- — it scopes a user to their own token rows whether there is one or many, so
+-- this migration does not touch it (schema.sql keeps it as-is).
+--
+-- No new column, so NO preflight.REQUIRED change: both user_id and apns_token
+-- are already in the manifest (scripts/preflight.py) and the monitor reads and
+-- writes exactly the same columns before and after this migration. The only
+-- behaviour that changes is that a second (user_id, apns_token) row is now
+-- allowed to exist; the sender already handles a set of rows.
+--
+-- Correct BEFORE and AFTER apply (like 0008): until this is applied the table
+-- still allows only one token per user, and send_alert's fan-out over "every
+-- row for this user" simply iterates a one-element set — identical to today's
+-- single-token behaviour. So the backend is safe to merge ahead of the apply;
+-- the iOS change that makes a second device register a token must NOT ship to
+-- campers until this migration has been applied by hand (see the PR body).
+--
+-- Idempotent: DROP CONSTRAINT IF EXISTS drops whichever primary key is present
+-- (the original single-column one on first apply, the composite one on a
+-- re-run) and the ADD re-creates the composite key, so re-running lands the
+-- same state either way. Both user_id and apns_token are already NOT NULL, and
+-- before this migration user_id was unique, so no duplicate (user_id,
+-- apns_token) pair can pre-exist to block the new key. Apply it BY HAND in the
+-- Supabase SQL editor, like every file here (see README "Database migrations");
+-- CI does not run migrations. The matching definition is in
+-- supabase/schema.sql so a fresh install and a migrated database agree.
+
+ALTER TABLE device_tokens DROP CONSTRAINT IF EXISTS device_tokens_pkey;
+ALTER TABLE device_tokens ADD CONSTRAINT device_tokens_pkey PRIMARY KEY (user_id, apns_token);
