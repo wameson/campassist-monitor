@@ -179,6 +179,52 @@ APNS_WIPEOUT_FLOOR = 2
 # systemic anyway — fanning out would spend hundreds of writes).
 MAX_LOGGED_WATCH_ERRORS = 10
 PER_ID_FALLBACK_MAX = 50
+# The batched `id=in.(…)` PATCH URL grows one UUID (~39 URL-encoded bytes) per
+# served watch, so a single unchunked write crosses common gateway URI limits
+# (nginx's 8 KB default ≈ 200 ids) well below 100 users — turning every run red
+# and freezing last_checked_at. Splitting the ids into fixed-size chunks bounds
+# each URL: 150 ids ≈ 5.9 KB, comfortably under 8 KB, while staying above the
+# 100-watch no-change budget test so that cycle is still a single request. Each
+# chunk keeps the same isolate-the-bad-row fan-out semantics; the shared
+# FanoutBudget is charged across all of them (see patch_watches).
+PATCH_ID_CHUNK_MAX = 150
+# Rows per page for the cycle's `watches` reads. PostgREST's `max-rows` (a
+# Supabase server setting this repo does not control) silently truncates a
+# single unbounded GET to the first max-rows rows — every watch past that count
+# would go unpolled behind a green run. paginated_select walks id=gt.<last>
+# until an empty page, which is correct for any max-rows value, including one
+# below this page size.
+SELECT_PAGE_SIZE = 1000
+# The columns the cycle actually reads off a monitoring watch — every field
+# run(), apns.send_alert, or any provider touches. Projecting the monitoring
+# read to these trims per-row egress (the dominant Supabase egress term at
+# scale) vs select=*. WARN columns an unapplied migration may lack are included,
+# so on a *drifted* database the projected read is rejected (42703) and
+# read_monitoring_watches falls back to the tolerant select=* read — preserving
+# the `.get()`-tolerance the WARN classification in preflight.REQUIRED rests on.
+# NEVER narrow this below what the code reads: an omitted-but-present column
+# raises no error, only silently wrong behaviour (`.get()` sees its default).
+# error_reason is deliberately absent (a monitoring watch never carries one; the
+# errored-watch census reads it and keeps its own select=* for that reason), as
+# are the write-only/app-only columns campground_state, created_at,
+# last_checked_at, last_found_at, flex_max_nights.
+WATCH_READ_COLUMNS = (
+    "id",
+    "user_id",
+    "provider",
+    "provider_ref",
+    "campground_id",
+    "campground_name",
+    "site_ids",
+    "include_ada_only",
+    "start_date",
+    "end_date",
+    "date_mode",
+    "flex_min_nights",
+    "consecutive_not_found",
+    "state_hash",
+    "status",
+)
 # The per-id fan-out must never cost the run its summary row and its pruning,
 # so it is capped twice and the arithmetic closes against the workflow's
 # `timeout-minutes: 15` (900 s, .github/workflows/monitor.yml):
@@ -580,6 +626,70 @@ def rejects_missing_column(exc: BaseException, column: str) -> bool:
     return column in str(body.get("message") or "")
 
 
+def is_missing_column_rejection(exc: BaseException) -> bool:
+    """True when PostgREST rejected a request because a named column is absent
+    from the live database — an unapplied migration — whatever the column.
+
+    Unlike `rejects_missing_column`, the caller does not know which column: a
+    projected read names several at once, so only the code is checked, never the
+    `message` (which would echo one arbitrary column name). Same permanent-4xx +
+    missing-column-code signature otherwise. Used by `read_monitoring_watches`
+    to fall back from a column-scoped read to the tolerant select=* read on a
+    drifted database.
+    """
+    if not is_permanent_failure(exc):
+        return False
+    body = _response_body_dict(getattr(exc, "response", None))
+    return str(body.get("code")) in WRITE_MISSING_COLUMN_CODES
+
+
+def paginated_select(db, table: str, params: dict, *, page_size: int = SELECT_PAGE_SIZE) -> list[dict]:
+    """Read every matching row, keyset-paginated by `id` ascending.
+
+    A single unbounded GET is silently truncated to PostgREST's `max-rows` cap
+    (a Supabase server setting this repo does not control), so a fleet past that
+    count would go unpolled behind a green run — a silent skip that is worse
+    than a slow one. Walking `id=gt.<last>` until an empty page returns is
+    correct for *any* max-rows value, including one smaller than `page_size`;
+    the cost is one trailing empty GET. Reads only, so the write budget is
+    untouched.
+    """
+    rows: list[dict] = []
+    cursor: str | None = None
+    while True:
+        page_params = {**params, "order": "id.asc", "limit": str(page_size)}
+        if cursor is not None:
+            page_params["id"] = f"gt.{cursor}"
+        page = db.select(table, page_params)
+        if not page:
+            break
+        rows.extend(page)
+        cursor = str(page[-1]["id"])
+    return rows
+
+
+def read_monitoring_watches(db) -> list[dict]:
+    """The cycle's monitoring set: column-scoped and paginated.
+
+    Scoped to WATCH_READ_COLUMNS to trim per-row egress vs select=* (the
+    dominant Supabase egress term at scale). On a live database missing a WARN
+    column the projection names (an unapplied migration), PostgREST rejects the
+    whole read with 42703; we fall back to the tolerant select=* read — the
+    `.get()`-tolerant read the WARN classification in preflight.REQUIRED depends
+    on — for the rest of this cycle. Any other read failure propagates as it did
+    before, aborting the cycle: without the monitoring set there is nothing to
+    poll. Both the projected and the fallback read are paginated so a max-rows
+    cap cannot silently drop watches.
+    """
+    base = {"status": "eq.monitoring"}
+    try:
+        return paginated_select(db, "watches", {**base, "select": ",".join(WATCH_READ_COLUMNS)})
+    except Exception as exc:  # containment: retry drift-tolerantly, re-raise the rest
+        if is_missing_column_rejection(exc):
+            return paginated_select(db, "watches", base)
+        raise
+
+
 def error_reason_census(rows) -> list[tuple[str, int]]:
     """Per-reason tally of the errored watches, commonest first.
 
@@ -668,19 +778,27 @@ def patch_watches(
     *,
     budget: FanoutBudget | None = None,
     fanout=True,
+    chunk_size: int = PATCH_ID_CHUNK_MAX,
 ) -> PatchOutcome:
     """PATCH `data` onto many watches, isolating the row that is actually bad.
 
-    The healthy path is the single batched `id=in.(…)` write the write budget
-    assumes. Only a *permanently* rejected batch (a PostgREST 4xx other than
-    429) is retried one id at a time, so one unwritable row cannot silently
-    drop everyone else's update. A transient batch failure (429, 5xx, timeout,
-    transport error) is never fanned out: it marks nothing errored, so
-    isolating it buys nothing, while dozens of sequential 30-second PATCHes
-    against a struggling Supabase would blow the workflow timeout and kill the
-    run before its summary and pruning. For the same reason a fan-out stops as
-    soon as `budget` is spent, and a batch larger than PER_ID_FALLBACK_MAX is
-    not fanned out at all.
+    The ids are split into fixed-size chunks (`chunk_size`) so the `id=in.(…)`
+    URL of each write stays well under common gateway URI limits: an unchunked
+    write of the whole served set grows past those limits below 100 users,
+    turning every run red and freezing last_checked_at (see PATCH_ID_CHUNK_MAX).
+    A pool small enough to fit one chunk is still a single request, so the
+    no-change write budget is unchanged at the scales it covers.
+
+    Within each chunk the healthy path is one batched `id=in.(…)` write. Only a
+    *permanently* rejected batch (a PostgREST 4xx other than 429) is retried one
+    id at a time, so one unwritable row cannot silently drop everyone else's
+    update. A transient batch failure (429, 5xx, timeout, transport error) is
+    never fanned out: it marks nothing errored, so isolating it buys nothing,
+    while dozens of sequential 30-second PATCHes against a struggling Supabase
+    would blow the workflow timeout and kill the run before its summary and
+    pruning. For the same reason a fan-out stops as soon as `budget` is spent
+    (the budget is shared across every chunk), and a batch larger than
+    PER_ID_FALLBACK_MAX is not fanned out at all.
 
     `fanout` lets a caller veto the fallback for rejections it knows are about
     the *payload* rather than any row: `False`, or a predicate on the batch
@@ -694,6 +812,29 @@ def patch_watches(
     ids = sorted(str(i) for i in watch_ids)
     if not ids:
         return PatchOutcome({}, frozenset())
+    if len(ids) <= chunk_size:
+        return _patch_id_batch(db, ids, data, budget=budget, fanout=fanout)
+    failures: dict[str, BaseException] = {}
+    isolated: set[str] = set()
+    for start in range(0, len(ids), chunk_size):
+        outcome = _patch_id_batch(
+            db, ids[start : start + chunk_size], data, budget=budget, fanout=fanout
+        )
+        failures.update(outcome.failures)
+        isolated |= outcome.isolated
+    return PatchOutcome(failures, frozenset(isolated))
+
+
+def _patch_id_batch(
+    db,
+    ids: list[str],
+    data: dict,
+    *,
+    budget: FanoutBudget | None,
+    fanout,
+) -> PatchOutcome:
+    """One chunk's batched PATCH with the per-id isolating fallback. `ids` is a
+    non-empty, sorted list already bounded to a single URL by patch_watches."""
     try:
         db.patch("watches", {"id": f"in.({','.join(ids)})"}, data)
         return PatchOutcome({}, frozenset())
@@ -888,7 +1029,7 @@ def run(
     def blocked(watch: dict) -> bool:
         return str(watch["id"]) in blocked_ids
 
-    watches = db.select("watches", {"status": "eq.monitoring"})
+    watches = read_monitoring_watches(db)
 
     # Visibility: how many watches are sitting in status='error'. That state is
     # terminal — an errored watch is absent from the select above and no code
@@ -911,7 +1052,9 @@ def run(
     # No projection: naming error_reason in a select list would be rejected by
     # exactly the database this design must tolerate (one where 0004 has not been
     # applied), which is how preflight probes for a missing column. select=* is
-    # what keeps the read `.get`-tolerant.
+    # what keeps the read `.get`-tolerant. Left as a single unpaginated GET: this
+    # population (errored watches with a future trip) is small and bounded, unlike
+    # the monitoring set, so it is not the max-rows truncation risk that one is.
     try:
         errored = db.select(
             "watches", {"status": "eq.error", "end_date": f"gte.{today.isoformat()}"}
@@ -1346,6 +1489,19 @@ def run(
     retention_cutoff = iso_now(now - timedelta(days=RETENTION_DAYS))
     contained("sent_alerts prune", db.delete, "sent_alerts", {"sent_at": f"lt.{retention_cutoff}"})
     contained("run_summaries prune", db.delete, "run_summaries", {"ran_at": f"lt.{retention_cutoff}"})
+    # alert_history is otherwise unbounded — one row per delivered push, forever —
+    # a slow storage leak toward the free-tier DB cap. Pruned on the same
+    # RETENTION_DAYS window as the other two tables — but NOT via `contained`:
+    # alert_history is WARN-classified in preflight.REQUIRED (unlike the HALT
+    # tables sent_alerts/run_summaries above), so a database missing 0005 has no
+    # table to delete from. Mirroring the insert path, the failure is reported to
+    # both audiences but UNRATED — it never joins cycle_failures and so an
+    # unapplied 0005 (or any delete failure) cannot redden the run.
+    try:
+        db.delete("alert_history", {"delivered_at": f"lt.{retention_cutoff}"})
+    except Exception as exc:  # reported, never rated
+        errors.append(capped_line(f"alert_history prune: {summarize_exception(exc, safe=True)}"))
+        detail_only.append(capped_line(f"alert_history prune: {summarize_exception(exc)}"))
 
     # The persisted verdict must match the exit code, which is systemic OR any
     # failure belonging to no watch, so fold cycle_failures in before labelling.

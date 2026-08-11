@@ -133,7 +133,7 @@ def test_time_budget_cycle_reaches_bookkeeping():
     # INSERT, and both retention DELETEs
     assert len(db.calls_of("patch", "watches")) == 1
     assert len(db.calls_of("insert", "run_summaries")) == 1
-    assert len(db.calls_of("delete")) == 2
+    assert len(db.calls_of("delete")) == 3
     rows = db.tables["watches"]
     # telemetry reflects only what was actually attempted: skipped watches
     # keep their old last_checked_at and are not counted as checked

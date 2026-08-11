@@ -132,3 +132,37 @@ CREATE POLICY "read own alert history" ON alert_history FOR SELECT
     USING (watch_id IN (SELECT id FROM watches WHERE user_id = auth.uid()));
 CREATE POLICY "read summaries" ON run_summaries FOR SELECT USING (true);
 -- Backend writes via service-role key (bypasses RLS)
+
+-- Per-user active-watch cap (pre-release abuse guardrail; migrations/0008).
+-- Enforced backend-side so the app's own UX cap cannot be bypassed by a client
+-- that INSERTs watch rows directly under RLS. "Active" = status IN
+-- ('monitoring','paused') (the non-terminal states a user still holds); the
+-- terminal 'expired'/'error' rows are never counted, so accumulated history
+-- never locks a user out. Checked only when a row ENTERS the active set (INSERT,
+-- or an UPDATE from a terminal status), so the monitor's own writes on already
+-- active rows are never blocked. On breach it RAISEs check_violation (HTTP 400
+-- via PostgREST) with HINT 'WATCH_CAP_EXCEEDED' so the app can recognise it.
+CREATE OR REPLACE FUNCTION enforce_watch_cap() RETURNS trigger AS $$
+DECLARE
+    active_count INT;
+BEGIN
+    IF NEW.status IN ('monitoring','paused')
+       AND (TG_OP = 'INSERT' OR OLD.status NOT IN ('monitoring','paused')) THEN
+        SELECT count(*) INTO active_count
+        FROM watches
+        WHERE user_id = NEW.user_id
+          AND status IN ('monitoring','paused')
+          AND id <> NEW.id;
+        IF active_count >= 20 THEN
+            RAISE EXCEPTION 'watch cap exceeded: 20 active watches per user'
+                USING ERRCODE = 'check_violation', HINT = 'WATCH_CAP_EXCEEDED';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS watch_cap ON watches;
+CREATE TRIGGER watch_cap
+    BEFORE INSERT OR UPDATE ON watches
+    FOR EACH ROW EXECUTE FUNCTION enforce_watch_cap();

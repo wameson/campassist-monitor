@@ -178,4 +178,4 @@ def test_flexible_write_budget():
     assert db.write_count <= 5
     assert len(db.calls_of("patch")) == 1     # one batched last_checked_at PATCH
     assert len(db.calls_of("insert")) == 1    # run_summaries
-    assert len(db.calls_of("delete")) == 2    # retention
+    assert len(db.calls_of("delete")) == 3    # retention
