@@ -69,8 +69,12 @@ def test_watch_entirely_beyond_horizon_polls_nothing():
     row = db.tables["watches"][0]
     assert row["status"] == "monitoring"
     assert row["state_hash"] is None  # delta detection deferred, not seeded
-    assert row["last_checked_at"] is None  # zero pollable months: not "checked"
-    assert summary["watches_checked"] == 0
+    # The blanket freshness stamp covers every monitoring, non-expired watch —
+    # the watch is still being actively monitored (it becomes pollable once the
+    # horizon reaches it), so last_checked_at reflects that the cycle ran, and
+    # watches_checked counts it as one of the monitored watches.
+    assert row["last_checked_at"] is not None
+    assert summary["watches_checked"] == 1
     assert summary["errors"] is None
 
 

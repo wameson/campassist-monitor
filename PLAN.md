@@ -35,12 +35,13 @@ campassist-monitor (GitHub, PUBLIC since 2026-08-01)
     plan job → dynamic matrix: one poll job per provider with watches (15-min jobs; going_to_camp 20-min)
     ├── preflight: read-only schema-drift probe (before the jitter)
     ├── start jitter: sleep rand(0–20s)
-    ├── read status=eq.monitoring watches + errored-watch census
-    ├── expire past-end_date watches
-    ├── plan PollUnits (provider, PollKey) — deduped cross-user, per provider
+    ├── plan PollUnits from the monitoring_plan view — deduped cross-user, per provider
     ├── poll via each watch's Provider conformer — paced, backed off, time-budgeted
+    ├── diff each unit's raw availability vs poll_units → changed campgrounds
+    ├── read back only the watch rows that can matter (changed/edited/striking/expiring) + errored-watch census
+    ├── expire past-end_date watches
     ├── per watch: extract_relevant → state_hash → delta → alert dedup/cooldown → APNs
-    ├── lifecycle writes (error/strike), batched last_checked_at PATCH
+    ├── lifecycle writes (error/strike); blanket + per-id last_checked_at PATCH; poll_units upsert (changed units)
     └── per-provider run_summaries row (30-day retention prune owned by the plan job)
   .github/workflows/keepalive.yml  monthly commit (GitHub disables crons after 60 idle days)
   .github/workflows/ci.yml         pytest on PR + push to main (ubuntu)
@@ -139,7 +140,8 @@ shape, abridged:
 
 | Table | Columns | Notes |
 |---|---|---|
-| `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `date_mode`, `flex_min_nights`, `flex_max_nights`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site; `date_mode ∈ fixed/flexible` (Phase 16) |
+| `watches` | `id`, `user_id`, `provider`, `provider_ref`, `campground_id`, `campground_name`, `campground_state`, `site_ids`, `include_ada_only`, `start_date`, `end_date`, `date_mode`, `flex_min_nights`, `flex_max_nights`, `status`, `error_reason`, `state_hash`, `consecutive_not_found`, `created_at`, `last_checked_at`, `last_found_at`, `updated_at` | `status ∈ monitoring/paused/expired/error`; `site_ids` empty = any site; `date_mode ∈ fixed/flexible` (Phase 16); `updated_at` bumped only on a user edit (read-reduction watermark, `0009`) |
+| `poll_units` | `unit_key`, `raw_hash`, `campground_id`, `updated_at` | per-unit raw-availability hash for the read-reduction (`0010`); service-role only (RLS on, no policy) |
 | `device_tokens` | `user_id`, `apns_token` (composite PK since 0012), `environment`, `updated_at` | `environment ∈ production/sandbox` — per-token APNs host routing; composite key lets one user hold several devices |
 | `sent_alerts` | `id`, `watch_id`, `site_id`, `date`, `sent_at` | `UNIQUE(watch_id, site_id, date)` — the dedup key; **never read by the app** |
 | `alert_history` | `id`, `watch_id`, `campground_name`, `start_date`, `end_date`, `site_count`, `delivered_at` | **the app's server-truth Alert History** — one row per DELIVERED push; RLS scoped to the owning user like `sent_alerts` |
@@ -198,6 +200,9 @@ alert cooldown), so the app's Alert History still shows the last 30 days.
 | `0006_watches_flexible_dates.sql` | `date_mode`, `flex_min_nights`, `flex_max_nights` | `WARN` (read via `.get` with a `'fixed'`/None default — unmigrated DB reads every watch as fixed) |
 | `0007_watches_provider_use_direct.sql` | widens the `provider` CHECK to admit `'use_direct'` (no new column) | n/a — no column, so `preflight.REQUIRED` is unchanged |
 | `0008_watches_user_cap.sql` | `enforce_watch_cap` trigger — caps each user at 20 active watches (`status IN ('monitoring','paused')`), rejecting a breach with `check_violation`/hint `WATCH_CAP_EXCEEDED` | n/a — a trigger, not a column, so `preflight.REQUIRED` is unchanged (like `0007`) |
+| `0009_watches_updated_at.sql` | `updated_at` column + a trigger that bumps it **only on a user edit** (the read-reduction's edit watermark) | `WARN` (read only in the watermark filter, full-read fallback when absent) |
+| `0010_poll_units.sql` | `poll_units` table (per-unit raw-availability hash, the read-reduction's change store) | `WARN` (whole table; absent → treat every unit as changed = full read) |
+| `0011_monitoring_plan_view.sql` | `monitoring_plan` view (deduped poll-planning inputs) | n/a — a view, not a `CREATE TABLE`, so it is not in `preflight.REQUIRED`; its absence is handled by the same runtime full-read fallback |
 | `0012_device_tokens_multi.sql` | widens `device_tokens` PK to the composite `(user_id, apns_token)` so one user can hold several devices and an alert fans out to every token (0009–0011 owned by a concurrent worker) | n/a — no new column, so `preflight.REQUIRED` is unchanged (`user_id`/`apns_token` already in the manifest) |
 
 **Migrations are applied by hand in the Supabase SQL editor. CI does not run them — this is
@@ -232,7 +237,7 @@ PostgREST answers `400 / 42703`. Two production incidents took exactly that shap
 Incident 2 is the load-bearing lesson: the guard checks the schema **the product** depends on,
 not only what the monitor would crash without.
 
-**How it probes:** one `GET <table>?select=<all manifest columns>&limit=0` per table, four
+**How it probes:** one `GET <table>?select=<all manifest columns>&limit=0` per table, six
 total, before the start jitter. Zero writes, no row data crosses the wire, no new secret
 (reuses `SUPABASE_URL` / `SUPABASE_SERVICE_KEY`). PostgREST validates the `select` list while
 planning, so `limit=0` still proves the columns exist.
@@ -309,18 +314,39 @@ cannot be verified without a write. Both incidents to date were missing columns.
 ## Poll / alert pipeline
 
 ### Write budget
-A no-change whole-fleet cycle performs **≤5 Supabase writes** regardless of watch count: 1 batched
+A no-change whole-fleet cycle performs **≤5 Supabase writes** regardless of watch count: 1 blanket
 `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3 retention DELETEs (`sent_alerts`,
 `run_summaries`, `alert_history`). Enforced by `test_write_budget`. **Do not add per-watch
 writes** — the free tier is the constraint, and delta-only writing is what keeps ~200–500
 writes/day at any scale instead of ~9,600. Under the per-provider poll split (§ Time budget)
 those 5 are **divided by owner, not multiplied**: each provider's poll job (`run(provider=…,
-prune=False)`) does only the 2 writes for its own slice, and the plan job does the 3 retention
-DELETEs once for the whole cycle (`prune_retention`), so three jobs never each prune the fleet. The `last_checked_at` PATCH is chunked into ≤150-id
-batches (`PATCH_ID_CHUNK_MAX`) so its `id=in.(…)` URL cannot outgrow a gateway URI limit as the
-fleet grows; a pool within one chunk is still the single write the budget assumes. The per-cycle
-monitoring read is column-scoped (`WATCH_READ_COLUMNS`, with a `select=*` fallback on a drifted
-DB) and keyset-paginated by `id` so a PostgREST `max-rows` cap cannot silently truncate it.
+prune=False)`) does only the ~2 writes for its own slice, and the plan job does the 3 retention
+DELETEs once for the whole cycle (`prune_retention`), so three jobs never each prune the fleet.
+`last_checked_at` is written two ways: a filter-scoped **blanket** PATCH
+(`status=eq.monitoring&end_date=gte.today`, plus `provider=eq.<job>` on a poll job so it stamps
+only that provider's slice, no id list) that freshens every monitored watch — including the
+quiet-unit rows the read-reduction never read back — plus, for the rows it did read, the per-id
+chunked PATCH (≤150 ids per `id=in.(…)` URL, `PATCH_ID_CHUNK_MAX`) that keeps the fan-out
+isolation which errors a genuinely bad row.
+
+### Per-cycle `watches` read-reduction (egress)
+The dominant Supabase egress term was one `watches` row per monitoring watch, every cycle,
+growing linearly with the fleet against a 5 GB free tier (~88 GB/mo projected at 10k users).
+The reduction (migrations `0009`/`0010`/`0011`) keeps polling every unit — a quiet unit is
+still polled so an opening on it is still noticed — but reads back the watch rows only where a
+change can matter. The deduped poll plan comes from the `monitoring_plan` **view**; each polled
+unit's raw availability is hashed and diffed against `poll_units`; and a cycle reads the full
+watch rows only for a **changed/404ed** campground, plus small bounded sets (`read_process_set`):
+watches **edited since the last cycle** (`watches.updated_at ≥` a watermark from the last
+`run_summaries.ran_at`, closing the new/edited/unpaused-watch hole an unchanged unit does not
+cover), watches carrying a **404 strike**, and **expiring** watches. On a quiet cycle almost no
+watch rows are read; the win is a sensitivity range — ~20× at ~5% of units changing per cycle
+(≈5 GB/mo, at the free tier) down to ~3.4× at ~30% churn (≈26 GB/mo) — holding across the whole
+plausible range. Every read stays column-scoped (`WATCH_READ_COLUMNS`, `select=*` fallback on a
+drifted WARN column) and paginated (keyset for `watches`/`poll_units`, offset for the view) so a
+PostgREST `max-rows` cap cannot truncate it. All three objects are `WARN`: absent, the cycle
+falls back to the full monitoring read (`is_missing_schema_object`), so it is correct at the old
+egress until an operator applies the migrations.
 
 ### Anti-blocking (jittered, polite)
 Random 0–20 s start delay per run; 1.2–2.8 s inter-request delays; randomized poll order;
@@ -637,17 +663,22 @@ Fan-out rules, each with a reason:
 | Verdict | Exit | Rule |
 |---|---|---|
 | *isolated* | 0, schedule green | the healthy watches were served |
-| *systemic* | non-zero + `::error::`, schedule red | more than `SYSTEMIC_ERROR_RATE` (25%) of **served** watches failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) did — so 1-of-2 stays green, 2-of-2 goes red — **or** a failure belonging to no watch occurred |
+| *systemic* | non-zero + `::error::`, schedule red | the **served** set's rated failures exceeded `SYSTEMIC_ERROR_RATE` (25%) of the **whole active-monitoring fleet** **and** at least `SYSTEMIC_ERROR_FLOOR` (2) did — so 1-of-2 stays green, 2-of-2 goes red — **or** a failure belonging to no watch occurred |
 
 Failures belonging to no watch: the `run_summaries` INSERT, retention pruning, being unable to
 write `status='error'`, a provider raising out of a shared poll unit, a pool-wide unpollable
 condition, and the **poll budget running out mid-plan** (skipped parks were not served this
 cycle — see the Time budget section for why any skip goes red).
 
-The **served set** is both the denominator and the scope of the numerator, so the ratio can
-never exceed 1. It excludes watches that expired this cycle, were errored, name an unregistered
-provider, are wholly beyond the poll horizon, or that the time budget never reached. A cycle
-that failed every watch it served goes red however much of the pool left for unrelated reasons.
+The **served set** scopes the numerator; the **denominator is the whole active-monitoring
+fleet**, read as a metadata-only `count` (zero rows cross the wire; a failed count falls back to
+the served-set size). The egress read-reduction means a quiet cycle reads back only a fraction
+of the fleet, so dividing by the small served set would misread a cycle as systemic just because
+few watches were served. The served set — and so the numerator — excludes watches that expired
+this cycle, were errored, name an unregistered provider, are wholly beyond the poll horizon, or
+that the time budget never reached. The served set is a subset of the fleet, so the ratio can
+never exceed 1; and because the denominator is the whole fleet, failing a small served set no
+longer forces a red on its own — a deliberate trade so a quiet cycle is not misread as systemic.
 
 The numerator counts only failures that say something about this cycle's health — a per-device
 APNs rejection is reported but not counted, and the tally says how many it left out.
@@ -790,7 +821,7 @@ Design, classification and rationale are in [Schema-drift guard](#schema-drift-g
 - [x] Per-column confirmation obligation: for each `WARN`-classified read column, record the citation proving the fallback. Anything unproven moves to `HALT` before merge.
 - [x] Classify each probe outcome: `200` → clean; 4xx carrying `42703` / `42P01` / `PGRST205` → **drift**; everything else → **transient**.
 - [x] Wire into `main()`: build the client and run the preflight **before** the start jitter so a halting run fails fast. Halt-set drift → `::error::` + `SystemExit(1)` without entering `run()`; warn-set drift → `::warning::` and continue; transient → `::warning::` and continue. When a run turns up both, the halt wins and the message lists every missing object.
-- [x] Account for the probe in the budget arithmetic comment: up to four `GET`s on the healthy path, charged against `FANOUT_DEADLINE_SECONDS`; the narrowing pass costs at worst one extra `GET` per column of a drifted table.
+- [x] Account for the probe in the budget arithmetic comment: up to six `GET`s on the healthy path (one per manifest table), charged against `FANOUT_DEADLINE_SECONDS`; the narrowing pass costs at worst one extra `GET` per column of a drifted table.
 - [x] `README.md` "Database migrations" gains the guard's behaviour; `AGENTS.md` gains the clause that a schema change means `schema.sql` + a migration **+ the `preflight.REQUIRED` entry**, classified `WARN` only with a proven fallback — and states the **apply-first ordering**.
 
 **Tests (offline, reusing `tests/helpers.py`):**

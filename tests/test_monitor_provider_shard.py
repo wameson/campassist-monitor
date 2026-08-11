@@ -125,10 +125,17 @@ def test_a_provider_jobs_writes_never_reach_another_providers_rows():
     assert rows["w-rec"]["last_checked_at"] is not None
     assert rows["w-gtc"]["state_hash"] == "stale"          # untouched
     assert rows["w-gtc"]["last_checked_at"] is None
-    # every watches write this run made was pinned to the recreation row
+    # every watches write this run made was scoped to the recreation slice: the
+    # per-id lifecycle/last_checked PATCHes name only recreation ids, and the
+    # filter-scoped blanket last_checked stamp carries a provider=eq.recreation_gov
+    # filter (no id list) so it, too, can never reach the going_to_camp row.
     for call in db.calls_of("patch", "watches"):
-        ids = str(call[2]["id"]).partition(".")[2].strip("()").split(",")
-        assert "w-gtc" not in ids
+        filt = call[2]
+        if "id" in filt:
+            ids = str(filt["id"]).partition(".")[2].strip("()").split(",")
+            assert "w-gtc" not in ids
+        else:
+            assert filt.get("provider") == "eq.recreation_gov"
 
 
 def test_scoped_read_falls_back_when_the_provider_column_is_absent():

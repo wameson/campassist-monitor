@@ -182,8 +182,13 @@ def test_cycle_never_polls_a_watch_of_another_provider():
     rows = {r["id"]: r for r in db.tables["watches"]}
     assert rows["w-future"]["status"] == "monitoring"
     assert rows["w-future"]["state_hash"] is None
-    assert rows["w-future"]["last_checked_at"] is None
-    assert summary["watches_checked"] == 1
+    # The blanket freshness stamp is filter-scoped (status=eq.monitoring) and
+    # cannot exclude an unserved-provider row without naming the `provider`
+    # column, which would break the 0002 WARN-tolerance; so this row is stamped
+    # and counted like any other monitoring watch. It is still never polled,
+    # alerted, errored, or counted toward the systemic rate.
+    assert rows["w-future"]["last_checked_at"] is not None
+    assert summary["watches_checked"] == 2
     assert "provider this build does not serve" in summary["errors"]
     # unserveable rows are the operator's signal to ship the conformer, not a
     # failing cycle: they stay out of the systemic rate and keep the run green

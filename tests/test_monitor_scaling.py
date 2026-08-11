@@ -47,7 +47,7 @@ def patch_id_lists(db):
     """The set of watch ids in every batched `id=in.(…)` PATCH FakeDB recorded."""
     lists = []
     for call in db.calls_of("patch", "watches"):
-        expr = str(call[2]["id"])
+        expr = str(call[2].get("id", ""))
         if expr.startswith("in.("):
             lists.append(expr[len("in.("):-1].split(","))
     return lists
@@ -112,8 +112,10 @@ def test_cycle_chunks_the_last_checked_write_at_scale():
     summary, _ = quiet_cycle(db)
 
     assert summary["watches_checked"] == 400
+    # the per-id last_checked writes (exclude the filter-scoped blanket stamp)
     last_checked = [
-        call for call in db.calls_of("patch", "watches") if "last_checked_at" in call[3]
+        call for call in db.calls_of("patch", "watches")
+        if "last_checked_at" in call[3] and "id" in call[2]
     ]
     assert len(last_checked) == 3  # chunked, not one giant URL
     assert all(

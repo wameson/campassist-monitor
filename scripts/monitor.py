@@ -237,11 +237,11 @@ WATCH_READ_COLUMNS = (
 #          before it are inside it, not on top of it
 #
 # The preflight (preflight.py, called from main() before the jitter) is charged
-# against that same 600 s and has ample headroom: it is 4 GETs, one per table,
+# against that same 600 s and has ample headroom: it is 6 GETs, one per table,
 # each bounded by the client's 30 s timeout (db.py) — at most 120 s of the 600.
 # That ceiling holds on a broken Supabase too: a probe failure does not end the
 # pass (a blip on one table must not hide drift on another), so the worst case
-# stays those same 4 probes, on a run where the cycle would achieve nothing
+# stays those same 6 probes, on a run where the cycle would achieve nothing
 # anyway. The per-column narrowing pass fires only on real drift, on a run that
 # is already halting or warning, and costs at worst roughly one extra GET per
 # column of the drifted table, so it cannot blow a healthy run's fanout or
@@ -723,7 +723,32 @@ def paginated_select(db, table: str, params: dict, *, page_size: int = SELECT_PA
     return rows
 
 
-def read_monitoring_watches(db, provider: str | None = None) -> list[dict]:
+def offset_paginated_select(
+    db, table: str, params: dict, *, order: str, page_size: int = SELECT_PAGE_SIZE
+) -> list[dict]:
+    """Read every matching row by OFFSET pagination, for a relation with no unique
+    column to keyset on (the monitoring_plan view is `SELECT DISTINCT` over five
+    columns). The offset advances by the number of rows a page ACTUALLY returned,
+    not by `page_size`, so — exactly like the keyset reader — it is correct for
+    any PostgREST max-rows cap, including one below `page_size`: it stops only on
+    an empty page, never on a short one. `order` is a deterministic sort so the
+    pages tile the set. Reads only, so the write budget is untouched."""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        page = db.select(
+            table, {**params, "order": order, "limit": str(page_size), "offset": str(offset)}
+        )
+        if not page:
+            break
+        rows.extend(page)
+        offset += len(page)
+    return rows
+
+
+def read_monitoring_watches(
+    db, provider: str | None = None, extra: dict | None = None
+) -> list[dict]:
     """The cycle's monitoring set: column-scoped and paginated, optionally
     scoped to one provider so a per-provider poll job reads only its own slice.
 
@@ -746,8 +771,13 @@ def read_monitoring_watches(db, provider: str | None = None) -> list[dict]:
     read already had. On such a database every watch reads as recreation_gov, so
     the recreation_gov job serves them all and the other providers' jobs serve
     none, which is correct: a pre-0002 database has only recreation.gov watches.
+
+    `extra` adds filter params to narrow the read below the whole monitoring set
+    (the egress read-reduction's scoped process-set reads pass one, e.g.
+    `{"campground_id": "in.(…)"}` or `{"updated_at": "gte.…"}`); the provider
+    scope, drift fallback and pagination hold identically for a narrowed read.
     """
-    base = {"status": "eq.monitoring"}
+    base = {"status": "eq.monitoring", **(extra or {})}
     scoped = {**base, "provider": f"eq.{provider}"} if provider is not None else base
     try:
         return paginated_select(db, "watches", {**scoped, "select": ",".join(WATCH_READ_COLUMNS)})
@@ -757,6 +787,182 @@ def read_monitoring_watches(db, provider: str | None = None) -> list[dict]:
             if provider is not None:
                 rows = [w for w in rows if provider_name(w) == provider]
             return rows
+        raise
+
+
+# --- egress read-reduction (plan view + per-unit hashes + watermark) --------
+#
+# The dominant Supabase egress term is the per-cycle `watches` read — every
+# monitoring row, every cycle, growing linearly with the fleet while the deduped
+# poll plan grows only sublinearly. The reduction keeps polling every unit (a
+# quiet unit is still polled, so an opening on it is still noticed) but reads
+# back WATCH rows only where it must: on a campground whose raw availability
+# changed this cycle, plus a few small bounded sets. Three server-side objects
+# make that possible, each with a runtime fallback to the full read so the cycle
+# is correct BEFORE its migration is applied (see the docstrings and preflight):
+#   * monitoring_plan (view, 0011) — the deduped poll-planning inputs.
+#   * poll_units (table, 0010)      — per-unit last-seen raw-availability hash.
+#   * watches.updated_at (0009)     — the "edited since last cycle" watermark,
+#                                     closing the new/edited/unpaused-watch hole
+#                                     (an unchanged UNIT does not imply an
+#                                     unchanged WATCH).
+
+MONITORING_PLAN_VIEW = "monitoring_plan"
+POLL_UNITS_TABLE = "poll_units"
+# The columns the view exposes (== what the providers' poll_plan reads). A synthetic
+# "watch" built from these routes and plans exactly like the real row.
+PLAN_COLUMNS = ("provider", "campground_id", "provider_ref", "start_date", "end_date")
+# Watermark safety margin: the process read pulls watches edited since
+# (last cycle's ran_at − this). It must exceed one cycle's wall time (so an edit
+# racing the previous cycle's own read is still caught next cycle) and one cycle
+# interval (so a single skipped trigger does not drop an edit). One hour clears
+# both comfortably; over-reading an hour of rare user edits is safe, missing one
+# is the exact missed-opening bug this margin guards.
+WATERMARK_MARGIN_SECONDS = 3600
+# Above this many distinct campgrounds needing a row read, the scoped
+# `campground_id=in.(…)` read is abandoned for a single full monitoring read:
+# the id list would otherwise grow past a gateway URI limit (the same cliff
+# PATCH_ID_CHUNK_MAX guards on the write side), and near-fleet-wide churn is
+# cheaper to serve as one read than as many chunked ones. The first cycle after
+# this feature ships takes this path (every unit is unseen, so every campground
+# is "changed") and then quiet cycles fall back to the tiny scoped reads.
+CAMPGROUND_IN_MAX = 150
+# poll_units keys are read back chunked so their `unit_key=in.(…)` URL cannot
+# outgrow a gateway limit either. A unit_key is a fixed 64-char hex digest, so a
+# chunk of 100 is ~6.5 KB, well under 8 KB.
+POLL_UNIT_READ_CHUNK = 100
+
+# Codes that positively identify a missing schema object — a column (42703 /
+# PostgREST's write-body PGRST204) or a whole relation (42P01 / PGRST205). The
+# read-reduction treats any of these as "this server-side object is not applied
+# yet" and falls back to the full monitoring read, exactly the WARN-tolerance
+# preflight.REQUIRED records for these objects.
+_MISSING_SCHEMA_CODES = frozenset(WRITE_MISSING_COLUMN_CODES | {"42P01", "PGRST205"})
+
+
+def is_missing_schema_object(exc: BaseException) -> bool:
+    """True when PostgREST rejected a request because a named column OR a whole
+    relation is absent from the live database — an unapplied migration. Broader
+    than `is_missing_column_rejection` (which is column-only): the plan view and
+    poll_units table are whole relations, so their absence surfaces as a
+    missing-relation code. Only the response body is read, never the request
+    (whose headers carry the service-role key)."""
+    if not is_permanent_failure(exc):
+        return False
+    body = _response_body_dict(getattr(exc, "response", None))
+    return str(body.get("code")) in _MISSING_SCHEMA_CODES
+
+
+def _jsonable(obj):
+    """Normalize a PollKey's parts to JSON-safe primitives so a unit gets one
+    canonical string form: dates → ISO, tuples → lists, recursively."""
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    return obj
+
+
+def unit_key(unit: PollUnit) -> str:
+    """A stable, URL-safe, collision-free id for one (provider, PollKey) poll
+    unit — the poll_units primary key. A SHA-256 hex digest of the unit's
+    canonical form: fixed length and free of the commas/brackets a JSON key would
+    carry (which would break an `in.(…)` filter), while still one-to-one with the
+    unit. The subkey may hold dates or nested tuples, so it is `_jsonable`-d
+    first."""
+    provider, key = unit
+    return state_hash([provider, _jsonable(key)])
+
+
+def read_watermark(db, now: datetime) -> str | None:
+    """ISO lower bound for 'a user edited this watch since the last cycle': the
+    most recent run_summaries.ran_at minus WATERMARK_MARGIN_SECONDS, or None when
+    there is no prior run (a fresh database — then the process read cannot scope
+    to edits and reads the full monitoring set). One row read, no writes."""
+    rows = db.select(
+        "run_summaries", {"select": "ran_at", "order": "ran_at.desc", "limit": "1"}
+    )
+    if not rows or not rows[0].get("ran_at"):
+        return None
+    return iso_now(parse_timestamp(rows[0]["ran_at"]) - timedelta(seconds=WATERMARK_MARGIN_SECONDS))
+
+
+def read_plan_rows(db, provider: str | None = None) -> list[dict]:
+    """The deduped poll-planning inputs from the monitoring_plan view — one row
+    per distinct (provider, campground_id, provider_ref, start_date, end_date)
+    across every monitoring watch, optionally scoped to one provider so a
+    per-provider poll job plans only its own slice. Offset-paginated (a view has
+    no unique id to keyset on) advancing by the rows actually returned, so a
+    PostgREST max-rows cap cannot silently truncate the plan and leave units
+    unpolled. Raises the underlying rejection when the view is absent; run()
+    treats that as 'plan view unavailable' and falls back to planning from the
+    full watches read. The view always carries `provider` (0011 selects it), so
+    the scope is safe server-side; the view's own absence is the only drift here,
+    and it falls back to the drift-tolerant scoped watches read."""
+    params = {"provider": f"eq.{provider}"} if provider is not None else {}
+    return offset_paginated_select(db, MONITORING_PLAN_VIEW, params, order="campground_id.asc")
+
+
+def read_poll_unit_hashes(db, unit_keys) -> dict[str, str]:
+    """The stored last-seen raw-availability hash for each of `unit_keys`, read
+    from poll_units in fixed-size chunks so the `unit_key=in.(…)` URL stays
+    bounded — and scoped to only the units this cycle polls, so the read's egress
+    tracks the (sublinear) plan size, never the table's slow accumulation of
+    aged-out units. Raises when the table is absent; run() then treats every unit
+    as changed (the full-read fallback)."""
+    keys = sorted({str(k) for k in unit_keys})
+    hashes: dict[str, str] = {}
+    for i in range(0, len(keys), POLL_UNIT_READ_CHUNK):
+        chunk = keys[i : i + POLL_UNIT_READ_CHUNK]
+        rows = db.select(
+            POLL_UNITS_TABLE,
+            {"unit_key": f"in.({','.join(chunk)})", "select": "unit_key,raw_hash"},
+        )
+        for row in rows:
+            hashes[str(row["unit_key"])] = str(row.get("raw_hash"))
+    return hashes
+
+
+def read_process_set(
+    db, today: date, watermark: str | None, campgrounds: set[str],
+    provider: str | None = None,
+) -> list[dict]:
+    """The watch rows the cycle must actually read and process, as a union of the
+    small bounded sets that can change a camper's outcome even when most of the
+    fleet cannot:
+      * watches on a campground that CHANGED (or 404ed, or is invalid/unpollable)
+        this cycle — the availability-driven set;
+      * watches EDITED since the last cycle (`updated_at >= watermark`) — the
+        new/created, edited, and paused->monitoring rows an unchanged unit does
+        not cover (the correctness hole updated_at exists to close);
+      * watches carrying a 404 strike (for reset when their campground recovers);
+      * watches whose stay has ended (for expiry).
+    Deduplicated by id. Every read is column-scoped and paginated like the full
+    read, and the whole thing degrades safely: no watermark yet (fresh DB), too
+    many changed campgrounds to scope by id, or ANY missing-schema rejection
+    (e.g. updated_at not applied) all fall back to `read_monitoring_watches` —
+    the full, drift-tolerant monitoring read — so the cycle is never LESS correct
+    than reading everything, only cheaper when it safely can be."""
+    if watermark is None or len(campgrounds) > CAMPGROUND_IN_MAX:
+        return read_monitoring_watches(db, provider)
+    try:
+        by_id: dict[str, dict] = {}
+        def add(rows):
+            for row in rows:
+                by_id[str(row["id"])] = row
+        if campgrounds:
+            add(read_monitoring_watches(
+                db, provider, {"campground_id": f"in.({','.join(sorted(campgrounds))})"}
+            ))
+        add(read_monitoring_watches(db, provider, {"updated_at": f"gte.{watermark}"}))
+        add(read_monitoring_watches(db, provider, {"consecutive_not_found": "gt.0"}))
+        add(read_monitoring_watches(db, provider, {"end_date": f"lt.{today.isoformat()}"}))
+        return list(by_id.values())
+    except Exception as exc:  # any unapplied object -> the full read is always correct
+        if is_missing_schema_object(exc):
+            return read_monitoring_watches(db, provider)
         raise
 
 
@@ -1152,7 +1358,166 @@ def run(
     def blocked(watch: dict) -> bool:
         return str(watch["id"]) in blocked_ids
 
-    watches = read_monitoring_watches(db, scoped_provider)
+    # --- egress read-reduction: plan from the view, poll, then read back only
+    #     the watch rows that can matter this cycle ------------------------------
+    #
+    # When the cycle is scoped to one provider (a per-provider poll job), every
+    # read below narrows to that provider's slice — the plan view, the full-read
+    # fallback, and the process-set read alike — so three jobs never each plan or
+    # read the whole fleet. The whole-fleet run (scoped_provider is None) plans
+    # and reads every provider, exactly as before the split.
+    #
+    # 'today's watermark for "a user edited this watch since the last cycle". A
+    # failure here is non-fatal: None just means the process read cannot scope to
+    # edits and reads the full monitoring set (correct, only costlier).
+    try:
+        watermark = read_watermark(db, now)
+    except Exception:  # optimization input only; never a reason to redden a run
+        watermark = None
+
+    # The poll plan covers EVERY monitoring watch's units — a quiet unit is still
+    # polled so an opening on it is still noticed. The deduped planning inputs
+    # come from the monitoring_plan view (one row per real unit); if the view is
+    # absent (or blips), fall back to the full watches read and plan from it,
+    # exactly as before the reduction. `full_watches` is reused as the process set
+    # in that fallback so the cycle never reads the whole table twice.
+    try:
+        plan_rows = read_plan_rows(db, scoped_provider)
+        have_view = True
+        full_watches: list[dict] | None = None
+    except Exception:
+        have_view = False
+        full_watches = read_monitoring_watches(db, scoped_provider)
+        plan_rows = full_watches
+
+    # Filter the plan for what may be POLLED: a provider this build serves, a
+    # campground_id that is well-formed. Unroutable/invalid rows are never polled
+    # (garbage requests); expired and unpollable rows self-exclude because their
+    # poll_plan is empty.
+    #
+    # Invalid/unpollable watches are NOT added to the process read's campground
+    # scope, deliberately: a malformed campground_id can carry characters unsafe
+    # in a `campground_id=in.(…)` filter, and it is never needed there. Such a
+    # watch's config is client-written, so it is set at create/edit time and the
+    # `updated_at` watermark reads it back on the very next cycle to error it;
+    # any that predate this feature were already errored by the pre-reduction
+    # cycle, which read and validated every row. So the scoped read stays over
+    # poll-derived, regex-valid campground_ids only.
+    plan_routable = [r for r in plan_rows if provider_name(r) in PROVIDERS]
+    plan_pollable = [
+        r for r in plan_routable
+        if CAMPGROUND_ID_RE.fullmatch(str(r["campground_id"]))
+    ]
+
+    # Each planned unit carries the conformer `provider_for` chose for the
+    # watches that asked for it, so dispatch can never be decided by the
+    # client-writable campground_id. The pacing below still runs one shared,
+    # shuffled queue across providers rather than a burst per site.
+    dispatch = poll_dispatch(plan_pollable, today)
+    plan = sorted_poll_units(dispatch)
+    rng.shuffle(plan)
+    session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
+
+    # A campground_id is only unique within its own provider, so the 404-strike
+    # inputs are scoped per provider: one site's 404 must never strike a watch
+    # on another site that happens to name the same id.
+    not_found: dict[str, set[str]] = {}
+    availability: dict[PollUnit, dict | None] = {}
+    # A cycle that runs out of poll budget mid-plan leaves the remaining parks
+    # unpolled: their watches do not fire this cycle. That is a completed miss,
+    # not a transient the next cycle heals, and it belongs to no single watch —
+    # the plan is shared across every user. So it goes through record_cycle_failure
+    # (systemic by definition, red run, both audiences via a safe aggregate
+    # label), never a bare errors.append that would leave the run green. There is
+    # deliberately no tolerant threshold: the budget only trips once the serial
+    # poll work already exceeds one cycle's budget, so any skip already means the
+    # fleet (or a stalled upstream) is over capacity — a K>0 threshold would just
+    # re-hide the silent-miss it took a two-day outage to learn about. The count
+    # is also surfaced on the result (polls_skipped), mirroring the errored-watch
+    # census, with no added read or write.
+    polls_skipped = 0
+    for i, unit in enumerate(plan):
+        if budget_exhausted():
+            polls_skipped = len(plan) - i
+            record_cycle_failure(
+                f"time budget exhausted: skipped {polls_skipped} remaining poll(s) "
+                f"of {len(plan)} planned — fleet exceeds one cycle's poll budget"
+            )
+            break
+        name, key = unit
+        try:
+            availability[unit] = dispatch[unit].poll(
+                http, key, session_ua,
+                sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
+                not_found=not_found.setdefault(name, set()),
+            )
+        except Exception as exc:  # containment boundary
+            # A provider raising out of poll belongs to no single watch — the
+            # unit is shared by everyone watching that park — and by contract
+            # (Provider.poll) it means a fault no retry clears: a park whose map
+            # fan-out is past the provider's safety cap, or a conformer bug. The
+            # unit is recorded as failed like any other, so the watches on it
+            # keep their old hash rather than reading the gap as "nothing
+            # available", and the failure is recorded against the cycle so the
+            # run goes red instead of leaving that park unserved on a green run.
+            availability[unit] = None
+            record_cycle_failure(f"poll {name}", exc)
+        if i < len(plan) - 1 and not budget_exhausted():
+            sleep(inter_request_delay(rng))
+
+    # Split the results back into the per-provider {PollKey: parsed-or-None}
+    # map each conformer's extract_relevant reads — a provider is only ever
+    # handed the units it planned itself.
+    polled: dict[str, dict[PollKey, dict | None]] = {}
+    polled_ok: dict[str, set[str]] = {}
+    for (name, key), parsed in availability.items():
+        polled.setdefault(name, {})[key] = parsed
+        if parsed is not None:
+            polled_ok.setdefault(name, set()).add(key[0])
+
+    # Change detection: compare each polled unit's RAW availability hash against
+    # the one stored last cycle (poll_units). A unit whose hash is unchanged
+    # cannot have changed any watch's per-watch state_hash, so its rows are not
+    # read; a changed or unseen unit's campground IS read back and processed. The
+    # hashes are read scoped to only the units this cycle polls (bounded egress),
+    # and if the table is absent (unapplied 0010) every unit reads as changed —
+    # the full-read fallback.
+    stored_hashes: dict[str, str] = {}
+    have_hashes = False
+    if have_view:
+        try:
+            stored_hashes = read_poll_unit_hashes(db, (unit_key(u) for u in dispatch))
+            have_hashes = True
+        except Exception:  # table absent or a blip: treat every unit as changed
+            have_hashes = False
+    changed_campgrounds: set[str] = set()
+    changed_unit_rows: list[dict] = []
+    for unit, parsed in availability.items():
+        if parsed is None:
+            continue  # failed poll: keep the old hash, do not count as changed
+        uk = unit_key(unit)
+        digest = state_hash(parsed)
+        if stored_hashes.get(uk) != digest:
+            campground_id = str(unit[1][0])
+            changed_campgrounds.add(campground_id)
+            changed_unit_rows.append(
+                {"unit_key": uk, "raw_hash": digest, "campground_id": campground_id}
+            )
+    # Only poll-derived campground_ids reach the scoped read's `in.(…)` filter:
+    # changed units and 404ed campgrounds, both of which passed CAMPGROUND_ID_RE
+    # to be polled at all (so they carry no URL-unsafe characters).
+    not_found_cgs = {cg for cgs in not_found.values() for cg in cgs}
+    relevant_cgs = changed_campgrounds | not_found_cgs
+
+    # The watch rows to actually process. Fast path: only the rows a change,
+    # edit, strike, or expiry can touch. Otherwise (view or poll_units absent) the
+    # full monitoring set, exactly as before the reduction.
+    if have_view and have_hashes:
+        watches = read_process_set(db, today, watermark, relevant_cgs, scoped_provider)
+    elif full_watches is not None:
+        watches = full_watches
+    else:
+        watches = read_monitoring_watches(db, scoped_provider)
 
     # Visibility: how many watches are sitting in status='error'. That state is
     # terminal — an errored watch is absent from the select above and no code
@@ -1204,6 +1569,28 @@ def run(
             "errored watches by reason: "
             + ", ".join(f"{reason}: {count}" for reason, count in error_reason_census(errored))
         ))
+
+    # The active-monitoring fleet size, for the systemic-vs-isolated
+    # determinations below (pool-wide-unpollable and the end-of-cycle error
+    # rate). The read-reduction means `active`/`served` are only the process
+    # subset, so dividing by them would misread a couple of genuinely-isolated
+    # bad watches on a quiet cycle as a shared cause and leave them monitoring
+    # forever. A metadata-only count (limit=0, count=exact — zero rows cross the
+    # wire, so no per-watch egress and the ≤5-write budget is untouched) gives
+    # the true denominator. Scoped to this provider on a per-provider poll job so
+    # a job judges its own fleet, not a denominator diluted by other providers'
+    # watches (which could leave one provider's total breakage looking isolated,
+    # green); the whole-fleet run counts every provider. Contained: a failed/None
+    # count (including a pre-0002 DB where the provider filter is unusable) falls
+    # back to the local process-set size at each use site, itself provider-scoped,
+    # never a reason to abort the cycle.
+    try:
+        count_filter = {"status": "eq.monitoring"}
+        if scoped_provider is not None:
+            count_filter["provider"] = f"eq.{scoped_provider}"
+        monitoring_count = db.count("watches", count_filter)
+    except Exception:  # optimization input only; never reddens a run
+        monitoring_count = None
 
     # Backend-owned lifecycle: expire past-date watches (one batched write).
     # An expiring watch is leaving the pool either way, so a failure here is
@@ -1282,7 +1669,15 @@ def run(
         # breakage is broadest. A shared cause (a client writing the wrong key
         # name on every row it creates) is the operator's to fix, so the pool is
         # left intact and the run goes red instead of erroring every watch.
-        pool_wide = is_systemic(len(unpollable), len(active))
+        #
+        # The denominator is the WHOLE active-monitoring fleet, not the reduced
+        # process set: an unpollable watch enters the process set only via the
+        # ~1h updated_at watermark after creation, so on a quiet cycle a handful
+        # of genuinely-isolated bad rows would otherwise dominate `len(active)`
+        # and be misread as pool-wide — left monitoring forever, never re-read,
+        # the invisible-unmonitored harm this pass exists to prevent.
+        denom = monitoring_count if monitoring_count is not None else len(active)
+        pool_wide = is_systemic(len(unpollable), denom)
         # The reason names only the field at fault, never what the client wrote,
         # but the world-readable row still gets the count alone — the field name
         # is what tells the operator which client is writing bad rows, and that
@@ -1310,72 +1705,6 @@ def run(
             detail_only.append(capped_line(f"{reason}: watch(es) {disposition} and skipped"))
         unpollable_ids = {w["id"] for w, _ in unpollable}
         active = [w for w in active if w["id"] not in unpollable_ids]
-
-    # Each planned unit carries the conformer `provider_for` chose for the
-    # watches that asked for it, so dispatch can never be decided by the
-    # client-writable campground_id. The pacing below still runs one shared,
-    # shuffled queue across providers rather than a burst per site.
-    dispatch = poll_dispatch(active, today)
-    plan = sorted_poll_units(dispatch)
-    rng.shuffle(plan)
-    session_ua = rng.choice(USER_AGENTS)  # one UA per run, rotated across runs
-
-    # A campground_id is only unique within its own provider, so the 404-strike
-    # inputs are scoped per provider: one site's 404 must never strike a watch
-    # on another site that happens to name the same id.
-    not_found: dict[str, set[str]] = {}
-    availability: dict[PollUnit, dict | None] = {}
-    # A cycle that runs out of poll budget mid-plan leaves the remaining parks
-    # unpolled: their watches do not fire this cycle. That is a completed miss,
-    # not a transient the next cycle heals, and it belongs to no single watch —
-    # the plan is shared across every user. So it goes through record_cycle_failure
-    # (systemic by definition, red run, both audiences via a safe aggregate
-    # label), never a bare errors.append that would leave the run green. There is
-    # deliberately no tolerant threshold: the budget only trips once the serial
-    # poll work already exceeds one cycle's budget, so any skip already means the
-    # fleet (or a stalled upstream) is over capacity — a K>0 threshold would just
-    # re-hide the silent-miss it took a two-day outage to learn about. The count
-    # is also surfaced on the result (polls_skipped), mirroring the errored-watch
-    # census, with no added read or write.
-    polls_skipped = 0
-    for i, unit in enumerate(plan):
-        if budget_exhausted():
-            polls_skipped = len(plan) - i
-            record_cycle_failure(
-                f"time budget exhausted: skipped {polls_skipped} remaining poll(s) "
-                f"of {len(plan)} planned — fleet exceeds one cycle's poll budget"
-            )
-            break
-        name, key = unit
-        try:
-            availability[unit] = dispatch[unit].poll(
-                http, key, session_ua,
-                sleep=sleep, errors=errors, budget_exhausted=budget_exhausted,
-                not_found=not_found.setdefault(name, set()),
-            )
-        except Exception as exc:  # containment boundary
-            # A provider raising out of poll belongs to no single watch — the
-            # unit is shared by everyone watching that park — and by contract
-            # (Provider.poll) it means a fault no retry clears: a park whose map
-            # fan-out is past the provider's safety cap, or a conformer bug. The
-            # unit is recorded as failed like any other, so the watches on it
-            # keep their old hash rather than reading the gap as "nothing
-            # available", and the failure is recorded against the cycle so the
-            # run goes red instead of leaving that park unserved on a green run.
-            availability[unit] = None
-            record_cycle_failure(f"poll {name}", exc)
-        if i < len(plan) - 1 and not budget_exhausted():
-            sleep(inter_request_delay(rng))
-
-    # Split the results back into the per-provider {PollKey: parsed-or-None}
-    # map each conformer's extract_relevant reads — a provider is only ever
-    # handed the units it planned itself.
-    polled: dict[str, dict[PollKey, dict | None]] = {}
-    polled_ok: dict[str, set[str]] = {}
-    for (name, key), parsed in availability.items():
-        polled.setdefault(name, {})[key] = parsed
-        if parsed is not None:
-            polled_ok.setdefault(name, set()).add(key[0])
 
     # Backend-owned lifecycle: a syntactically valid campground id that
     # keeps 404ing (typo or delisted campground) errors its watches after
@@ -1437,6 +1766,22 @@ def run(
     # about this row), while the `sent_alerts` select/upsert and the APNs send
     # are table- or service-scoped and recorded as unattributed — a
     # `sent_alerts` schema drift is not evidence this user's watch is broken.
+    #
+    # A watch that saw a delta this cycle but did NOT settle it — an APNs
+    # retryable/config failure or a rejected state_hash write, both of which keep
+    # the old hash to retry next cycle — must be re-processed next cycle. Under
+    # the read-reduction that only happens if its unit is read again, so its
+    # unit's hash is withheld from the poll_units upsert (deferred_unit_keys):
+    # an un-stored unit reads as "changed" next cycle and its rows are pulled
+    # back. Without this, a transient APNs outage would silently defer a push
+    # until the campground's availability happened to change — a delayed opening.
+    deferred_unit_keys: set[str] = set()
+
+    def defer_watch_units(watch: dict) -> None:
+        prov = provider_for(watch)
+        for key in prov.poll_plan(watch, today):
+            deferred_unit_keys.add(unit_key((prov.name, key)))
+
     alerts_sent = 0
     for watch in active:
         if blocked(watch):
@@ -1487,7 +1832,10 @@ def run(
                         apns_rejected_ids.add(watch_id)
                 if outcome in (RETRYABLE_FAILURE, CONFIG_FAILURE):
                     # keep old hash so the alert is retried next cycle — once the
-                    # outage clears or the operator rotates the bad credential
+                    # outage clears or the operator rotates the bad credential.
+                    # Withhold the unit's hash so the reduction re-reads this
+                    # watch next cycle rather than skipping the unchanged unit.
+                    defer_watch_units(watch)
                     continue
                 if outcome == DELIVERED:
                     alerts_sent += len(fresh)
@@ -1527,8 +1875,10 @@ def run(
         except Exception as exc:  # sent_alerts / APNs: not this watch's row
             # Table-scoped, like the delivery failure above: the watch was
             # polled, so it is still stamped last_checked_at rather than left
-            # looking unchecked.
+            # looking unchecked. The state_hash was not advanced, so the delta is
+            # unsettled — withhold the unit so next cycle re-reads and retries.
             record_failures(unattributed_failure(watch_id, exc), "alert", blocking=False)
+            defer_watch_units(watch)
             continue
 
         try:  # the one write pinned to this watch's own row
@@ -1538,7 +1888,10 @@ def run(
                 {"state_hash": new_hash, **({"last_found_at": iso_now(now)} if delivered else {})},
             )
         except Exception as exc:  # containment boundary
+            # The hash did not land, so the delta is unsettled: withhold the unit
+            # so the reduction re-reads this watch next cycle instead of skipping.
             record_failures(isolated_failure(watch_id, exc), "process")
+            defer_watch_units(watch)
 
     # The served set: watches this cycle actually tried to serve — still active
     # after the lifecycle passes (not expired this cycle, not errored for an
@@ -1571,8 +1924,15 @@ def run(
 
     # Threshold gate (B): the watch-error rate over the served set, counting
     # only the failures that describe the cycle's own health (see `rated`).
+    # `considered` still reports what was served this cycle (the tally line and
+    # watches_considered describe the served set), but the systemic-vs-isolated
+    # rate divides by the WHOLE active fleet, not the reduced served set — the
+    # same principle as the pool-wide-unpollable check above: a couple of
+    # genuinely-isolated failures on an otherwise-quiet reduced cycle must not be
+    # misread as systemic just because the served set they sit in is small.
     considered = len(served)
     failed_served = sum(1 for watch_id in rated_ids if watch_id in served_ids)
+    rate_denom = monitoring_count if monitoring_count is not None else considered
     # Pool-wide APNs wipeout backstop (C): a distinct systemic condition, kept
     # separate from the per-watch rated flag. Even a rejection reason we did not
     # enumerate as a config fault cannot yield a silent green outage — when
@@ -1584,7 +1944,7 @@ def run(
         apns_rejected_served >= APNS_WIPEOUT_FLOOR
         and apns_rejected_served > considered * APNS_WIPEOUT_RATE
     )
-    systemic = is_systemic(failed_served, considered) or apns_wipeout
+    systemic = is_systemic(failed_served, rate_denom) or apns_wipeout
 
     # Isolated, permanent failures surface on the watch itself (A) so the user
     # sees a broken watch instead of one that silently stops updating. Systemic
@@ -1603,6 +1963,68 @@ def run(
                 f"error-mark: {len(error_mark_failures)} of {len(mark_errored)} watch(es) "
                 "could not be moved to status='error'"
             )
+
+    # Freshness stamp: set last_checked_at on every monitoring, non-expired watch
+    # the per-id write above did not cover — the quiet-unit rows the read-
+    # reduction never pulled. One filter-scoped PATCH (no id list, so no URL-
+    # length cliff), run AFTER error-marking so a watch errored this cycle is not
+    # shown as freshly checked. The reduction shrinks the row READ, not the poll —
+    # every unit is still polled every cycle, so every monitoring watch genuinely
+    # is still being checked and stamping them all is accurate (captain's ruling).
+    # Its affected-row count is watches_checked: how many watches are actually
+    # being monitored, which the per-id `len(checked)` can no longer report once
+    # the quiet rows are unread. A pool-wide stamp failure is a systemic signal
+    # (the whole fleet went unstamped), so it reddens the run like any cycle-scope
+    # write failure.
+    # Skipped only when the poll did NOT cover the fleet this cycle (the time
+    # budget ran out mid-plan, already a systemic red run): blanket-stamping then
+    # would falsely mark the un-polled watches as freshly checked. On a normal
+    # cycle every unit was polled, so the blanket stamp is accurate and its count
+    # is watches_checked; on a truncated cycle we fall back to the per-id
+    # `len(checked)`, stamping only the watches actually served.
+    watches_checked = len(checked)
+    try:
+        if not polls_skipped:
+            # Scoped to this provider on a per-provider job so it stamps (and
+            # counts) only that job's slice, never another provider's quiet rows;
+            # the whole-fleet run adds no provider filter and stamps every
+            # monitoring row, as before the split.
+            blanket_filter = {"status": "eq.monitoring", "end_date": f"gte.{today.isoformat()}"}
+            if scoped_provider is not None:
+                blanket_filter["provider"] = f"eq.{scoped_provider}"
+            stamped = db.patch(
+                "watches",
+                blanket_filter,
+                {"last_checked_at": iso_now(now)},
+            )
+            if stamped is not None:
+                watches_checked = stamped
+    except Exception as exc:  # containment boundary
+        if is_permanent_failure(exc):
+            # A permanent rejection (e.g. a missing last_checked_at column) leaves
+            # the whole fleet unstamped and will recur every cycle — systemic.
+            record_cycle_failure("last_checked blanket stamp", exc)
+        else:
+            # A transient blip (429/5xx/timeout) is retried next cycle, like any
+            # other transient write failure: reported to both audiences but never
+            # reddening the run.
+            errors.append(capped_line(f"last_checked blanket stamp: {summarize_exception(exc, safe=True)}"))
+            detail_only.append(capped_line(f"last_checked blanket stamp: {summarize_exception(exc)}"))
+
+    # Record this cycle's changed units so next cycle can skip their unchanged
+    # rows. Only CHANGED units are written, so a quiet cycle writes nothing here
+    # and the ≤5 write budget holds; a failure is self-healing (next cycle simply
+    # re-detects the change, and pushes stay deduped by sent_alerts), so it is
+    # reported UNRATED and never reddens the run — mirroring the alert_history
+    # write. With poll_units absent (unapplied 0010) have_hashes is False and
+    # nothing is written here.
+    settled_unit_rows = [r for r in changed_unit_rows if r["unit_key"] not in deferred_unit_keys]
+    if have_hashes and settled_unit_rows:
+        try:
+            db.upsert(POLL_UNITS_TABLE, settled_unit_rows, on_conflict="unit_key")
+        except Exception as exc:  # reported, never rated
+            errors.append(capped_line(f"poll_units upsert: {summarize_exception(exc, safe=True)}"))
+            detail_only.append(capped_line(f"poll_units upsert: {summarize_exception(exc)}"))
 
     # Contain the retention pruning *before* the summary row is written, so a
     # prune failure is already known when the row's verdict label is chosen —
@@ -1682,7 +2104,7 @@ def run(
     public_errors.extend(public_cycle_failures)
 
     summary = {
-        "watches_checked": len(checked),
+        "watches_checked": watches_checked,
         "campgrounds_polled": len({key[0] for _, key in availability}),
         "alerts_sent": alerts_sent,
         "duration_ms": int((monotonic() - started) * 1000),

@@ -1291,7 +1291,10 @@ def test_a_pool_wide_unpollable_condition_goes_red_without_erroring_the_pool():
     summary = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
 
     assert [r["status"] for r in db.tables["watches"]] == ["monitoring"] * 4
-    assert not [c for c in db.calls if c[0] == "patch"]
+    # no watch is errored or otherwise status-changed — the only write is the
+    # filter-scoped blanket freshness stamp (last_checked_at), which cannot
+    # exclude these still-'monitoring' rows. The pool is left intact.
+    assert not [c for c in db.calls if c[0] == "patch" and "status" in c[3]]
     # loud: red, with the count on the world-readable row and the field at
     # fault operator-only, exactly as the isolated case renders it
     assert monitor.exit_code(summary) == 1
@@ -1301,6 +1304,46 @@ def test_a_pool_wide_unpollable_condition_goes_red_without_erroring_the_pool():
     ) in summary["errors"]
     assert "provider_ref.resource_location_id" in summary["errors_detail"]
     assert "provider_ref" not in summary["errors"]
+
+
+def test_a_couple_of_isolated_unpollable_watches_are_errored_against_the_whole_fleet():
+    # the read-reduction shrinks the process set to the edited/striking/expiring
+    # rows, so on a quiet cycle a couple of freshly-created unpollable watches are
+    # nearly the whole read — but they are NOT the whole fleet. The pool-wide-vs-
+    # isolated call must divide by the fleet, obtained as a metadata-only count,
+    # or is_systemic misreads them as a shared cause and leaves them 'monitoring'
+    # forever: never re-read, never errored, silently unmonitored.
+    healthy = [make_gtc_watch(id=f"w{i}", user_id=f"u{i}") for i in range(10)]
+    db = FakeDB({
+        "watches": healthy,
+        "device_tokens": [{"user_id": f"u{i}", "apns_token": "t", "environment": "production"}
+                          for i in range(10)],
+    })
+    # seed the unit hash so the next cycle is quiet (the park does not change)
+    monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
+    db.calls.clear()
+
+    # two users create watches with an unreadable provider_ref just now, so only
+    # they are read back next cycle (via the updated_at watermark); the healthy
+    # ten sit on the unchanged unit and are never pulled
+    db.tables["watches"].extend([
+        make_gtc_watch(id="bad1", user_id="b1", provider_ref={}, updated_at=monitor.iso_now(NOW)),
+        make_gtc_watch(id="bad2", user_id="b2", provider_ref={}, updated_at=monitor.iso_now(NOW)),
+    ])
+
+    summary = monitor.run(db, FakeAPNs(), FakeGTCHTTP(park_responder()), **QUIET)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    # 2 unpollable of a 12-watch fleet is isolated: each is errored ONCE with a
+    # reason, not left 'monitoring' as dividing by the reduced read set would
+    assert rows["bad1"]["status"] == "error"
+    assert rows["bad2"]["status"] == "error"
+    assert rows["bad1"]["error_reason"] == monitor.ERROR_REASON_UNREADABLE_PROVIDER_REF
+    assert all(rows[f"w{i}"]["status"] == "monitoring" for i in range(10))
+    # the run stays green (isolated), and the denominator came from a metadata
+    # count of the monitoring fleet, not a full-fleet row read
+    assert monitor.exit_code(summary) == 0
+    assert db.calls_of("count", "watches")
 
 
 def test_a_park_past_the_fan_out_cap_cannot_masquerade_as_a_healthy_watch():

@@ -38,7 +38,7 @@ more missing columns, never unmake one already proven absent, and a blip on
 positively identified as gone. So a probe failure is *recorded* against its own
 table and the pass moves on to the next one; every confirmed drift and every blip
 is collected across the whole manifest, and the verdict is reached once, at the
-end. On a full Supabase outage that costs one timed-out probe per table (four,
+end. On a full Supabase outage that costs one timed-out probe per table (six,
 the figure the `monitor` budget comment already carries) on a run where the cycle
 would have achieved nothing anyway.
 
@@ -104,8 +104,20 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
         "date_mode":             (WARN, "0006_watches_flexible_dates.sql"),
         "flex_min_nights":       (WARN, "0006_watches_flexible_dates.sql"),
         "flex_max_nights":       (WARN, "0006_watches_flexible_dates.sql"),
+        "updated_at":            (WARN, "0009_watches_updated_at.sql"),
         "campground_state":      (WARN, None),
         "created_at":            (WARN, None),
+    },
+    "poll_units": {
+        # All WARN: the whole table is the egress read-reduction's change-detection
+        # store, and when it is absent monitor.run falls back to treating every
+        # unit as changed — i.e. reading the full monitoring set exactly as today,
+        # correct at the old egress. WARN is also what lets 0010 merge before it is
+        # applied. See the citation below and monitor.read_poll_unit_hashes.
+        "unit_key":      (WARN, "0010_poll_units.sql"),
+        "raw_hash":      (WARN, "0010_poll_units.sql"),
+        "campground_id": (WARN, "0010_poll_units.sql"),
+        "updated_at":    (WARN, "0010_poll_units.sql"),
     },
     "device_tokens": {
         "user_id":     (HALT, None),  # written: the dead-token delete filter (apns.send_alert)
@@ -220,6 +232,25 @@ REQUIRED: dict[str, dict[str, tuple[str, str | None]]] = {
 #                          row and still monitors — only the provider label is absent.
 #                          Classifying it HALT would stop every cycle over a column that only
 #                          labels which provider a summary row is for.
+#   watches.updated_at     read only in the read-reduction's watermark filter
+#                          (`status=eq.monitoring&updated_at=gte.<watermark>`) in
+#                          monitor.read_process_set. When the column is absent that read
+#                          rejects with 42703 and the cycle falls back to reading the full
+#                          monitoring set (monitor.read_monitoring_watches) — exactly the
+#                          pre-reduction behaviour — so an unmigrated live DB keeps
+#                          monitoring, at the old egress. Never written by the monitor
+#                          (the trigger sets it), never subscripted. Classifying it HALT
+#                          would stop the cycle over a column whose only role is trimming a
+#                          read it already knows how to do in full.
+#   poll_units.*           every column is WARN because the whole table is the read-reduction's
+#                          per-unit availability-hash store, read via
+#                          monitor.read_poll_unit_hashes and written only for CHANGED units.
+#                          When the table is absent the read rejects with a missing-relation
+#                          code and monitor.run treats every unit as changed, reading the full
+#                          monitoring set and processing it exactly as today — correct, at the
+#                          old egress, and writing nothing to the missing table. So an
+#                          unmigrated live DB keeps monitoring and keeps its write budget.
+#                          Classifying it HALT would stop the cycle over an optimisation store.
 #   watches.campground_state  never read or written by the monitor (schema/iOS only).
 #   watches.created_at, device_tokens.updated_at, sent_alerts.id, run_summaries.id
 #                          monitor-untouched bootstrap columns; absent from every read
@@ -385,7 +416,7 @@ def check_schema(db) -> SchemaCheck:
     """Probe the live schema: every missing object it confirmed, and one note per
     table it could not classify.
 
-    One combined `GET` per table (four total, zero writes). The per-column
+    One combined `GET` per table (six total, zero writes). The per-column
     narrowing pass fires only on real drift — on a run that is already halting or
     warning — so it cannot inflate a healthy run's budget.
 

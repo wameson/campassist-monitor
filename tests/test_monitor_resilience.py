@@ -50,13 +50,29 @@ def fails_watch_patch(*watch_ids, columns=None, status=400):
     live DB fails: some writes to the row go through, one kind never does."""
     targets = {str(i) for i in watch_ids}
 
-    def fail_on(call):
+    def fail_on(call, db=None):
         op, table = call[0], call[1]
         if op != "patch" or table != "watches":
             return None
         if columns is not None and not (set(call[3]) & set(columns)):
             return None
-        ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        if "id" in call[2]:
+            ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        elif db is not None:
+            # The read-reduction's blanket freshness stamp is filter-scoped
+            # (status=eq.monitoring, no id list): it writes to every monitoring
+            # row, so it fails only if a targeted bad row is still among them. A
+            # bad row already isolated and errored has left status='monitoring',
+            # so the blanket does not touch it (test_isolated); a bad row the
+            # starved fan-out never reached is still 'monitoring', so it does
+            # (test_worst_case).
+            monitoring = {
+                str(r["id"]) for r in db.tables["watches"]
+                if str(r.get("status")) == "monitoring"
+            }
+            ids = targets & monitoring
+        else:
+            return None
         if ids & targets:
             return postgrest_error(status, "column watches.last_checked_at does not exist")
         return None
@@ -170,7 +186,12 @@ def test_batched_write_falls_back_to_per_id():
 
     run_cycle(db)
 
-    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    # per-id last_checked writes only (exclude the blanket freshness stamp, which
+    # is filter-scoped and carries no id list)
+    checked = [
+        c for c in db.calls_of("patch", "watches")
+        if "last_checked_at" in c[3] and "id" in c[2]
+    ]
     assert str(checked[0][2]["id"]).startswith("in.(")  # batch attempted first
     assert [c[2]["id"] for c in checked[1:]] == ["eq.w0", "eq.w1", "eq.w2", "eq.w3"]
 
@@ -459,7 +480,7 @@ def test_failing_to_mark_a_watch_errored_is_systemic():
     def fail_on(call):
         if call[0] != "patch" or call[1] != "watches":
             return None
-        ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        ids = set(str(call[2].get("id", "")).partition(".")[2].strip("()").split(","))
         if "w1" in ids and set(call[3]) & {"state_hash", "status"}:
             return postgrest_error(400)
         return None
@@ -669,7 +690,7 @@ def test_worst_case_jitter_and_poll_phase_still_reaches_the_fanout():
             monotonic=Clock(jitter + monitor.CYCLE_TIME_BUDGET_SECONDS),
             process_started=0.0,
         )
-        checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+        checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3] and "id" in c[2]]
         rows = {r["id"]: r for r in db.tables["watches"]}
         return result, checked, rows
 
@@ -701,7 +722,7 @@ def test_run_bounds_the_fanout_so_bookkeeping_still_happens():
         per_id_fallback_budget_seconds=50,
     )
 
-    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3] and "id" in c[2]]
     assert len(checked) == 3  # the batch plus two per-id writes, then cut off
     # the cycle still served everyone and reached its end-of-cycle bookkeeping
     assert sorted(w for w, _ in apns.alerts) == ["w0", "w1", "w2", "w3"]
@@ -729,7 +750,7 @@ def test_run_anchors_the_fanout_deadline_to_process_start():
         process_started=0.0,
     )
 
-    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3] and "id" in c[2]]
     assert len(checked) == 1  # the batch only: no room left to fan out
     # nothing was pinned to a row, so nobody is parked in status='error'
     assert all(r["status"] == "monitoring" for r in db.tables["watches"])
@@ -823,7 +844,7 @@ def test_composed_error_line_respects_the_cap():
         if (
             call[0] == "patch" and call[1] == "watches"
             and "last_checked_at" in call[3]
-            and "w0" in str(call[2]["id"])
+            and "w0" in str(call[2].get("id", ""))
         ):
             return postgrest_error(400, long_message)
         return None
@@ -991,6 +1012,40 @@ def test_pool_wide_apns_wipeout_trips_the_backstop():
     assert result["systemic_failure"] is True and monitor.exit_code(result) == 1
 
 
+def test_isolated_write_failures_stay_isolated_against_the_whole_fleet():
+    # the read-reduction serves only the changed/edited/striking rows, so a
+    # mostly-quiet cycle can serve a handful even in a large fleet. A couple of
+    # isolated write failures inside that small served set must be judged against
+    # the WHOLE monitoring fleet, not the served set — else is_systemic reads two
+    # broken rows as a systemic outage and refuses to error them, leaving those
+    # users with watches that silently stopped updating.
+    served = [make_watch(id=f"s{i}", user_id=f"su{i}") for i in range(2)]
+    # ten more monitoring watches wholly beyond the poll horizon: counted in the
+    # fleet by the metadata count, but never served this cycle (no unit to poll)
+    idle = [
+        make_watch(id=f"i{i}", user_id=f"iu{i}", campground_id="999999",
+                   start_date="2028-06-01", end_date="2028-06-05")
+        for i in range(10)
+    ]
+    db = FakeDB(
+        {"watches": served + idle},
+        fail_on=fails_watch_patch("s0", "s1", columns=("state_hash",)),
+    )
+
+    result, _ = run_cycle(db)
+
+    rows = {r["id"]: r for r in db.tables["watches"]}
+    # both served watches failed the write pinned to their own row (isolated), so
+    # each is errored — not left 'monitoring' as dividing by the served set would
+    assert rows["s0"]["status"] == "error" and rows["s1"]["status"] == "error"
+    assert "2 of 2 served watch(es) failed this cycle (isolated)" in result["errors"]
+    assert result["systemic_failure"] is False and monitor.exit_code(result) == 0
+    # the ten idle watches stay monitoring and the denominator came from a
+    # metadata count of the fleet, not the reduced served set
+    assert all(rows[f"i{i}"]["status"] == "monitoring" for i in range(10))
+    assert db.calls_of("count", "watches")
+
+
 def test_state_hash_write_failure_still_errors_the_watch():
     # the counterpart: a failure of the one write pinned to the watch's own row
     # (its state_hash PATCH) is isolated, so a permanent rejection still surfaces
@@ -1014,7 +1069,7 @@ def test_prune_failure_makes_the_persisted_label_systemic():
     # never "(isolated)" on a run that exits 1.
     def fail_on(call):
         if call[0] == "patch" and call[1] == "watches" and "last_checked_at" in call[3]:
-            ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+            ids = set(str(call[2].get("id", "")).partition(".")[2].strip("()").split(","))
             if "w1" in ids:
                 return postgrest_error(400, "column watches.last_checked_at does not exist")
         if call[0] == "delete" and call[1] == "sent_alerts":
@@ -1067,7 +1122,7 @@ def test_persisted_row_omits_uuids_and_key_values_the_annotation_keeps():
 
     def fail_on(call):
         if call[0] == "patch" and call[1] == "watches" and "last_checked_at" in call[3]:
-            ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+            ids = set(str(call[2].get("id", "")).partition(".")[2].strip("()").split(","))
             if "w0" in ids:
                 return postgrest_error(
                     400,
@@ -1115,7 +1170,7 @@ def test_fanout_deadline_can_anchor_to_this_runs_own_clock():
         fanout_deadline_seconds=90,
     )
 
-    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3]]
+    checked = [c for c in db.calls_of("patch", "watches") if "last_checked_at" in c[3] and "id" in c[2]]
     # batch + two per-id writes (t=40, t=80), then t=120 >= 90 cuts it off. A
     # deadline anchored to the real clock would never bind and all four would run.
     assert len(checked) == 3
@@ -1250,7 +1305,7 @@ def test_error_mark_aggregate_is_annotated_once():
     def fail_on(call):
         if call[0] != "patch" or call[1] != "watches":
             return None
-        ids = set(str(call[2]["id"]).partition(".")[2].strip("()").split(","))
+        ids = set(str(call[2].get("id", "")).partition(".")[2].strip("()").split(","))
         if "w1" in ids and set(call[3]) & {"state_hash", "status"}:
             return postgrest_error(400)
         return None

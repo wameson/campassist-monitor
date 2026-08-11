@@ -274,8 +274,19 @@ once caused a multi-day PATCH-400 outage). Migrations close that gap.
   reason is simply not recorded, and the census reports those rows as `unrecorded`.
   Halting instead would stop the whole cycle over a column that only annotates an
   error, which is exactly the blast radius inversion the `warn` class exists to avoid.
+- **The egress read-reduction ships as three `warn` migrations.** `0009_watches_updated_at`
+  (a column plus a trigger that bumps it only on a user edit), `0010_poll_units` (a
+  per-unit availability-hash table), and `0011_monitoring_plan_view` (a deduped
+  planning view). All are backend-only and all fall back to the full monitoring read
+  when absent (`monitor.is_missing_schema_object`), so a database on which they are not
+  yet applied keeps monitoring correctly, just at the pre-reduction egress. Apply all
+  three by hand in the SQL editor together to turn the reduction on; there is no
+  ordering constraint against the app, and no monitor code change is needed to run
+  before they are applied. Only `0009`/`0010` add manifest entries (`updated_at`,
+  `poll_units.*`, all `warn`); the **view is not preflighted** (the drift manifest
+  mirrors `CREATE TABLE`s, and its absence is handled at runtime by the same fallback).
 - **The monitor checks before it runs.** Each run starts with a read-only schema
-  preflight (`scripts/preflight.py`): four `GET`s with `limit=0`, zero writes, no row
+  preflight (`scripts/preflight.py`): six `GET`s with `limit=0`, zero writes, no row
   data, before the start jitter. It never applies anything — the by-hand posture above
   is unchanged — it only reports, naming every missing `table.column` and the exact
   migration file to apply.
@@ -309,21 +320,37 @@ are all faked. CI runs the same suite on every PR and push to `main`.
 ## Operating notes
 
 - **Write budget:** a whole-fleet cycle with no availability changes performs ≤5
-  Supabase writes (1 batched `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3
+  Supabase writes (1 blanket `last_checked_at` PATCH, 1 `run_summaries` INSERT, 3
   retention DELETEs — `sent_alerts`, `run_summaries`, `alert_history`)
   regardless of watch count — enforced by `test_write_budget`. Under the
   per-provider poll split (see [Per-provider poll jobs](#per-provider-poll-jobs))
   those 5 are divided by owner, not multiplied: each provider's poll job does
-  only the 2 writes for its own slice, and the plan job does the 3 retention
-  DELETEs once for the whole cycle. The `last_checked_at`
-  PATCH is one request per **chunk** of ≤150 ids (`PATCH_ID_CHUNK_MAX`), so a
-  pool small enough to fit one chunk is still a single write; larger pools are
-  chunked to keep each `id=in.(…)` URL under the gateway's URI limit.
-- **Reading the watch pool:** each cycle reads the monitoring set scoped to the
-  columns it uses (`monitor.WATCH_READ_COLUMNS`) and keyset-paginated by `id`, so
-  a PostgREST `max-rows` cap can never silently truncate it. On a live database
-  missing a WARN column the projection names (an unapplied migration), the scoped
-  read is rejected and the cycle falls back to the tolerant `select=*` read.
+  only the ~2 writes for its own slice, and the plan job does the 3 retention
+  DELETEs once for the whole cycle. `last_checked_at` is written two ways: a
+  single **filter-scoped blanket** PATCH (`status=eq.monitoring&end_date=gte.today`,
+  plus `provider=eq.<job>` on a poll job so it stamps only that provider's slice,
+  no id list) that freshens every monitored watch — including the quiet-unit rows
+  the cycle never read back (see below) — plus, for the rows it did read, the
+  per-id chunked PATCH (≤150 ids per `id=in.(…)` URL, `PATCH_ID_CHUNK_MAX`) that
+  keeps the fan-out isolation which errors a genuinely bad row.
+- **Reading the watch pool (egress read-reduction):** the per-cycle `watches`
+  read no longer grows linearly with the fleet. Every unit is still polled, but a
+  cycle reads back only the watch rows that can change a camper's outcome: the
+  deduped poll plan comes from the `monitoring_plan` view (scoped to the job's
+  provider under the poll split); each polled unit's raw
+  availability is diffed against stored hashes (`poll_units`); and a cycle reads
+  the full watch rows only for a campground that **changed** (or 404ed) this
+  cycle, plus a few small bounded sets — watches **edited since the last cycle**
+  (`watches.updated_at`), watches carrying a **404 strike**, and **expiring**
+  watches. An unchanged unit cannot change any watcher's state, so on a quiet
+  cycle almost no watch rows are read. Openings are never missed: a change reads
+  the unit's rows back and alerts, and an unchanged unit with a newly-created or
+  edited watch is still caught by the `updated_at` watermark. Every read is
+  column-scoped (`WATCH_READ_COLUMNS`, with a `select=*` fallback on a missing
+  WARN column) and paginated so a PostgREST `max-rows` cap can never truncate it.
+  Before the migrations that add these objects are applied, the cycle falls back
+  to reading the full monitoring set — the pre-reduction behaviour — so it is
+  correct at the old egress until an operator applies them.
 - **Politeness / anti-blocking:** one rotating browser User-Agent per run,
   randomized campground order, 1.2–2.8 s inter-request delays, exponential
   backoff (2 s → 4 s → 8 s, then skip the campground for this cycle).
@@ -551,10 +578,11 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   - *isolated* — the run exits 0 and the schedule stays **green**, because
     the healthy watches were served;
   - *systemic* — the run prints an `::error::` annotation, exits non-zero
-    and turns the schedule **red**. Systemic means more than
-    `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
-    failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
-    2 stays green while 2 of 2 goes red — or that a failure belonging to no
+    and turns the schedule **red**. Systemic means the cycle's rated watch
+    failures (drawn from the **served** set) exceeded `SYSTEMIC_ERROR_RATE`
+    (25%) of the **whole active-monitoring fleet** **and** at least
+    `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of 2 stays green while 2 of 2
+    goes red — or that a failure belonging to no
     watch (the `run_summaries` INSERT, retention pruning, being unable to
     write `status='error'`, a provider raising out of a poll unit its watches
     share, a pool-wide unpollable condition — see [Providers](#providers) — or
@@ -569,17 +597,24 @@ are all faked. CI runs the same suite on every PR and push to `main`.
     pool-wide backstop makes the run systemic regardless of per-reason rating
     when outright rejections wipe out nearly every served push.
 
-    The served set is the rate's denominator *and* the scope of its
-    numerator, so the ratio can never exceed 1. It excludes watches that
-    expired this cycle, that were errored for an invalid or
+    The **served set** — the watches the cycle actually tried to serve — is the
+    scope of the rate's *numerator*. The *denominator*, though, is the **whole
+    active-monitoring fleet**, read as a metadata-only `count` (zero rows cross
+    the wire; a failed count falls back to the served-set size): the egress
+    read-reduction means a quiet cycle reads back only a fraction of the fleet,
+    and dividing by that small served set would misread a cycle as systemic just
+    because few watches were served. The served set — and so the numerator —
+    excludes watches that expired this cycle, that were errored for an invalid or
     persistently-404ing campground, that their provider can never poll
     (errored, or left `monitoring` when that condition is pool-wide — see
     Watch lifecycle), that name a provider this build does not
     serve (see [Providers](#providers)), that are wholly beyond the 12-month
     poll horizon (nothing to poll for them yet), and that the poll time budget
-    never reached. A cycle that failed every watch it served goes red no
-    matter how much of the pool left — or never entered — for unrelated
-    reasons.
+    never reached. The served set is a subset of the fleet, so the ratio can
+    never exceed 1; and because the denominator is the whole fleet rather than
+    the served set, failing a small served set no longer forces a red on its own
+    — the reduction deliberately trades that so a quiet cycle serving few
+    watches is not misread as systemic.
 
   Systemic runs deliberately leave the watch pool untouched: broad breakage
   is the operator's to fix, not something users should have to recreate

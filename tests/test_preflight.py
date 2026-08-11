@@ -385,7 +385,8 @@ def test_preflight_manifest_matches_schema_sql():
     # Sanity first, so a parser that silently matched nothing fails loudly
     # instead of agreeing with an empty manifest.
     assert set(parsed) == {
-        "watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries"
+        "watches", "device_tokens", "sent_alerts", "alert_history", "run_summaries",
+        "poll_units",
     }
     assert sum(len(c) for c in parsed.values()) >= 25
     assert all(len(c) >= 4 for c in parsed.values())
@@ -494,3 +495,33 @@ def test_main_proceeds_when_preflight_is_clean(monkeypatch):
         monitor.main()
     assert exc.value.code == 0
     assert order == ["preflight", "sleep", "run"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        SCHEMA_SQL,
+        SCHEMA_SQL.parent / "migrations" / "0011_monitoring_plan_view.sql",
+    ],
+)
+def test_monitoring_plan_view_is_locked_down(path):
+    # The monitoring_plan view is a projection of every monitoring watch's
+    # planning inputs. It must never be readable by an anon/authenticated caller:
+    # security_invoker=true enforces `watches` RLS for the querying role, and the
+    # REVOKE drops the default public grants Supabase applies to new relations.
+    # The service-role poller bypasses RLS, so the egress win is unaffected. This
+    # guard holds both schema.sql and the hand-applied 0011 migration to that so
+    # a future edit cannot silently drop the lockdown. FakeDB has no roles/RLS, so
+    # this is a static source assertion, not a runtime one.
+    text = path.read_text()
+    assert re.search(
+        r"create\s+or\s+replace\s+view\s+monitoring_plan\s+"
+        r"with\s*\(\s*security_invoker\s*=\s*true\s*\)",
+        text,
+        re.IGNORECASE,
+    ), f"{path.name}: monitoring_plan must be created WITH (security_invoker = true)"
+    assert re.search(
+        r"revoke\s+all\s+on\s+monitoring_plan\s+from\s+anon\s*,\s*authenticated",
+        text,
+        re.IGNORECASE,
+    ), f"{path.name}: monitoring_plan must REVOKE ALL ... FROM anon, authenticated"

@@ -36,6 +36,25 @@ class SupabaseClient:
         resp.raise_for_status()
         return resp.json()
 
+    def count(self, table: str, params: dict | None = None) -> int | None:
+        """The exact number of rows matching `params`, read as metadata only: a
+        GET with `limit=0` so no rows cross the wire and `Prefer: count=exact` so
+        PostgREST still reports the full total in `Content-Range`. Returns None
+        when the gateway did not report a total. Lets a systemic-vs-isolated
+        determination divide by the whole active fleet without a full-fleet row
+        read."""
+        resp = self._client.get(
+            f"{self._base}/{table}",
+            params={**(params or {}), "limit": 0},
+            headers={
+                **self._headers,
+                "Accept": "application/json",
+                "Prefer": "count=exact",
+            },
+        )
+        resp.raise_for_status()
+        return _content_range_total(resp.headers.get("content-range"))
+
     def insert(self, table: str, rows: dict | list[dict]) -> None:
         resp = self._client.post(
             f"{self._base}/{table}",
@@ -54,14 +73,24 @@ class SupabaseClient:
         )
         resp.raise_for_status()
 
-    def patch(self, table: str, params: dict, data: dict) -> None:
+    def patch(self, table: str, params: dict, data: dict) -> int | None:
+        """PATCH `data` onto the rows `params` selects. Returns the number of rows
+        the write actually matched (from PostgREST's `Content-Range` header, asked
+        for via `count=exact`), or None when the gateway did not report one.
+
+        The count lets a filter-scoped write — e.g. the cycle's blanket
+        `last_checked_at` stamp of every monitoring watch — report how many rows it
+        covered without a separate read. Still exactly one HTTP request, so the
+        write budget is unchanged; `count=exact` only adds a server-side COUNT over
+        the same filter. Existing callers ignore the return value."""
         resp = self._client.patch(
             f"{self._base}/{table}",
             params=params,
             json=data,
-            headers={**self._headers, "Prefer": "return=minimal"},
+            headers={**self._headers, "Prefer": "return=minimal,count=exact"},
         )
         resp.raise_for_status()
+        return _content_range_total(resp.headers.get("content-range"))
 
     def delete(self, table: str, params: dict) -> None:
         resp = self._client.delete(
@@ -70,3 +99,13 @@ class SupabaseClient:
             headers={**self._headers, "Prefer": "return=minimal"},
         )
         resp.raise_for_status()
+
+
+def _content_range_total(header: str | None) -> int | None:
+    """The total after the `/` in a PostgREST `Content-Range` (`0-99/100`, or
+    `*/100` for a count-only response), or None when the header is missing or the
+    total is unknown (`*`)."""
+    if not header or "/" not in header:
+        return None
+    total = header.rsplit("/", 1)[1].strip()
+    return int(total) if total.isdigit() else None
