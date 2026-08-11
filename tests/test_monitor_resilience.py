@@ -140,6 +140,43 @@ def apns_failure(status=503, body=None):
     return httpx.HTTPStatusError(f"apns push rejected with {status}", request=request, response=response)
 
 
+def test_delivered_with_pruned_sibling_is_reported_but_not_rated():
+    # The whole point of this follow-up: a multi-device user whose alert reached
+    # a live phone (aggregate DELIVERED) while a dead sibling token was pruned.
+    # apns.send_alert reports that per-device rejection so the operator can SEE
+    # the dead device was pruned, but the caller must NOT rate a delivered watch
+    # toward the systemic exit-status rate — it rates on the aggregate outcome
+    # (only RETRYABLE/CONFIG), not on "a failure was reported". The single served
+    # watch is the only one in the rate; without the fix it would count 1-of-1
+    # and redden the run over a push that actually landed.
+    db, _ = pool(1)
+    apns = FakeAPNs(
+        result=monitor.DELIVERED,
+        failure=apns_failure(400, {"reason": "BadDeviceToken"}),
+    )
+
+    result, apns = run_cycle(db, apns=apns)
+
+    # the alert landed and the watch advanced exactly like a clean delivery
+    assert [w for w, _ in apns.alerts] == ["w0"]
+    assert result["alerts_sent"] == 1
+    row = db.tables["watches"][0]
+    assert row["last_found_at"] is not None and row["state_hash"] is not None
+    assert len(db.tables["sent_alerts"]) == 1
+
+    # the pruned sibling's rejection IS visible to the operator...
+    assert result["watch_errors"] == 1
+    assert "watch #1: alert:" in result["errors"] and "400" in result["errors"]
+    assert "BadDeviceToken" in result["errors_detail"]  # reason stays operator-only
+    assert "BadDeviceToken" not in result["errors"]
+
+    # ...but it is NOT rated: the watch stays healthy and the run stays green,
+    # even though this delivered watch is the only one served this cycle.
+    assert row["status"] == "monitoring"
+    assert result["systemic_failure"] is False
+    assert monitor.exit_code(result) == 0
+
+
 def test_failed_watch_does_not_stop_the_watches_after_it():
     # the first watch blows up mid-processing (its state_hash write is
     # rejected); the ones behind it in the loop still alert and store state
