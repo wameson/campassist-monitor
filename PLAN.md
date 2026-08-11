@@ -663,17 +663,22 @@ Fan-out rules, each with a reason:
 | Verdict | Exit | Rule |
 |---|---|---|
 | *isolated* | 0, schedule green | the healthy watches were served |
-| *systemic* | non-zero + `::error::`, schedule red | more than `SYSTEMIC_ERROR_RATE` (25%) of **served** watches failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) did — so 1-of-2 stays green, 2-of-2 goes red — **or** a failure belonging to no watch occurred |
+| *systemic* | non-zero + `::error::`, schedule red | the **served** set's rated failures exceeded `SYSTEMIC_ERROR_RATE` (25%) of the **whole active-monitoring fleet** **and** at least `SYSTEMIC_ERROR_FLOOR` (2) did — so 1-of-2 stays green, 2-of-2 goes red — **or** a failure belonging to no watch occurred |
 
 Failures belonging to no watch: the `run_summaries` INSERT, retention pruning, being unable to
 write `status='error'`, a provider raising out of a shared poll unit, a pool-wide unpollable
 condition, and the **poll budget running out mid-plan** (skipped parks were not served this
 cycle — see the Time budget section for why any skip goes red).
 
-The **served set** is both the denominator and the scope of the numerator, so the ratio can
-never exceed 1. It excludes watches that expired this cycle, were errored, name an unregistered
-provider, are wholly beyond the poll horizon, or that the time budget never reached. A cycle
-that failed every watch it served goes red however much of the pool left for unrelated reasons.
+The **served set** scopes the numerator; the **denominator is the whole active-monitoring
+fleet**, read as a metadata-only `count` (zero rows cross the wire; a failed count falls back to
+the served-set size). The egress read-reduction means a quiet cycle reads back only a fraction
+of the fleet, so dividing by the small served set would misread a cycle as systemic just because
+few watches were served. The served set — and so the numerator — excludes watches that expired
+this cycle, were errored, name an unregistered provider, are wholly beyond the poll horizon, or
+that the time budget never reached. The served set is a subset of the fleet, so the ratio can
+never exceed 1; and because the denominator is the whole fleet, failing a small served set no
+longer forces a red on its own — a deliberate trade so a quiet cycle is not misread as systemic.
 
 The numerator counts only failures that say something about this cycle's health — a per-device
 APNs rejection is reported but not counted, and the tally says how many it left out.

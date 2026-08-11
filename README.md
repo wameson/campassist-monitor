@@ -578,10 +578,11 @@ are all faked. CI runs the same suite on every PR and push to `main`.
   - *isolated* — the run exits 0 and the schedule stays **green**, because
     the healthy watches were served;
   - *systemic* — the run prints an `::error::` annotation, exits non-zero
-    and turns the schedule **red**. Systemic means more than
-    `SYSTEMIC_ERROR_RATE` (25%) of the watches the cycle actually **served**
-    failed **and** at least `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of
-    2 stays green while 2 of 2 goes red — or that a failure belonging to no
+    and turns the schedule **red**. Systemic means the cycle's rated watch
+    failures (drawn from the **served** set) exceeded `SYSTEMIC_ERROR_RATE`
+    (25%) of the **whole active-monitoring fleet** **and** at least
+    `SYSTEMIC_ERROR_FLOOR` (2) of them did — so 1 of 2 stays green while 2 of 2
+    goes red — or that a failure belonging to no
     watch (the `run_summaries` INSERT, retention pruning, being unable to
     write `status='error'`, a provider raising out of a poll unit its watches
     share, a pool-wide unpollable condition — see [Providers](#providers) — or
@@ -596,17 +597,24 @@ are all faked. CI runs the same suite on every PR and push to `main`.
     pool-wide backstop makes the run systemic regardless of per-reason rating
     when outright rejections wipe out nearly every served push.
 
-    The served set is the rate's denominator *and* the scope of its
-    numerator, so the ratio can never exceed 1. It excludes watches that
-    expired this cycle, that were errored for an invalid or
+    The **served set** — the watches the cycle actually tried to serve — is the
+    scope of the rate's *numerator*. The *denominator*, though, is the **whole
+    active-monitoring fleet**, read as a metadata-only `count` (zero rows cross
+    the wire; a failed count falls back to the served-set size): the egress
+    read-reduction means a quiet cycle reads back only a fraction of the fleet,
+    and dividing by that small served set would misread a cycle as systemic just
+    because few watches were served. The served set — and so the numerator —
+    excludes watches that expired this cycle, that were errored for an invalid or
     persistently-404ing campground, that their provider can never poll
     (errored, or left `monitoring` when that condition is pool-wide — see
     Watch lifecycle), that name a provider this build does not
     serve (see [Providers](#providers)), that are wholly beyond the 12-month
     poll horizon (nothing to poll for them yet), and that the poll time budget
-    never reached. A cycle that failed every watch it served goes red no
-    matter how much of the pool left — or never entered — for unrelated
-    reasons.
+    never reached. The served set is a subset of the fleet, so the ratio can
+    never exceed 1; and because the denominator is the whole fleet rather than
+    the served set, failing a small served set no longer forces a red on its own
+    — the reduction deliberately trades that so a quiet cycle serving few
+    watches is not misread as systemic.
 
   Systemic runs deliberately leave the watch pool untouched: broad breakage
   is the operator's to fix, not something users should have to recreate
