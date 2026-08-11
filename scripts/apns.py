@@ -226,15 +226,17 @@ class APNsClient:
 
         Each push that did not land contributes the *exception* behind it to
         `failures` — the transport error itself, or an HTTPStatusError carrying
-        the APNs response — EXCEPT when the aggregate is DELIVERED: a per-device
-        rejection (PERMANENT_FAILURE) whose token's row is already pruned is
-        housekeeping once a sibling device received the push, so it is withheld
-        so the caller cannot rate a delivered watch toward the exit-status rate
-        (mirroring the 410 clean-prune, which reaches neither audience).
-        Retryable and config faults still surface on a non-delivered aggregate.
-        Attribution and rendering are the caller's: nothing here names the
-        watch, so an APNs failure cannot put a watch UUID into the
-        world-readable run summary."""
+        the APNs response — regardless of the aggregate, so a per-device
+        rejection stays visible to the operator even on a DELIVERED fan-out
+        (e.g. a dead sibling token pruned while the live phone got the push).
+        Reporting is decoupled from rating: whether a reported failure counts
+        toward the exit-status rate is the caller's decision, made on the
+        aggregate outcome (only RETRYABLE_FAILURE / CONFIG_FAILURE are rated), so
+        surfacing a per-device rejection here can never redden a delivered watch.
+        The one rejection never reported is the 410 clean-prune, which
+        `_send_to_token` declines to collect at all. Attribution and rendering
+        are the caller's: nothing here names the watch, so an APNs failure cannot
+        put a watch UUID into the world-readable run summary."""
         rows = db.select("device_tokens", {"user_id": f"eq.{watch['user_id']}"})
         if not rows:
             return PERMANENT_FAILURE
@@ -273,17 +275,14 @@ class APNsClient:
             aggregate = RETRYABLE_FAILURE
         else:
             aggregate = PERMANENT_FAILURE
-        # Only now decide which collected exceptions the caller sees. On a
-        # delivered fan-out, a sibling token's per-device rejection is already
-        # pruned housekeeping — withhold it so the caller cannot rate a watch
-        # that actually reached a device. On any non-delivered aggregate, every
-        # exception (retryable, config, or the final all-dead rejection) still
-        # surfaces exactly as before.
+        # Report every collected exception to the caller, whatever the
+        # aggregate. A sibling token's per-device rejection stays visible on a
+        # DELIVERED fan-out so the operator can see a dead device was pruned;
+        # rating is the caller's separate decision (it rates on the aggregate
+        # outcome, not on the presence of a failure), so a delivered watch is
+        # reported-but-unrated rather than counted as systemic. The only
+        # rejection never here is the 410 clean-prune, which _send_to_token does
+        # not collect.
         if failures is not None:
-            if aggregate == DELIVERED:
-                failures.extend(
-                    exc for outcome, exc in collected if outcome != PERMANENT_FAILURE
-                )
-            else:
-                failures.extend(exc for _, exc in collected)
+            failures.extend(exc for _, exc in collected)
         return aggregate

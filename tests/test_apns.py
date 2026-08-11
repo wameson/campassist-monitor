@@ -225,12 +225,14 @@ def test_fanout_dead_token_pruned_without_touching_sibling(signing_key):
     ]
 
 
-def test_fanout_delivered_withholds_sibling_dead_token_400(signing_key):
+def test_fanout_delivered_reports_sibling_dead_token_400(signing_key):
     # deviceA is a dead-token 400 (BadDeviceToken) while deviceB delivers: the
-    # aggregate is DELIVERED, deviceA's row is pruned, and — unlike the
-    # single-token 400 path — its rejection is WITHHELD from the caller's
-    # failures. Once a device received the push, a sibling's dead token is
-    # already-pruned housekeeping and must not be rated toward the run's rate.
+    # aggregate is DELIVERED and deviceA's row is pruned, and its rejection is
+    # REPORTED to the caller's failures so the operator can see a dead sibling
+    # was pruned. Reporting no longer implies rating: the caller decides on the
+    # aggregate outcome (a delivered watch is reported-but-unrated), so surfacing
+    # this rejection cannot count it toward the run's systemic rate. The only
+    # rejection still never reported is the 410 clean-prune (below).
     _, pem = signing_key
 
     def handler(request):
@@ -244,7 +246,7 @@ def test_fanout_delivered_withholds_sibling_dead_token_400(signing_key):
     outcome = client.send_alert(make_watch(), OPENINGS, db, failures=failures)
 
     assert outcome == apns.DELIVERED
-    assert failures == []
+    assert len(failures) == 1 and isinstance(failures[0], httpx.HTTPStatusError)
     assert db.tables["device_tokens"] == [
         {"user_id": "u1", "apns_token": "deviceB", "environment": "production"},
     ]
@@ -253,10 +255,33 @@ def test_fanout_delivered_withholds_sibling_dead_token_400(signing_key):
     ]
 
 
+def test_fanout_delivered_410_prune_stays_unreported(signing_key):
+    # the one rejection still never surfaced even on a DELIVERED fan-out: a 410
+    # Unregistered is a clean prune reported to neither audience (_send_to_token
+    # does not collect it), so deviceA is pruned but failures stays empty.
+    _, pem = signing_key
+
+    def handler(request):
+        if request.url.path.endswith("deviceA"):
+            return httpx.Response(410, json={"reason": "Unregistered"})
+        return httpx.Response(200)
+
+    client = make_client(pem, handler=handler)
+    db = multi_token_db()
+    failures = []
+    outcome = client.send_alert(make_watch(), OPENINGS, db, failures=failures)
+
+    assert outcome == apns.DELIVERED
+    assert failures == []
+    assert db.tables["device_tokens"] == [
+        {"user_id": "u1", "apns_token": "deviceB", "environment": "production"},
+    ]
+
+
 def test_fanout_delivered_still_surfaces_sibling_retryable(signing_key):
-    # a delivered aggregate withholds only per-device rejections, not a sibling
-    # retryable (5xx): that still surfaces so the operator sees the transient
-    # fault even though the opening reached another device.
+    # a delivered aggregate still surfaces a sibling retryable (5xx) so the
+    # operator sees the transient fault even though the opening reached another
+    # device — a plain instance of "reported, and rating is the caller's".
     _, pem = signing_key
 
     def handler(request):

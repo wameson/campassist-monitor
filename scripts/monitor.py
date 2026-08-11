@@ -1821,12 +1821,17 @@ def run(
                     # that one device's problem rather than this cycle's, so it
                     # is reported outside the systemic rate; a provider/config
                     # fault (CONFIG_FAILURE) is rated so a pool-wide APNs outage
-                    # still turns the run red.
+                    # still turns the run red. Rate on the aggregate OUTCOME, not
+                    # on "not PERMANENT_FAILURE": a DELIVERED fan-out can now
+                    # carry a pruned dead sibling's rejection (apns reports it for
+                    # operator visibility), and that push reached a device — so
+                    # only a genuinely unsettled outcome (retryable/config) is
+                    # rated, never a delivered one.
                     record_failures(
                         unattributed_failure(watch_id, delivery_failures[0]),
                         "alert",
                         blocking=False,
-                        rated=outcome != PERMANENT_FAILURE,
+                        rated=outcome in (RETRYABLE_FAILURE, CONFIG_FAILURE),
                     )
                     if outcome == PERMANENT_FAILURE:
                         apns_rejected_ids.add(watch_id)
